@@ -62,7 +62,7 @@ YourShell 是一个 iOS 原生终端 App：**Rust 核心（brush-core）+ Swift 
 2. **Rust CLI 生态直接嵌**（品质远超手写，作为库引入）：
    - `jaq`（jq 的纯 Rust 实现，可当库用）→ jq
    - `mlua`（Lua 5.4 绑定，vendored 编译）→ lua
-   - `gitoxide` → git（对标 a-Shell 的 lg2）
+   - `git2-rs`（libgit2 绑定）→ git。git 官方 C 本体依赖 fork 子进程无法上 iOS；libgit2 是 iOS 事实标准（a-Shell 的 lg2 同源），命令面完整。gitoxide 仅作后期性能优化备选（命令面不全，不当主力）
    - `russh` → ssh/scp/sftp/ssh-keygen
    - `reqwest`/`hyper` → curl/wget 子集
    - `similar` → diff；`regex-lite` → grep 系（已用）
@@ -108,7 +108,7 @@ YourShell 是一个 iOS 原生终端 App：**Rust 核心（brush-core）+ Swift 
 | 归属 | 数量(约) | 代表 | 说明 |
 |---|---|---|---|
 | brush 原生 builtin | 25 | cd echo export history pwd type alias env sh | 已免费获得 |
-| T1 手写/已有 | 15 | ls cat grep head wc mkdir rm touch uname | 已完成 9 个 |
+| T1 手写/已有 | 9（+计划补写 tail cp mv ln 等） | ls cat grep head wc mkdir rm touch uname | 简化版实现，后续可被生态 crate/uutils 替换 |
 | T1 生态 crate | 45 | jq lua git ssh scp curl diff tar gzip xz find sed awk sort uniq tree xxd base64 sha* | 逐波次接入 |
 | T1 uutils 长尾 | 50 | date du stat cksum split tee xargs mktemp realpath… | 大锁串行化 |
 | T2 Python | 4 | python python3 pip + deactivate | M3 |
