@@ -56,10 +56,11 @@ YourShell 是一个 iOS 原生终端 App：**Rust 核心（brush-core）+ Swift 
 
 ### 4.2 命令层 T1：Rust 进程内命令
 
-三个来源，统一注册为 brush builtin（`builtins::Command` trait）：
+**纪律：不手写命令实现**（决策 2026-07-24）。MVP 里的 9 个手写命令（builtins_extra.rs）是一次性验证代码，M2 起全部删除替换；我们只写**适配器**这一层基础设施。命令来源两个，统一注册为 brush builtin（`builtins::Command` trait）：
 
-1. **手写**（已有 9 个）：小命令直接写，30-60 行/个，天然用 ExecutionContext 的管道 fd，无全局状态问题。适用：基础文件/文本命令。
-2. **Rust CLI 生态直接嵌**（品质远超手写，作为库引入）：
+1. **uutils coreutils（第一天就上）**：`uu_ls`/`uu_cat`/`uu_mkdir`… 经统一适配器接入——适配器在调用前把进程 fd 0/1/2 `dup2` 到会话管道、加全局锁串行化、`catch_unwind` 包裹、调 `uumain(args) -> i32`、恢复 fd。约百行基础设施换来 uutils 全量命令面（含完整 flag 支持），远胜简化手写版。已知代价：uutils 命令同一时刻只能跑一条（brush 原生 builtin 与生态 crate 命令不受限）；后续按需对高频命令做 Context 化解锁并发。find/xargs 用 uutils 的 findutils 项目同款方式接入。
+2. **Rust CLI 生态直接嵌**（uutils 覆盖不到的，作为库引入）：
+   - `grep` 系 → ripgrep 的引擎 crate（`grep-searcher`/`grep-regex`），替换 MVP 的 regex-lite 简化版
    - `jaq`（jq 的纯 Rust 实现，可当库用）→ jq
    - `mlua`（Lua 5.4 绑定，vendored 编译）→ lua
    - `git2-rs`（libgit2 绑定）→ git。git 官方 C 本体依赖 fork 子进程无法上 iOS；libgit2 是 iOS 事实标准（a-Shell 的 lg2 同源），命令面完整。gitoxide 仅作后期性能优化备选（命令面不全，不当主力）
@@ -67,8 +68,7 @@ YourShell 是一个 iOS 原生终端 App：**Rust 核心（brush-core）+ Swift 
    - `reqwest`/`hyper` → curl/wget 子集
    - `similar` → diff；`regex-lite` → grep 系（已用）
    - `image` crate → convert/identify 基础子集（对标 ImageMagick 常用路径）
-3. **uutils coreutils**（覆盖长尾）：已验证约 60-70% 命令可接入，但其全局 stdio/cwd 需"大锁 + dup2"串行化（MVP 阶段可接受）或逐个 Context 化（后期）。8 个本质需 fork 的命令（env/nohup/nice/timeout/chroot/runcon/stdbuf/install）永久排除。
-   - **决策：先手写 + 生态 crate 覆盖高频 40 个命令（无全局状态、可并发），uutils 只用于长尾补齐，不在关键路径上。**
+uutils 中 8 个本质需 fork 的命令（env/nohup/nice/timeout/chroot/runcon/stdbuf/install）永久排除；11 个含残留 `process::exit` 的命令（cat/sort/tail/tr/more 等）需在适配层规避或上游 patch。
 
 ### 4.3 Python：官方 CPython iOS XCFramework ⭐
 
@@ -108,9 +108,8 @@ YourShell 是一个 iOS 原生终端 App：**Rust 核心（brush-core）+ Swift 
 | 归属 | 数量(约) | 代表 | 说明 |
 |---|---|---|---|
 | brush 原生 builtin | 25 | cd echo export history pwd type alias env sh | 已免费获得 |
-| T1 手写/已有 | 9（+计划补写 tail cp mv ln 等） | ls cat grep head wc mkdir rm touch uname | 简化版实现，后续可被生态 crate/uutils 替换 |
-| T1 生态 crate | 45 | jq lua git ssh scp curl diff tar gzip xz find sed awk sort uniq tree xxd base64 sha* | 逐波次接入 |
-| T1 uutils 长尾 | 50 | date du stat cksum split tee xargs mktemp realpath… | 大锁串行化 |
+| T1 uutils（适配器接入，第一天） | 65 | ls cat cp mv rm mkdir touch head tail wc sort uniq tr date du stat split tee mktemp realpath base64 sha* find xargs… | dup2+大锁适配器；MVP 手写版全部删除替换 |
+| T1 生态 crate | 30 | grep(ripgrep 引擎) jq(jaq) lua(mlua) git(git2/libgit2) ssh scp(russh) curl(reqwest) diff(similar) tar gzip xz sed awk | 库级引入 |
 | T2 Python | 4 | python python3 pip + deactivate | M3 |
 | T2 Node（新增，a-Shell 没有） | 3 | **node npm npx** | M4，差异化卖点 |
 | T3 wasm 通道 | 40 | clang/lld/llc… ffmpeg ffprobe unrar zip 全部 TeX | pkg install |
@@ -121,7 +120,7 @@ YourShell 是一个 iOS 原生终端 App：**Rust 核心（brush-core）+ Swift 
 
 - **M0 ✅ 原型验证**：brush-core iOS 化 + 102 用例全绿 + 上游 PR。
 - **M1 终端化（骨架定型）**：SwiftTerm 接入、sentinel 协议、raw/canonical stdin、多窗口 Scene（每窗口一 Shell 实例）、xcodegen → 正式工程。验收：vim 级别的全屏 wasm 程序可运行前置条件（termios 语义）就绪，交互式 `read`/Ctrl-C 可用。
-- **M2 命令宽度第一波**：T1 生态 crate 40 个高频命令 + 测试炮台扩到 300 用例（每命令≥3 用例）。验收：日常文件/文本/网络操作不出终端。
+- **M2 命令宽度第一波**：uutils 适配器（dup2+锁+catch_unwind）接入 ~65 命令并**删除全部 MVP 手写命令**；生态 crate 接入 grep/jq/diff/tar/curl 等 ~15 个；测试炮台扩到 300+ 用例（每命令≥3 用例）。验收：日常文件/文本/网络操作不出终端。
 - **M3 Python**：CPython 3.14 XCFramework 嵌入、python3 REPL/脚本、pip 纯 Python 包、子解释器多会话。验收：`pip install requests && python3 -c "import requests"`。
 - **M4 Node + npm**：nodejs-mobile 常驻实例、node/npm/npx 命令、child_process shim。验收：`npm install lodash && node -e "console.log(require('lodash').chunk([1,2,3,4],2))"`。
 - **M5 生态与集成**：wasmi + pkg install、Swift 集成命令、uutils 长尾、App Store 准备（2.5.2 审核话术：开发工具、用户代码可见可编辑、无远程代码解锁功能）。
@@ -135,7 +134,7 @@ YourShell 是一个 iOS 原生终端 App：**Rust 核心（brush-core）+ Swift 
 | numpy 等不兼容子解释器 | 中 | 多 dylib 副本兜底；限制在主会话 |
 | App 审核 2.5.2 波动 | 中 | 对齐 a-Shell/Pythonista 先例；审核说明模板 |
 | brush PR 不被接受 | 低 | 维持薄 fork（补丁仅 86 行，rebase 成本低） |
-| uutils 全局状态改造量 | 低 | 已降级为长尾补齐，不在关键路径 |
+| uutils 全局状态（dup2+锁上关键路径） | 中 | 适配器统一处理；串行化仅限 uutils 命令；高频命令逐个 Context 化解锁 |
 | V8 jitless / wasm 解释性能 | 低 | CLI 负载可接受；wasmtime-Pulley 备选 |
 
 ## 8. 调研来源（节选）
