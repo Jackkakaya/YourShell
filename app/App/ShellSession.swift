@@ -12,6 +12,19 @@ final class ShellSession: ObservableObject {
     private var demoQueue: [String] = []
 
     init() {
+        // Point the embedded CPython at the bundled stdlib before the Rust
+        // core spins up any session. xcodegen folder resources land under
+        // Resources/PythonResources/python.
+        if let res = Bundle.main.resourcePath {
+            setenv("YOURSHELL_PYTHON_HOME", res + "/PythonResources/python", 1)
+        }
+        // Writable site-packages for pip (the bundle is read-only and iOS
+        // disables the user site); the python driver puts it on sys.path.
+        let library = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
+        let pySite = library.appendingPathComponent("python/site-packages").path
+        try? FileManager.default.createDirectory(
+            atPath: pySite, withIntermediateDirectories: true)
+        setenv("YOURSHELL_PY_SITE", pySite, 1)
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         cwd = docs.path
         seedDemoFiles(in: docs)
@@ -75,6 +88,19 @@ final class ShellSession: ObservableObject {
                 to: docs.appendingPathComponent("selftest_report.txt"),
                 atomically: true, encoding: .utf8)
             DispatchQueue.main.async { self.transcript += report }
+        }
+    }
+
+    /// Debug channel: run one command, mirror the transcript to a file so the
+    /// host can read it (`ASHELL_EXEC` env, output in Documents/exec_out.txt).
+    func runSingle(_ cmd: String) {
+        run(cmd)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
+            guard let self else { return }
+            let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            try? self.transcript.write(
+                to: docs.appendingPathComponent("exec_out.txt"),
+                atomically: true, encoding: .utf8)
         }
     }
 

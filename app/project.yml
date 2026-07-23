@@ -6,7 +6,16 @@ targets:
     type: application
     platform: iOS
     deploymentTarget: "17.0"
-    sources: [App]
+    sources:
+      - App
+      - PyHost
+      - path: PythonResources
+        type: folder
+        buildPhase: resources
+    dependencies:
+      - framework: ../vendor/python-ios/Python.xcframework
+        embed: true
+        codeSign: false
     settings:
       base:
         SWIFT_OBJC_BRIDGING_HEADER: App/Bridging-Header.h

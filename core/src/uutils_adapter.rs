@@ -37,6 +37,14 @@ const KEEP_BRUSH: &[&str] = &["echo", "printf", "pwd", "test", "true", "false"];
 /// interactive pager that assumes a controlling tty.
 const SKIP: &[&str] = &["yes", "more"];
 
+/// Serializes every mutation of process-global state (fds 0/1/2, cwd, env).
+/// Shared by the uutils adapter and the Python runner — anything that dup2s
+/// must hold this lock.
+pub(crate) fn process_state_lock() -> &'static Mutex<()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    &LOCK
+}
+
 fn registry() -> &'static HashMap<String, fn(Vec<OsString>) -> i32> {
     static REGISTRY: OnceLock<HashMap<String, fn(Vec<OsString>) -> i32>> = OnceLock::new();
     REGISTRY.get_or_init(brush_coreutils_builtins::bundled_commands)
@@ -152,7 +160,7 @@ fn exec_uutils(
 
 /// Compares two fds by file description identity (dev + inode), so a dup'd
 /// clone of the session stdin still registers as "interactive".
-fn raw_fd_same_file(a: i32, b: i32) -> bool {
+pub(crate) fn raw_fd_same_file(a: i32, b: i32) -> bool {
     unsafe {
         let mut sa: libc::stat = std::mem::zeroed();
         let mut sb: libc::stat = std::mem::zeroed();
@@ -164,7 +172,7 @@ fn raw_fd_same_file(a: i32, b: i32) -> bool {
 }
 
 /// Materializes a drained stdin buffer as an unlinked temp file fd.
-fn buffered_stdin_fd(buf: &[u8]) -> Option<std::os::fd::OwnedFd> {
+pub(crate) fn buffered_stdin_fd(buf: &[u8]) -> Option<std::os::fd::OwnedFd> {
     use std::io::{Seek, SeekFrom, Write};
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -192,8 +200,9 @@ fn run_locked(
     cwd: &PathBuf,
     exported: &[(String, String)],
 ) -> i32 {
-    static UU_LOCK: Mutex<()> = Mutex::new(());
-    let _guard = UU_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = process_state_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
 
     let Some(func) = registry().get(name).copied() else {
         return 127;

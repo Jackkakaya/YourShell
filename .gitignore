@@ -2,3 +2,5 @@ target/
 .build/
 *.xcodeproj/
 DerivedData/
+app/PythonResources/
+vendor/python-ios/

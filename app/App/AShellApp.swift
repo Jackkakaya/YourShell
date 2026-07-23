@@ -58,6 +58,8 @@ struct TerminalView: View {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                 if ProcessInfo.processInfo.environment["ASHELL_SELFTEST"] == "1" {
                     session.runSelftest()
+                } else if let cmd = ProcessInfo.processInfo.environment["ASHELL_EXEC"] {
+                    session.runSingle(cmd)
                 } else {
                     session.startDemo()
                 }

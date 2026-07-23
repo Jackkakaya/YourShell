@@ -235,6 +235,30 @@ pub static CASES: &[Case] = &[
     case!("rm-r-dir", "mkdir -p rmd/inner; touch rmd/inner/x.txt; rm -r rmd; [ ! -d rmd ] && echo rmr-ok", Eq("rmr-ok")),
 ];
 
+/// Python cases run only when the `python` feature is compiled in
+/// (detected at runtime via `type python3`). pip cases require network.
+pub static PY_CASES: &[Case] = &[
+    case!("py-version", "python3 --version", Has("Python 3.14")),
+    case!("py-c", "python3 -c 'print(21 * 2)'", Eq("42")),
+    case!("py-argv", "python3 -c 'import sys; print(sys.argv[1])' hello-arg", Eq("hello-arg")),
+    case!("py-file", "printf 'import sys\\nprint(\"from-file\", sys.argv[1])\\n' > pys.py; python3 pys.py world", Eq("from-file world")),
+    case!("py-m-module", "echo '{\"b\": 1}' | python3 -m json.tool", Has("\"b\": 1")),
+    case!("py-stdin", "printf 'print(5 + 5)\\n' | python3", Eq("10")),
+    case!("py-exit-code", "python3 -c 'import sys; sys.exit(3)'; echo rc=$?", Eq("rc=3")),
+    case!("py-traceback", "python3 -c '1/0' 2>&1; echo rc=$?", Has("ZeroDivisionError"), Has("rc=1")),
+    case!("py-native-modules", "python3 -c 'import math, json, zlib, sqlite3, ssl, hashlib; print(\"mods-ok\")'", Eq("mods-ok")),
+    case!("py-subinterp-isolation", "python3 -c 'leak = 1; print(\"first\")'; python3 -c 'print(\"leak\" in dir())'", Eq("first\nFalse")),
+    case!("py-env-passthrough", "export PYE=fromshell; python3 -c 'import os; print(os.environ[\"PYE\"])'", Eq("fromshell")),
+    case!("py-cwd", "python3 -c 'import os; print(os.path.basename(os.getcwd()))'", Has("selftest_")),
+    case!("py-pipe-to-shell", "python3 -c 'print(chr(104)+chr(105))' | tr 'a-z' 'A-Z'", Eq("HI")),
+    // iOS: ensurepip needs subprocess (unsupported) and user-site is
+    // disabled, so pip is bootstrapped by unzipping the bundled wheel into
+    // our writable site dir, and installs use --target.
+    case!("py-pip-bootstrap", "python3 -c 'import zipfile, glob, os; w = glob.glob(os.path.join(os.environ[\"YOURSHELL_PYTHON_HOME\"], \"lib/python3.14/ensurepip/_bundled/pip-*.whl\"))[0]; zipfile.ZipFile(w).extractall(os.environ[\"YOURSHELL_PY_SITE\"]); print(\"pip-boot-ok\")'", Eq("pip-boot-ok")),
+    case!("py-pip-version", "export PIP_DISABLE_PIP_VERSION_CHECK=1; python3 -m pip --version 2>&1", Has("pip 26")),
+    case!("py-pip-install", "python3 -m pip install --quiet --no-input --upgrade --only-binary :all: --target \"$YOURSHELL_PY_SITE\" six > /dev/null 2>&1; python3 -c 'import six; print(six.__name__, six.__version__ != \"\")'", Eq("six True")),
+];
+
 pub fn run_selftest(workdir: &std::path::Path) -> String {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -299,7 +323,53 @@ async fn run_selftest_async(workdir: &std::path::Path) -> String {
         }
     }
 
-    report.push_str(&format!("=== {passed}/{} passed ===\n", CASES.len()));
+    // Only the in-process builtin counts — on dev hosts a system python3
+    // found via PATH would otherwise hijack these cases.
+    let (_c, py_probe_out) = run_case(&mut shell, "type python3 2>/dev/null").await;
+    let python_present = py_probe_out.contains("builtin");
+    let mut total = CASES.len();
+    if python_present {
+        for case in PY_CASES {
+            let (exit_code, output) = run_case(&mut shell, case.script).await;
+            let trimmed = output.trim_end();
+            let mut failures: Vec<String> = Vec::new();
+            for check in case.checks {
+                match check {
+                    Eq(want) => {
+                        if trimmed != *want {
+                            failures.push(format!("expected {want:?}, got {trimmed:?}"));
+                        }
+                    }
+                    Has(want) => {
+                        if !output.contains(want) {
+                            failures.push(format!("missing {want:?} in {trimmed:?}"));
+                        }
+                    }
+                    Not(bad) => {
+                        if output.contains(bad) {
+                            failures.push(format!("unexpected {bad:?} in {trimmed:?}"));
+                        }
+                    }
+                    Exit(want) => {
+                        if exit_code != *want {
+                            failures.push(format!("expected exit {want}, got {exit_code}"));
+                        }
+                    }
+                }
+            }
+            if failures.is_empty() {
+                passed += 1;
+                report.push_str(&format!("PASS {}\n", case.name));
+            } else {
+                report.push_str(&format!("FAIL {}: {}\n", case.name, failures.join("; ")));
+            }
+        }
+        total += PY_CASES.len();
+    } else {
+        report.push_str("NOTE python3 not built in; python cases skipped\n");
+    }
+
+    report.push_str(&format!("=== {passed}/{total} passed ===\n"));
     report
 }
 
@@ -315,7 +385,7 @@ async fn run_case(
     let params = shell.default_exec_params();
     let source_info = brush_core::SourceInfo::from("selftest");
     let run = shell.run_string(script.to_string(), &source_info, &params);
-    let result = tokio::time::timeout(std::time::Duration::from_secs(10), run).await;
+    let result = tokio::time::timeout(std::time::Duration::from_secs(120), run).await;
 
     let exit_code: i32 = match result {
         Ok(Ok(r)) => i32::from(u8::from(r.exit_code)),

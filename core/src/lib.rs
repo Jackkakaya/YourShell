@@ -8,6 +8,8 @@
 
 mod builtins_extra;
 mod uutils_adapter;
+#[cfg(feature = "python")]
+mod python_adapter;
 pub mod selftest;
 
 use std::collections::HashMap;
@@ -43,6 +45,12 @@ pub(crate) async fn build_shell(
         .builtin("grep", core_builtins::builtin::<builtins_extra::GrepCommand, DefaultShellExtensions>());
     for name in uutils_adapter::command_names() {
         builder = builder.builtin(name, uutils_adapter::registration());
+    }
+    #[cfg(feature = "python")]
+    {
+        builder = builder
+            .builtin("python3", python_adapter::registration())
+            .builtin("python", python_adapter::registration());
     }
     builder
         .fds(fds)
