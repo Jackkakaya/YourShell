@@ -1,0 +1,2 @@
+vendor/nodejs-mobile/NodeMobile.xcframework/ios-arm64/NodeMobile.framework/NodeMobile filter=lfs diff=lfs merge=lfs -text
+vendor/nodejs-mobile/NodeMobile.xcframework/ios-arm64_x86_64-simulator/NodeMobile.framework/NodeMobile filter=lfs diff=lfs merge=lfs -text

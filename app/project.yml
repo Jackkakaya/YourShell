@@ -1,0 +1,19 @@
+name: AShellRS
+options:
+  bundleIdPrefix: dev.sumin
+targets:
+  AShellRS:
+    type: application
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources: [App]
+    settings:
+      base:
+        SWIFT_OBJC_BRIDGING_HEADER: App/Bridging-Header.h
+        LIBRARY_SEARCH_PATHS: ["$(PROJECT_DIR)/../core/target/aarch64-apple-ios-sim/release"]
+        OTHER_LDFLAGS: ["-lashellcore"]
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        PRODUCT_BUNDLE_IDENTIFIER: dev.sumin.ashellrs
+        TARGETED_DEVICE_FAMILY: "1,2"
+        CODE_SIGNING_ALLOWED: NO
