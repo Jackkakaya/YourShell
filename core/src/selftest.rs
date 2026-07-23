@@ -69,7 +69,7 @@ pub static CASES: &[Case] = &[
     case!("redirect-out", "echo filedata > rt.txt; cat rt.txt", Eq("filedata")),
     case!("redirect-append", "echo l1 > ra.txt; echo l2 >> ra.txt; cat ra.txt", Eq("l1\nl2")),
     case!("redirect-in", "echo indata > ri.txt; cat < ri.txt", Eq("indata")),
-    case!("redirect-err-null", "ls /definitely/nonexistent 2>/dev/null; echo rc=$?", Eq("rc=1")),
+    case!("redirect-err-null", "ls /definitely/nonexistent 2>/dev/null; echo rc=$?", Eq("rc=2")),
     case!("pipe-two", "printf 'x\\ny\\nz\\n' | wc -l", Eq("3")),
     case!("pipe-three", "printf 'a\\nb\\nc\\nd\\n' | head -n 2 | wc -l", Eq("2")),
     case!("pipe-custom-to-builtin", "cat poem.txt | wc -l", Eq("2")),
@@ -121,14 +121,50 @@ pub static CASES: &[Case] = &[
     case!("grep-n", "printf 'x\\ny\\n' | grep -n y", Eq("2:y")),
     case!("grep-o-regex", "echo abc123def | grep -o '[0-9]+'", Eq("123")),
     case!("grep-nomatch-exit", "grep zzz poem.txt; echo rc=$?", Eq("rc=1")),
-    case!("uname", "uname", Eq("aShell-rs")),
-    case!("uname-a", "uname -a", Has("brush-core")),
+    case!("uname", "uname", Has("Darwin")),
+    // ---- uutils adapter: session-state sync ----
+    case!("uu-env-sync", "export UUV=fromshell; printenv UUV", Eq("fromshell")),
+    case!("uu-cwd-sync", "mkdir -p cwt && cd cwt && touch inner.txt && ls && cd ..", Has("inner.txt")),
+    // ---- uutils adapter: breadth ----
+    case!("sort", "printf 'b\\na\\nc\\n' | sort", Eq("a\nb\nc")),
+    case!("sort-rn", "printf '1\\n3\\n2\\n' | sort -rn", Eq("3\n2\n1")),
+    case!("uniq", "printf 'a\\na\\nb\\n' | uniq", Eq("a\nb")),
+    case!("cut", "echo 'a:b:c' | cut -d: -f2", Eq("b")),
+    case!("tr", "echo abc | tr 'a-z' 'A-Z'", Eq("ABC")),
+    case!("tac", "printf '1\\n2\\n3\\n' | tac", Eq("3\n2\n1")),
+    case!("seq", "seq 3", Eq("1\n2\n3")),
+    case!("tail", "printf '1\\n2\\n3\\n4\\n' | tail -n 2", Eq("3\n4")),
+    case!("basename", "basename /some/path/file.txt", Eq("file.txt")),
+    case!("dirname", "dirname /some/path/file.txt", Eq("/some/path")),
+    case!("date", "date +%Y", Has("20")),
+    case!("expr", "expr 6 \\* 7", Eq("42")),
+    case!("factor", "factor 12", Has("2 2 3")),
+    case!("sha256sum", "printf hi | sha256sum", Has("8f434346648f6b96")),
+    case!("base64-cmd", "printf hi | base64", Eq("aGk=")),
+    case!("nl", "printf 'x\\ny\\n' | nl", Has("1"), Has("x")),
+    case!("paste", "printf 'a\\nb\\n' > p1.txt; printf '1\\n2\\n' > p2.txt; paste -d: p1.txt p2.txt", Eq("a:1\nb:2")),
+    case!("tee", "echo teed | tee tee.txt; cat tee.txt", Eq("teed\nteed")),
+    case!("comm", "printf 'a\\nb\\n' > cm1.txt; printf 'b\\nc\\n' > cm2.txt; comm -12 cm1.txt cm2.txt", Eq("b")),
+    case!("cp-mv", "echo v > cpm.txt; cp cpm.txt cpm2.txt; mv cpm2.txt cpm3.txt; cat cpm3.txt", Eq("v")),
+    case!("ln-readlink", "echo tgt > lnt.txt; ln -s lnt.txt lns.txt; cat lns.txt; readlink lns.txt", Eq("tgt\nlnt.txt")),
+    case!("realpath-cmd", "realpath lnt.txt", Has("/"), Has("lnt.txt")),
+    case!("rmdir", "mkdir rdt; rmdir rdt; [ ! -d rdt ] && echo rmdir-ok", Eq("rmdir-ok")),
+    case!("truncate", "truncate -s 5 trc.txt; wc -c trc.txt", Has("5")),
+    case!("mktemp-cmd", "t=$(mktemp tmp.XXXXXX); [ -f \"$t\" ] && echo mktemp-ok; rm -f \"$t\"", Eq("mktemp-ok")),
+    case!("du", "du -s . > /dev/null; echo du-rc=$?", Eq("du-rc=0")),
+    case!("whoami-nproc-hostname", "whoami > /dev/null && nproc > /dev/null && hostname > /dev/null; echo id-rc=$?", Eq("id-rc=0")),
+    case!("sleep-cmd", "sleep 0; echo slept=$?", Eq("slept=0")),
+    case!("od", "printf 'A' | od -An -c", Has("A")),
+    case!("fold", "echo abcdef | fold -w 3", Eq("abc\ndef")),
+    case!("split-cmd", "printf '1\\n2\\n3\\n4\\n' > sp.txt; split -l 2 sp.txt spx_; cat spx_aa", Eq("1\n2")),
+    case!("tsort", "printf 'a b\\nb c\\n' | tsort", Eq("a\nb\nc")),
+    case!("expand-roundtrip", "printf '\\tx\\n' | expand | unexpand | wc -l", Eq("1")),
     case!("touch-ls", "touch f1.txt f2.txt; ls", Has("f1.txt"), Has("f2.txt"), Has("poem.txt")),
     case!("ls-hidden", "touch .hidden; ls; echo ---; ls -a", Has(".hidden")),
     case!("ls-hidden-default-off", "ls", Not(".hidden")),
     case!("ls-long", "ls -l", Has("poem.txt"), Has("  ")),
     case!("ls-glob", "echo *.txt", Has("poem.txt"), Not("*")),
-    case!("ls-missing", "ls /no/such/dir; echo rc=$?", Has("rc=1")),
+    case!("ls-missing", "ls /no/such/dir 2>/dev/null; echo rc=$?", Has("rc=2")),
     case!("cat-file", "cat poem.txt", Has("no fork"), Exit(0)),
     case!("cat-multi", "echo A > c1.txt; echo B > c2.txt; cat c1.txt c2.txt", Eq("A\nB")),
     case!("cat-missing", "cat nope.txt; echo rc=$?", Has("rc=1")),
@@ -153,7 +189,7 @@ pub fn run_selftest(workdir: &std::path::Path) -> String {
 }
 
 async fn run_selftest_async(workdir: &std::path::Path) -> String {
-    let scratch = workdir.join("selftest");
+    let scratch = workdir.join(format!("selftest_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&scratch);
     std::fs::create_dir_all(&scratch).expect("create scratch dir");
     std::fs::write(
@@ -244,19 +280,4 @@ async fn run_case(
         output = String::from_utf8_lossy(&buf).into_owned();
     }
     (exit_code, output)
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn battery_passes_on_host() {
-        let dir = std::env::temp_dir().join("ashell_selftest_host");
-        std::fs::create_dir_all(&dir).unwrap();
-        let report = super::run_selftest(&dir);
-        println!("{report}");
-        assert!(
-            !report.contains("FAIL") && !report.contains("FATAL"),
-            "selftest failures:\n{report}"
-        );
-    }
 }

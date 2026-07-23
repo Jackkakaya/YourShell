@@ -7,6 +7,7 @@
 //! in one process stay isolated.
 
 mod builtins_extra;
+mod uutils_adapter;
 pub mod selftest;
 
 use std::collections::HashMap;
@@ -31,22 +32,19 @@ pub struct Session {
 }
 
 /// Builds a Shell configured identically for FFI sessions and the selftest
-/// battery: bash-mode default builtins plus our in-process file commands.
+/// battery: bash-mode default builtins, the full uutils coreutils set (via
+/// the fd-redirecting adapter), and library-backed commands.
 pub(crate) async fn build_shell(
     fds: HashMap<brush_core::ShellFd, OpenFile>,
     working_dir: &std::path::Path,
 ) -> Result<brush_core::Shell, brush_core::Error> {
-    brush_core::Shell::builder()
+    let mut builder = brush_core::Shell::builder()
         .default_builtins(BuiltinSet::BashMode)
-        .builtin("ls", core_builtins::builtin::<builtins_extra::LsCommand, DefaultShellExtensions>())
-        .builtin("cat", core_builtins::builtin::<builtins_extra::CatCommand, DefaultShellExtensions>())
-        .builtin("wc", core_builtins::builtin::<builtins_extra::WcCommand, DefaultShellExtensions>())
-        .builtin("head", core_builtins::builtin::<builtins_extra::HeadCommand, DefaultShellExtensions>())
-        .builtin("uname", core_builtins::builtin::<builtins_extra::UnameCommand, DefaultShellExtensions>())
-        .builtin("mkdir", core_builtins::builtin::<builtins_extra::MkdirCommand, DefaultShellExtensions>())
-        .builtin("rm", core_builtins::builtin::<builtins_extra::RmCommand, DefaultShellExtensions>())
-        .builtin("touch", core_builtins::builtin::<builtins_extra::TouchCommand, DefaultShellExtensions>())
-        .builtin("grep", core_builtins::builtin::<builtins_extra::GrepCommand, DefaultShellExtensions>())
+        .builtin("grep", core_builtins::builtin::<builtins_extra::GrepCommand, DefaultShellExtensions>());
+    for name in uutils_adapter::command_names() {
+        builder = builder.builtin(name, uutils_adapter::registration());
+    }
+    builder
         .fds(fds)
         .working_dir(working_dir.to_path_buf())
         .shell_name("ashell".to_string())
