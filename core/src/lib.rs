@@ -52,6 +52,14 @@ pub(crate) async fn build_shell(
         .await
 }
 
+/// Builds the standard shell with no preset fds; used by the integration
+/// tests (battery, concurrency) that manage fds per invocation themselves.
+pub async fn build_shell_for_tests(
+    working_dir: &std::path::Path,
+) -> Result<brush_core::Shell, brush_core::Error> {
+    build_shell(HashMap::new(), working_dir).await
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn ashell_session_new(
     out_cb: OutputCb,

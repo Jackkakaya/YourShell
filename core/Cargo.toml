@@ -16,6 +16,9 @@ futures = { version = "0.3.33", default-features = false, features = ["std"] }
 libc = "0.2.189"
 brush-coreutils-builtins = { version = "0.1.0", path = "../vendor/brush/brush-coreutils-builtins", features = ["coreutils.all"] }
 uucore = "0.8"
+grep-searcher = "0.1"
+grep-regex = "0.1"
+grep-matcher = "0.1"
 
 [profile.release]
 opt-level = "s"
@@ -30,4 +33,8 @@ uu_whoami = { path = "../vendor/patches/uu_whoami" }
 
 [[test]]
 name = "battery"
+harness = false
+
+[[test]]
+name = "concurrency"
 harness = false
