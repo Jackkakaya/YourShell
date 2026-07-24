@@ -1,15 +1,27 @@
 import Foundation
 
-/// One shell session backed by a `brush_core::Shell` instance living on a
-/// dedicated Rust thread. Output arrives on a Rust reader thread and is
-/// forwarded to the main actor.
+/// One shell session backed by a `brush_core::Shell` instance on a dedicated
+/// Rust thread. Output bytes stream to `onOutput` (fed into SwiftTerm);
+/// keyboard bytes come in through `keyInput`, which implements a minimal
+/// line discipline: line editing + local echo while idle, raw forwarding to
+/// the command's stdin while a command runs (enabling `read`, python REPL…).
 final class ShellSession: ObservableObject {
-    @Published var transcript: String = ""
+    /// Terminal feed: raw output bytes (LF already mapped to CRLF).
+    var onOutput: ((ArraySlice<UInt8>) -> Void)?
+
     @Published var cwd: String = ""
-    @Published var busy: Bool = false
+    private(set) var busy = false
+
+    /// Mirror of everything fed to the terminal; used by the selftest/exec
+    /// debug channels so the host can read results from a file.
+    private(set) var transcript: String = ""
 
     private var handle: UnsafeMutableRawPointer?
+    private var lineBuffer: [UInt8] = []
+    private var history: [String] = []
+    private var historyIndex: Int? = nil
     private var demoQueue: [String] = []
+    private var pendingEscape: [UInt8] = []
 
     init() {
         // Point the embedded CPython at the bundled stdlib before the Rust
@@ -25,6 +37,7 @@ final class ShellSession: ObservableObject {
         try? FileManager.default.createDirectory(
             atPath: pySite, withIntermediateDirectories: true)
         setenv("YOURSHELL_PY_SITE", pySite, 1)
+
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         cwd = docs.path
         seedDemoFiles(in: docs)
@@ -34,20 +47,18 @@ final class ShellSession: ObservableObject {
             { ctx, bytes, len in
                 guard let ctx, let bytes, len > 0 else { return }
                 let session = Unmanaged<ShellSession>.fromOpaque(ctx).takeUnretainedValue()
-                let data = Data(bytes: bytes, count: len)
-                let text = String(decoding: data, as: UTF8.self)
-                DispatchQueue.main.async { session.transcript += text }
+                let data = Array(UnsafeBufferPointer(start: bytes, count: len))
+                DispatchQueue.main.async { session.emitPipeOutput(data) }
             },
             { ctx, exitCode, cwdPtr in
                 guard let ctx else { return }
                 let session = Unmanaged<ShellSession>.fromOpaque(ctx).takeUnretainedValue()
                 let newCwd = cwdPtr.map { String(cString: $0) } ?? ""
-                // The output pipe is drained on a separate thread; give the
-                // last chunk a beat to land before we mark the command done.
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
                     if !newCwd.isEmpty { session.cwd = newCwd }
-                    if exitCode != 0 { session.appendLine("[exit \(exitCode)]") }
+                    if exitCode != 0 { session.emitText("[exit \(exitCode)]\r\n") }
                     session.busy = false
+                    session.printPrompt()
                     session.runNextDemoCommand()
                 }
             },
@@ -60,26 +71,156 @@ final class ShellSession: ObservableObject {
         (cwd as NSString).lastPathComponent
     }
 
+    // MARK: terminal output
+
+    /// Pipe bytes use bare LF; terminals need CRLF.
+    private func emitPipeOutput(_ bytes: [UInt8]) {
+        var mapped: [UInt8] = []
+        mapped.reserveCapacity(bytes.count + 16)
+        var previous: UInt8 = 0
+        for b in bytes {
+            if b == 0x0A && previous != 0x0D {
+                mapped.append(0x0D)
+            }
+            mapped.append(b)
+            previous = b
+        }
+        emitBytes(mapped)
+    }
+
+    private func emitText(_ s: String) {
+        emitBytes(Array(s.utf8))
+    }
+
+    private func emitBytes(_ bytes: [UInt8]) {
+        transcript += String(decoding: bytes, as: UTF8.self)
+        onOutput?(bytes[...])
+    }
+
+    func printPrompt() {
+        emitText("\u{1B}[1;32m\(promptPathComponent) $\u{1B}[0m ")
+    }
+
+    // MARK: keyboard input
+
+    func keyInput(_ bytes: ArraySlice<UInt8>) {
+        if busy {
+            // Raw mode: the running command owns stdin. Map CR to LF for
+            // canonical line-based readers.
+            var raw = Array(bytes)
+            for i in raw.indices where raw[i] == 0x0D { raw[i] = 0x0A }
+            // Local echo for line-based interactive programs (python REPL,
+            // read): show what's typed, since the program can't echo.
+            emitBytes(raw.map { $0 == 0x0A ? nil : $0 }.compactMap { $0 })
+            if raw.contains(0x0A) { emitText("\r\n") }
+            if let handle {
+                raw.withUnsafeBufferPointer { buf in
+                    ashell_stdin_write(handle, buf.baseAddress, buf.count)
+                }
+            }
+            return
+        }
+        for b in bytes {
+            handleEditingKey(b)
+        }
+    }
+
+    private func handleEditingKey(_ b: UInt8) {
+        // Arrow keys arrive as ESC [ A/B — track a tiny escape state.
+        if !pendingEscape.isEmpty {
+            pendingEscape.append(b)
+            if pendingEscape.count == 3 {
+                let key = pendingEscape[2]
+                pendingEscape = []
+                if key == 0x41 { recallHistory(direction: -1) }      // Up
+                else if key == 0x42 { recallHistory(direction: 1) }  // Down
+            }
+            return
+        }
+        switch b {
+        case 0x1B:
+            pendingEscape = [b]
+        case 0x0D, 0x0A: // Enter
+            emitText("\r\n")
+            let line = String(decoding: lineBuffer, as: UTF8.self)
+            lineBuffer = []
+            historyIndex = nil
+            submit(line)
+        case 0x7F, 0x08: // Backspace
+            if !lineBuffer.isEmpty {
+                // Pop one UTF-8 scalar (continuation bytes included).
+                while let last = lineBuffer.last, (last & 0xC0) == 0x80 {
+                    lineBuffer.removeLast()
+                }
+                if !lineBuffer.isEmpty { lineBuffer.removeLast() }
+                emitText("\u{08} \u{08}")
+            }
+        case 0x15: // Ctrl-U: kill line
+            eraseCurrentLine()
+            lineBuffer = []
+        case 0x03: // Ctrl-C at prompt: abandon line
+            emitText("^C\r\n")
+            lineBuffer = []
+            printPrompt()
+        default:
+            if b >= 0x20 || b == 0x09 {
+                lineBuffer.append(b)
+                emitBytes([b])
+            }
+        }
+    }
+
+    private func eraseCurrentLine() {
+        let scalars = String(decoding: lineBuffer, as: UTF8.self).count
+        for _ in 0..<scalars { emitText("\u{08} \u{08}") }
+    }
+
+    private func recallHistory(direction: Int) {
+        guard !history.isEmpty else { return }
+        var idx = historyIndex ?? history.count
+        idx = max(0, min(history.count, idx + direction))
+        eraseCurrentLine()
+        if idx == history.count {
+            lineBuffer = []
+            historyIndex = nil
+        } else {
+            let entry = history[idx]
+            lineBuffer = Array(entry.utf8)
+            historyIndex = idx
+            emitText(entry)
+        }
+    }
+
+    private func submit(_ line: String) {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            printPrompt()
+            return
+        }
+        history.append(trimmed)
+        busy = true
+        if let handle {
+            ashell_exec(handle, trimmed)
+        }
+    }
+
+    /// Programmatic execution (demo/debug channels): echoes like a typed line.
     func run(_ command: String) {
         let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, let handle else { return }
-        appendLine("\(promptPathComponent) $ \(trimmed)")
+        emitText("\(trimmed)\r\n")
+        history.append(trimmed)
         busy = true
         ashell_exec(handle, trimmed)
     }
 
-    fileprivate func appendLine(_ line: String) {
-        if !transcript.isEmpty && !transcript.hasSuffix("\n") {
-            transcript += "\n"
-        }
-        transcript += line + "\n"
-    }
+    // MARK: debug channels
 
     /// Runs the full command battery in-process and writes the report to
     /// Documents/selftest_report.txt so it can be pulled from the host.
     func runSelftest() {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        transcript += "running selftest battery (\("all commands")) ...\n"
+        emitText("running selftest battery ...\r\n")
         DispatchQueue.global(qos: .userInitiated).async {
             guard let raw = ashell_selftest(docs.path) else { return }
             let report = String(cString: raw)
@@ -87,7 +228,7 @@ final class ShellSession: ObservableObject {
             try? report.write(
                 to: docs.appendingPathComponent("selftest_report.txt"),
                 atomically: true, encoding: .utf8)
-            DispatchQueue.main.async { self.transcript += report }
+            DispatchQueue.main.async { self.emitPipeOutput(Array(report.utf8)) }
         }
     }
 
@@ -104,17 +245,27 @@ final class ShellSession: ObservableObject {
         }
     }
 
+    /// Debug channel: feed bytes to the running command's stdin after a delay
+    /// (`ASHELL_STDIN_FEED` env) — lets headless tests drive interactive
+    /// programs like the python REPL.
+    func scheduleStdinFeed(_ text: String, after seconds: Double) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { [weak self] in
+            guard let self, let handle = self.handle else { return }
+            let bytes = Array(text.utf8)
+            bytes.withUnsafeBufferPointer { buf in
+                ashell_stdin_write(handle, buf.baseAddress, buf.count)
+            }
+        }
+    }
+
     func startDemo() {
         demoQueue = [
-            "uname -a",
-            "echo hello from brush-core on iOS, pid $$",
+            "uname",
+            "echo YourShell on brush-core, pid $$",
             "ls",
-            "cat poem.txt",
-            "cat poem.txt | wc -l",
-            "for i in 1 2 3; do echo \"loop $i: $((i * i))\"; done",
-            "x=42; if [ $x -gt 10 ]; then echo \"branching works: x=$x\"; fi",
-            "mkdir -p sub && cd sub && pwd && cd ..",
-            "type ls; type cd",
+            "cat poem.txt | grep -n fork",
+            "python3 -c 'print(\"python\", 6*7)'",
+            "seq 3 | sort -r | paste -sd, -",
         ]
         runNextDemoCommand()
     }

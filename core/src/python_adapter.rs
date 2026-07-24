@@ -87,7 +87,11 @@ fn exec_python(
 
         let code = tokio::task::spawn_blocking(move || {
             let mut fds = fds;
+            let mut exported = exported;
             let stdin_buf: Option<Vec<u8>> = if stdin_is_interactive {
+                // Tell the python driver stdin is a live terminal stream so a
+                // bare `python3` starts a REPL instead of draining stdin.
+                exported.push(("YS_STDIN_TTY".to_string(), "1".to_string()));
                 None
             } else {
                 fds[0].take().map(|fd| {

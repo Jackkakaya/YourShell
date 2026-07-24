@@ -1,6 +1,10 @@
 name: AShellRS
 options:
   bundleIdPrefix: dev.sumin
+packages:
+  SwiftTerm:
+    url: https://github.com/migueldeicaza/SwiftTerm
+    from: 1.2.0
 targets:
   AShellRS:
     type: application
@@ -16,6 +20,7 @@ targets:
       - framework: ../vendor/python-ios/Python.xcframework
         embed: true
         codeSign: false
+      - package: SwiftTerm
     settings:
       base:
         SWIFT_OBJC_BRIDGING_HEADER: App/Bridging-Header.h
