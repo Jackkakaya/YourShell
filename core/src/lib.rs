@@ -10,6 +10,8 @@ mod builtins_extra;
 mod uutils_adapter;
 #[cfg(feature = "python")]
 mod python_adapter;
+#[cfg(feature = "vision")]
+mod ocr_adapter;
 pub mod selftest;
 
 use std::collections::HashMap;
@@ -51,6 +53,10 @@ pub(crate) async fn build_shell(
         builder = builder
             .builtin("python3", python_adapter::registration())
             .builtin("python", python_adapter::registration());
+    }
+    #[cfg(feature = "vision")]
+    {
+        builder = builder.builtin("ocr", ocr_adapter::registration());
     }
     builder
         .fds(fds)

@@ -41,3 +41,4 @@ harness = false
 
 [features]
 python = []
+vision = []

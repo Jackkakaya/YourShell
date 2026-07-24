@@ -131,50 +131,30 @@ int ys_python_run(int argc, const char **argv) {
         return 125;
     }
 
-    // Attach the main interpreter to this thread, then detach so the
-    // subinterpreter can own the thread.
+    // Execute in the persistent main interpreter. Per-command isolation
+    // comes from the driver running user code in a fresh __main__-style
+    // globals dict; module state (sys.modules) deliberately persists, since
+    // major C extensions (lxml, numpy) refuse to load into more than one
+    // interpreter per process. Same semantics as a-Shell / Jupyter kernels.
     PyEval_RestoreThread(ys_main_tstate);
-    PyThreadState *mainstate = PyThreadState_Get();
-    PyThreadState_Swap(NULL);
 
-    // Legacy-compatible subinterpreter config: most real-world C extensions
-    // (Pillow, numpy...) still use single-phase init, which own-GIL
-    // subinterpreters refuse to load. We serialize python commands anyway,
-    // so a shared GIL costs nothing and buys the binary-wheel ecosystem.
-    PyInterpreterConfig icfg = {
-        .use_main_obmalloc = 1,
-        .allow_fork = 0,
-        .allow_exec = 0,
-        .allow_threads = 1,
-        .allow_daemon_threads = 1,
-        .check_multi_interp_extensions = 0,
-        .gil = PyInterpreterConfig_SHARED_GIL,
-    };
-    PyThreadState *sub = NULL;
-    PyStatus st = Py_NewInterpreterFromConfig(&sub, &icfg);
     int exit_code = 125;
-
-    if (!PyStatus_Exception(st) && sub != NULL) {
-        PyObject *py_argv = PyList_New(argc);
-        if (py_argv != NULL) {
-            for (int i = 0; i < argc; i++) {
-                PyList_SetItem(py_argv, i, PyUnicode_DecodeFSDefault(argv[i]));
-            }
-            PySys_SetObject("argv", py_argv);
-            Py_DECREF(py_argv);
+    PyObject *py_argv = PyList_New(argc);
+    if (py_argv != NULL) {
+        for (int i = 0; i < argc; i++) {
+            PyList_SetItem(py_argv, i, PyUnicode_DecodeFSDefault(argv[i]));
         }
-
-        int rc = PyRun_SimpleString(YS_DRIVER);
-        exit_code = (rc == 0) ? 0 : 1;
-        PyObject *code_obj = PySys_GetObject("_ys_exit_code"); // borrowed
-        if (code_obj != NULL && PyLong_Check(code_obj)) {
-            exit_code = (int)PyLong_AsLong(code_obj);
-        }
-
-        Py_EndInterpreter(sub);
+        PySys_SetObject("argv", py_argv);
+        Py_DECREF(py_argv);
     }
 
-    PyThreadState_Swap(mainstate);
+    int rc = PyRun_SimpleString(YS_DRIVER);
+    exit_code = (rc == 0) ? 0 : 1;
+    PyObject *code_obj = PySys_GetObject("_ys_exit_code"); // borrowed
+    if (code_obj != NULL && PyLong_Check(code_obj)) {
+        exit_code = (int)PyLong_AsLong(code_obj);
+    }
+
     ys_main_tstate = PyEval_SaveThread();
 
     pthread_mutex_unlock(&ys_py_mutex);

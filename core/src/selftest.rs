@@ -268,7 +268,11 @@ pub static PY_CASES: &[Case] = &[
     // python-pptx blocked upstream: lxml has no iOS wheel yet. A minimal
     // valid .pptx is assembled with stdlib zipfile+xml instead, proving the
     // OOXML container pipeline works end to end.
-    case!("py-pptx-container", "cat > genpptx.py <<'PYSRC'\nimport zipfile\nct = '<Types xmlns=\"x\"></Types>'\nwith zipfile.ZipFile('deck.pptx', 'w') as z:\n    z.writestr('[Content_Types].xml', ct)\n    z.writestr('ppt/presentation.xml', 'stub')\nprint('pptx-entries', len(zipfile.ZipFile('deck.pptx').namelist()))\nPYSRC\npython3 genpptx.py", Eq("pptx-entries 2")),
+    // python-pptx works via the Flet iOS wheel index (lxml + libxml2).
+    case!("py-pptx-real", "python3 -m pip install -q --no-input --only-binary :all: --index-url https://pypi.flet.dev --extra-index-url https://pypi.org/simple --target \"$YOURSHELL_PY_SITE\" python-pptx > /dev/null 2>&1; cat > genppt.py <<'PYSRC'\nfrom pptx import Presentation\nprs = Presentation()\nslide = prs.slides.add_slide(prs.slide_layouts[0])\nslide.shapes.title.text = 'YourShell'\nprs.save('real.pptx')\nprint('pptx-saved')\nPYSRC\npython3 genppt.py; python3 -c 'from pptx import Presentation; print(\"title:\", Presentation(\"real.pptx\").slides[0].shapes.title.text)'", Has("pptx-saved"), Has("title: YourShell")),
+    // Full circle: PIL renders text, the native Vision-backed ocr command
+    // reads it back.
+    case!("ocr-vision-roundtrip", "cat > genocr.py <<'PYSRC'\nfrom PIL import Image, ImageDraw, ImageFont\nimg = Image.new('RGB', (900, 200), 'white')\nd = ImageDraw.Draw(img)\nfont = ImageFont.load_default(size=96)\nd.text((40, 40), 'HELLO YOURSHELL', fill='black', font=font)\nimg.save('ocr_input.png')\nprint('image-ok')\nPYSRC\npython3 genocr.py; ocr ocr_input.png", Has("image-ok"), Has("HELLO"), Has("YOURSHELL")),
 ];
 
 pub fn run_selftest(workdir: &std::path::Path) -> String {
