@@ -174,10 +174,13 @@ final class ShellSession: ObservableObject {
     func keyInput(_ bytes: ArraySlice<UInt8>) {
         if busy {
             if rawMode {
-                // Full-screen program (editor): forward keystrokes verbatim,
-                // no echo, no CR->LF mapping. The program controls the screen.
+                // Full-screen program (editor): forward keystrokes with no echo.
+                // Map CR->LF: raw-mode Enter sends 0x0D, but line-based readers
+                // (nextvi's ex command line) terminate on 0x0A. This mirrors
+                // what a-Shell's vim keyboard forwarder does.
                 if let handle {
-                    let arr = Array(bytes)
+                    var arr = Array(bytes)
+                    for i in arr.indices where arr[i] == 0x0D { arr[i] = 0x0A }
                     arr.withUnsafeBufferPointer { buf in
                         ashell_stdin_write(handle, buf.baseAddress, buf.count)
                     }

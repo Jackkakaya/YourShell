@@ -143,6 +143,7 @@ dependencies = [
  "brush-builtins",
  "brush-core",
  "brush-coreutils-builtins",
+ "cc",
  "clap",
  "flate2",
  "futures",
