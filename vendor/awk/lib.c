@@ -139,6 +139,37 @@ void savefs(void)
 
 static bool firsttime = true;
 
+/* iOS in-process embedding: reset the input/stream state that persists across
+ * invocations of ys_awk_main. Without this a second call skips initgetrec()
+ * (firsttime already false), keeps a stale argno/infile, and — critically —
+ * sees the shared stdin FILE* still flagged EOF from the previous program, so
+ * it reads nothing. Called from ys_awk_main before parsing. */
+void ys_awk_reset_io(void)
+{
+	/* Parse-tree accumulators defined in awkgram.tab.c. beginloc/endloc are
+	 * appended to (linkum) on every yyparse and are NOT cleared per program,
+	 * so without this a prior program's BEGIN/END blocks re-run on the next
+	 * invocation (e.g. a leftover `END{print s}` printing a stale field). */
+	extern Node *beginloc, *endloc, *arglist;
+	extern bool infunc;
+	extern int inloop;
+	extern char *curfname;
+	beginloc = NULL;
+	endloc = NULL;
+	arglist = NULL;
+	infunc = false;
+	inloop = 0;
+	curfname = NULL;
+
+	firsttime = true;
+	argno = 1;
+	infile = NULL;
+	innew = false;
+	clearerr(stdin);
+	clearerr(stdout);
+	clearerr(stderr);
+}
+
 int getrec(char **pbuf, int *pbufsize, bool isrecord)	/* get next input record */
 {			/* note: cares whether buf == record */
 	int c;
@@ -739,6 +770,10 @@ void FATAL(const char *fmt, ...)
 	error();
 	if (dbg > 1)		/* core dump if serious debugging on */
 		abort();
+	/* iOS in-process embedding: longjmp back to ys_awk_main instead of
+	 * killing the host process. */
+	if (ys_awk_jmp_active)
+		longjmp(ys_awk_jmp, 2);
 	exit(2);
 }
 

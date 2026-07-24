@@ -6,6 +6,7 @@
 //! a Swift callback. cwd/env live in the Shell instance, so multiple sessions
 //! in one process stay isolated.
 
+mod awk_adapter;
 mod builtins_extra;
 mod commands_ext;
 mod editor;
@@ -82,6 +83,7 @@ pub(crate) async fn build_shell(
         .builtin("sqlite3", core_builtins::builtin::<commands_ext::SqliteCommand, DefaultShellExtensions>())
         .builtin("jq", core_builtins::builtin::<commands_ext::JqCommand, DefaultShellExtensions>())
         .builtin("git", git_adapter::registration())
+        .builtin("awk", awk_adapter::registration())
         .builtin("edit", core_builtins::builtin::<editor::EditorCommand, DefaultShellExtensions>())
         .builtin("vi", core_builtins::builtin::<editor::EditorCommand, DefaultShellExtensions>())
         .builtin("nano", core_builtins::builtin::<editor::EditorCommand, DefaultShellExtensions>());

@@ -271,6 +271,11 @@ pub static CASES: &[Case] = &[
     case!("rm-missing", "rm nothere.txt 2>/dev/null; echo rc=$?", Eq("rc=1")),
     case!("rm-f-missing", "rm -f nothere.txt; echo rc=$?", Eq("rc=0")),
     case!("rm-r-dir", "mkdir -p rmd/inner; touch rmd/inner/x.txt; rm -r rmd; [ ! -d rmd ] && echo rmr-ok", Eq("rmr-ok")),
+    // ---- awk (one-true-awk, vendored C, in-process) ----
+    case!("awk-field", "echo 'a b c' | awk '{print $2}'", Eq("b"), Exit(0)),
+    case!("awk-sum", "printf '1\\n2\\n3\\n' | awk '{s+=$1} END{print s}'", Eq("6")),
+    case!("awk-fs", "echo 'x,y,z' | awk -F, '{print $3}'", Eq("z")),
+    case!("awk-pattern", "printf 'foo\\nbar\\n' | awk '/foo/{print}'", Eq("foo")),
 ];
 
 /// Python cases run only when the `python` feature is compiled in

@@ -2107,7 +2107,11 @@ Cell *bltin(Node **a, int n)	/* builtin functions. a[0] is type, a[1] is arg lis
 		break;
 	case FSYSTEM:
 		fflush(stdout);		/* in case something is buffered already */
-		estatus = status = system(getsval(x));
+		/* iOS in-process embedding: no fork/exec available; system() is
+		 * stubbed to report failure (-1) rather than spawn a process. */
+		WARNING("system() is not supported in this build");
+		(void) getsval(x);
+		estatus = status = -1;
 		if (status != -1) {
 			if (WIFEXITED(status)) {
 				estatus = WEXITSTATUS(status);
@@ -2301,9 +2305,12 @@ FILE *openfile(int a, const char *us, bool *pnewflag)
 		fp = fopen(s, "a");
 		m = GT;	/* so can mix > and >> */
 	} else if (a == '|') {	/* output pipe */
-		fp = popen(s, "w");
+		/* iOS in-process embedding: no fork/exec; pipes are unsupported. */
+		WARNING("command pipes ('cmd' | ... , print | 'cmd') are not supported in this build");
+		fp = NULL;
 	} else if (a == LE) {	/* input pipe */
-		fp = popen(s, "r");
+		WARNING("command pipes ('cmd' | ... , print | 'cmd') are not supported in this build");
+		fp = NULL;
 	} else if (a == LT) {	/* getline <file */
 		fp = strcmp(s, "-") == 0 ? stdin : fopen(s, "r");	/* "-" is stdin */
 	} else	/* can't happen */
@@ -2355,7 +2362,7 @@ Cell *closefile(Node **a, int n)
 		    files[i].fp == stderr)
 			stat = freopen("/dev/null", "r+", files[i].fp) == NULL;
 		else if (files[i].mode == '|' || files[i].mode == LE)
-			stat = pclose(files[i].fp) == -1;
+			stat = true;	/* iOS: pipes unsupported, never opened */
 		else
 			stat = fclose(files[i].fp) == EOF;
 		if (stat)
@@ -2392,7 +2399,7 @@ void closeall(void)
 		    files[i].fp == stderr)
 			continue;
 		if (files[i].mode == '|' || files[i].mode == LE)
-			stat = pclose(files[i].fp) == -1;
+			stat = true;	/* iOS: pipes unsupported, never opened */
 		else
 			stat = fclose(files[i].fp) == EOF;
 		if (stat)

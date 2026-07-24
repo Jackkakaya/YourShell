@@ -200,6 +200,8 @@ int ys_awk_main(int argc, char *argv[])
 	while (argc > 1 && argv[1][0] == '-' && argv[1][1] != '\0') {
 		if (strcmp(argv[1], "-version") == 0 || strcmp(argv[1], "--version") == 0) {
 			printf("awk %s\n", version);
+			ys_awk_jmp_active = 0;
+			fflush(stdout);
 			return 0;
 		}
 		if (strcmp(argv[1], "--") == 0) {	/* explicit end of args */

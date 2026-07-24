@@ -25,6 +25,7 @@ THIS SOFTWARE.
 #include <assert.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <setjmp.h>
 #if __STDC_VERSION__ <= 199901L
 #define noreturn
 #else

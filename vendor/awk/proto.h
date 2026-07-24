@@ -198,3 +198,9 @@ extern	FILE	*popen(const char *, const char *);
 extern	int	pclose(FILE *);
 
 extern  const char	*flags2str(int flags);
+
+/* iOS in-process embedding (see main.c / lib.c / awk_adapter.rs). */
+extern	jmp_buf	ys_awk_jmp;
+extern	int	ys_awk_jmp_active;
+extern	int	ys_awk_main(int argc, char *argv[]);
+extern	void	ys_awk_reset_io(void);
