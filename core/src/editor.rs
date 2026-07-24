@@ -6,10 +6,13 @@
 //! ANSI on stdout and reads keystrokes from stdin — which the Swift session
 //! forwards verbatim once it sees the alternate-screen enter sequence.
 //!
-//! vi keys — Normal mode: h/j/k/l + arrows move; w/b word; 0/$ line ends;
-//! gg/G top/bottom; i/a/A/o/O enter Insert; x delete char; dd delete line;
-//! yy yank; p paste; `:` command line (:w :q :wq :q! :w <file>). Insert mode:
-//! type text, Esc back to Normal.
+//! vi keys — Normal mode motions: h/j/k/l + arrows; w/b word; 0/^/$ line ends;
+//! gg/G top/bottom; a numeric count prefix repeats them (5j, 10G). Edits:
+//! i/I/a/A/o/O/s enter Insert; x/X delete char; r replace char; ~ toggle case;
+//! D/C to end of line; J join; dd/dw/cc/cw operators; yy yank; p/P paste;
+//! u undo, Ctrl-R redo. Search: /pattern then n/N. `:` command line
+//! (:w :q :wq :q! :w <file>). Files with a known extension get syntax
+//! highlighting (keywords/strings/numbers/comments) in the text area.
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -81,7 +84,23 @@ struct Editor {
     quit: bool,
     mode: Mode,
     cmd: String,
-    pending: Option<char>, // for 2-key normal commands: d, g, y
+    pending: Option<char>, // for 2-key normal commands: d, g, y, c, r
+    count: Option<usize>,  // numeric prefix accumulator (5j, 10dd, 3G)
+    undo: Vec<Snapshot>,
+    redo: Vec<Snapshot>,
+    last_search: String,
+    filetype: Option<Ft>,
+}
+
+/// A point-in-time buffer state for undo/redo.
+type Snapshot = (Vec<String>, usize, usize);
+
+/// Syntax profile for the open file, chosen by extension.
+#[derive(Clone, Copy)]
+struct Ft {
+    line_comment: &'static str,
+    keywords: &'static [&'static str],
+    backtick: bool,
 }
 
 impl Editor {
@@ -100,6 +119,7 @@ impl Editor {
         let name = path
             .as_ref()
             .map_or_else(|| "[new]".to_string(), |p| p.display().to_string());
+        let filetype = path.as_ref().and_then(|p| detect_ft(p));
         Self {
             lines: if lines.is_empty() { vec![String::new()] } else { lines },
             cx: 0,
@@ -119,6 +139,46 @@ impl Editor {
             mode: if modeless { Mode::Insert } else { Mode::Normal },
             cmd: String::new(),
             pending: None,
+            count: None,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            last_search: String::new(),
+            filetype,
+        }
+    }
+
+    /// Snapshot the buffer before a mutation so `u` can revert it.
+    fn push_undo(&mut self) {
+        self.undo.push((self.lines.clone(), self.cy, self.cx));
+        if self.undo.len() > 500 {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+    }
+
+    fn do_undo(&mut self) {
+        if let Some((lines, cy, cx)) = self.undo.pop() {
+            self.redo.push((self.lines.clone(), self.cy, self.cx));
+            self.lines = lines;
+            self.cy = cy.min(self.lines.len().saturating_sub(1));
+            self.cx = cx.min(self.cur_len());
+            self.dirty = true;
+            self.status = "undo".to_string();
+        } else {
+            self.status = "already at oldest change".to_string();
+        }
+    }
+
+    fn do_redo(&mut self) {
+        if let Some((lines, cy, cx)) = self.redo.pop() {
+            self.undo.push((self.lines.clone(), self.cy, self.cx));
+            self.lines = lines;
+            self.cy = cy.min(self.lines.len().saturating_sub(1));
+            self.cx = cx.min(self.cur_len());
+            self.dirty = true;
+            self.status = "redo".to_string();
+        } else {
+            self.status = "already at newest change".to_string();
         }
     }
 
@@ -196,18 +256,41 @@ impl Editor {
     }
 
     fn handle_normal(&mut self, b: u8, stdin: &mut impl Read) -> std::io::Result<()> {
-        // Two-key sequences (dd, gg, yy).
+        // Two-key sequences (dd, dw, cc, cw, gg, yy, r<char>).
         if let Some(first) = self.pending.take() {
             let c = b as char;
+            let n = self.count.take().unwrap_or(1);
             match (first, c) {
-                ('d', 'd') => {
-                    self.clipboard = Some(self.lines.remove(self.cy));
-                    if self.lines.is_empty() {
-                        self.lines.push(String::new());
+                ('r', _) if b >= 0x20 => {
+                    // Replace the char under the cursor with the next keystroke.
+                    let ch = self.read_utf8(b, stdin)?;
+                    if self.cx < self.cur_len() {
+                        self.push_undo();
+                        let line = &mut self.lines[self.cy];
+                        let s = char_to_byte(line, self.cx);
+                        let e = char_to_byte(line, self.cx + 1);
+                        line.replace_range(s..e, &ch.to_string());
+                        self.dirty = true;
                     }
-                    self.cy = self.cy.min(self.lines.len() - 1);
+                }
+                ('d', 'd') => {
+                    self.push_undo();
+                    self.delete_lines(n);
+                }
+                ('d', 'w') => {
+                    self.push_undo();
+                    self.delete_word();
+                }
+                ('c', 'c') => {
+                    self.push_undo();
+                    self.lines[self.cy].clear();
                     self.cx = 0;
-                    self.dirty = true;
+                    self.enter_insert();
+                }
+                ('c', 'w') => {
+                    self.push_undo();
+                    self.delete_word();
+                    self.enter_insert();
                 }
                 ('y', 'y') => {
                     self.clipboard = self.lines.get(self.cy).cloned();
@@ -221,49 +304,127 @@ impl Editor {
             }
             return Ok(());
         }
+        // Numeric count prefix: digits accumulate (but a leading 0 is the "start
+        // of line" motion, not a count).
+        if b.is_ascii_digit() && !(b == b'0' && self.count.is_none()) {
+            self.count = Some(self.count.unwrap_or(0).saturating_mul(10) + (b - b'0') as usize);
+            return Ok(());
+        }
+        let n = self.count.take().unwrap_or(1);
         match b {
-            b'h' => self.move_left(),
-            b'j' => self.move_down(),
-            b'k' => self.move_up(),
-            b'l' => self.move_right(),
+            b'h' => self.repeat(n, Self::move_left),
+            b'j' => self.repeat(n, Self::move_down),
+            b'k' => self.repeat(n, Self::move_up),
+            b'l' => self.repeat(n, Self::move_right),
             b'0' => self.cx = 0,
+            b'^' => self.cx = self.first_non_blank(),
             b'$' => self.cx = self.cur_len().saturating_sub(1),
-            b'w' => self.word_forward(),
-            b'b' => self.word_back(),
+            b'w' => self.repeat(n, Self::word_forward),
+            b'b' => self.repeat(n, Self::word_back),
             b'G' => {
-                self.cy = self.lines.len() - 1;
+                // With a count, jump to that line; otherwise last line.
+                self.cy = if self.count_was(n) {
+                    (n - 1).min(self.lines.len() - 1)
+                } else {
+                    self.lines.len() - 1
+                };
                 self.cx = 0;
             }
-            b'd' | b'g' | b'y' => self.pending = Some(b as char),
+            b'd' | b'g' | b'y' | b'c' | b'r' => {
+                self.count = if n == 1 { None } else { Some(n) }; // preserve for the pair
+                self.pending = Some(b as char);
+            }
             b'x' => {
+                self.push_undo();
+                for _ in 0..n {
+                    let len = self.cur_len();
+                    if self.cx < len {
+                        let line = &mut self.lines[self.cy];
+                        let s = char_to_byte(line, self.cx);
+                        let e = char_to_byte(line, self.cx + 1);
+                        line.replace_range(s..e, "");
+                        self.dirty = true;
+                    }
+                }
+            }
+            b'X' => {
+                self.push_undo();
+                for _ in 0..n {
+                    self.backspace();
+                }
+            }
+            b'D' => {
+                self.push_undo();
+                let s = char_to_byte(&self.lines[self.cy], self.cx);
+                self.lines[self.cy].truncate(s);
+                self.dirty = true;
+            }
+            b'C' => {
+                self.push_undo();
+                let s = char_to_byte(&self.lines[self.cy], self.cx);
+                self.lines[self.cy].truncate(s);
+                self.dirty = true;
+                self.enter_insert();
+            }
+            b'J' => {
+                self.push_undo();
+                self.join_line();
+            }
+            b'~' => {
+                self.push_undo();
+                self.toggle_case();
+            }
+            b'p' => {
+                if let Some(c) = self.clipboard.clone() {
+                    self.push_undo();
+                    self.lines.insert(self.cy + 1, c);
+                    self.cy += 1;
+                    self.dirty = true;
+                }
+            }
+            b'P' => {
+                if let Some(c) = self.clipboard.clone() {
+                    self.push_undo();
+                    self.lines.insert(self.cy, c);
+                    self.dirty = true;
+                }
+            }
+            b'u' => self.do_undo(),
+            0x12 => self.do_redo(), // Ctrl-R
+            b'i' => {
+                self.push_undo();
+                self.enter_insert();
+            }
+            b'I' => {
+                self.push_undo();
+                self.cx = self.first_non_blank();
+                self.enter_insert();
+            }
+            b's' => {
+                self.push_undo();
                 let len = self.cur_len();
                 if self.cx < len {
                     let line = &mut self.lines[self.cy];
                     let s = char_to_byte(line, self.cx);
                     let e = char_to_byte(line, self.cx + 1);
                     line.replace_range(s..e, "");
-                    self.dirty = true;
                 }
+                self.enter_insert();
             }
-            b'p' => {
-                if let Some(c) = self.clipboard.clone() {
-                    self.lines.insert(self.cy + 1, c);
-                    self.cy += 1;
-                    self.dirty = true;
-                }
-            }
-            b'i' => self.enter_insert(),
             b'a' => {
+                self.push_undo();
                 if self.cx < self.cur_len() {
                     self.cx += 1;
                 }
                 self.enter_insert();
             }
             b'A' => {
+                self.push_undo();
                 self.cx = self.cur_len();
                 self.enter_insert();
             }
             b'o' => {
+                self.push_undo();
                 self.lines.insert(self.cy + 1, String::new());
                 self.cy += 1;
                 self.cx = 0;
@@ -271,11 +432,18 @@ impl Editor {
                 self.enter_insert();
             }
             b'O' => {
+                self.push_undo();
                 self.lines.insert(self.cy, String::new());
                 self.cx = 0;
                 self.dirty = true;
                 self.enter_insert();
             }
+            b'/' => {
+                self.mode = Mode::Command;
+                self.cmd = String::from("/");
+            }
+            b'n' => self.search_repeat(true),
+            b'N' => self.search_repeat(false),
             b':' => {
                 self.mode = Mode::Command;
                 self.cmd = String::from(":");
@@ -286,13 +454,131 @@ impl Editor {
         Ok(())
     }
 
+    /// Was the count explicitly typed (vs the default of 1)? Used by `G`.
+    fn count_was(&self, n: usize) -> bool {
+        n != 1 || self.count.is_some()
+    }
+
+    fn repeat(&mut self, n: usize, f: fn(&mut Self)) {
+        for _ in 0..n {
+            f(self);
+        }
+    }
+
+    fn first_non_blank(&self) -> usize {
+        self.lines[self.cy]
+            .chars()
+            .position(|c| !c.is_whitespace())
+            .unwrap_or(0)
+    }
+
+    fn delete_lines(&mut self, n: usize) {
+        let mut yanked = Vec::new();
+        for _ in 0..n {
+            if self.cy < self.lines.len() {
+                yanked.push(self.lines.remove(self.cy));
+            }
+            if self.lines.is_empty() {
+                self.lines.push(String::new());
+                break;
+            }
+        }
+        self.clipboard = Some(yanked.join("\n"));
+        self.cy = self.cy.min(self.lines.len() - 1);
+        self.cx = 0;
+        self.dirty = true;
+    }
+
+    fn delete_word(&mut self) {
+        let chars: Vec<char> = self.lines[self.cy].chars().collect();
+        let mut i = self.cx;
+        while i < chars.len() && !chars[i].is_whitespace() {
+            i += 1;
+        }
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
+        }
+        let s = char_to_byte(&self.lines[self.cy], self.cx);
+        let e = char_to_byte(&self.lines[self.cy], i);
+        self.lines[self.cy].replace_range(s..e, "");
+        self.dirty = true;
+    }
+
+    fn join_line(&mut self) {
+        if self.cy + 1 < self.lines.len() {
+            let next = self.lines.remove(self.cy + 1);
+            let trimmed = next.trim_start();
+            let cur = &mut self.lines[self.cy];
+            if !cur.is_empty() && !cur.ends_with(' ') && !trimmed.is_empty() {
+                cur.push(' ');
+            }
+            cur.push_str(trimmed);
+            self.dirty = true;
+        }
+    }
+
+    fn toggle_case(&mut self) {
+        if self.cx < self.cur_len() {
+            let chars: Vec<char> = self.lines[self.cy].chars().collect();
+            let c = chars[self.cx];
+            let flipped: String = if c.is_uppercase() {
+                c.to_lowercase().collect()
+            } else {
+                c.to_uppercase().collect()
+            };
+            let s = char_to_byte(&self.lines[self.cy], self.cx);
+            let e = char_to_byte(&self.lines[self.cy], self.cx + 1);
+            self.lines[self.cy].replace_range(s..e, &flipped);
+            if self.cx + 1 <= self.cur_len() {
+                self.cx += 1;
+            }
+            self.dirty = true;
+        }
+    }
+
+    /// Search for `last_search` starting just after the cursor; `forward`
+    /// controls direction, and the scan wraps around the buffer.
+    fn search_repeat(&mut self, forward: bool) {
+        if self.last_search.is_empty() {
+            self.status = "no previous search".to_string();
+            return;
+        }
+        let pat = self.last_search.clone();
+        let total = self.lines.len();
+        // Build a flat list of (line, byte-col) candidates by scanning outward.
+        for step in 1..=total {
+            let li = if forward {
+                (self.cy + step) % total
+            } else {
+                (self.cy + total - step) % total
+            };
+            if let Some(col) = self.lines[li].find(&pat) {
+                let cx = self.lines[li][..col].chars().count();
+                self.cy = li;
+                self.cx = cx;
+                self.status = format!("/{pat}");
+                return;
+            }
+        }
+        // Also check the current line after (forward) / before (back) the cursor.
+        self.status = format!("pattern not found: {pat}");
+    }
+
     fn handle_command(&mut self, b: u8) {
         match b {
             0x0D | 0x0A => {
-                let cmd = self.cmd.trim_start_matches(':').trim().to_string();
+                let entry = std::mem::take(&mut self.cmd);
                 self.mode = Mode::Normal;
-                self.cmd.clear();
-                self.run_ex(&cmd);
+                if let Some(pat) = entry.strip_prefix('/') {
+                    // `/pattern`: record and jump to the first forward match.
+                    if !pat.is_empty() {
+                        self.last_search = pat.to_string();
+                    }
+                    self.search_repeat(true);
+                } else {
+                    let cmd = entry.trim_start_matches(':').trim().to_string();
+                    self.run_ex(&cmd);
+                }
             }
             0x1B => {
                 self.mode = Mode::Normal;
@@ -507,7 +793,8 @@ impl Editor {
             if li < self.lines.len() {
                 let line = &self.lines[li];
                 let truncated: String = line.chars().take(self.cols).collect();
-                write!(out, "{truncated}\r\n")?;
+                let painted = self.highlight_line(&truncated);
+                write!(out, "{painted}\r\n")?;
             } else {
                 write!(out, "~\r\n")?;
             }
@@ -535,6 +822,149 @@ impl Editor {
         }
         Ok(())
     }
+}
+
+impl Editor {
+    /// Colorize one already-width-truncated line for the text area. Returns the
+    /// line unchanged when the file has no known syntax profile. Uses a simple
+    /// single-line tokenizer (no multi-line strings/comments), which is enough
+    /// to read code at a glance without a full parser.
+    fn highlight_line(&self, s: &str) -> String {
+        let Some(ft) = self.filetype else {
+            return s.to_string();
+        };
+        const GREY: &str = "\x1b[38;5;245m"; // comments
+        const GREEN: &str = "\x1b[38;5;114m"; // strings
+        const BLUE: &str = "\x1b[38;5;75m"; // keywords
+        const YELLOW: &str = "\x1b[38;5;179m"; // numbers
+        const RESET: &str = "\x1b[0m";
+
+        let chars: Vec<char> = s.chars().collect();
+        let mut out = String::new();
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            // Line comment to end of line.
+            if !ft.line_comment.is_empty() && starts_with_at(&chars, i, ft.line_comment) {
+                out.push_str(GREY);
+                out.extend(chars[i..].iter());
+                out.push_str(RESET);
+                return out;
+            }
+            // String literal (single line).
+            if c == '"' || c == '\'' || (ft.backtick && c == '`') {
+                let quote = c;
+                out.push_str(GREEN);
+                out.push(c);
+                i += 1;
+                while i < chars.len() {
+                    let d = chars[i];
+                    out.push(d);
+                    i += 1;
+                    if d == '\\' && i < chars.len() {
+                        out.push(chars[i]);
+                        i += 1;
+                        continue;
+                    }
+                    if d == quote {
+                        break;
+                    }
+                }
+                out.push_str(RESET);
+                continue;
+            }
+            // Number.
+            if c.is_ascii_digit() {
+                out.push_str(YELLOW);
+                while i < chars.len()
+                    && (chars[i].is_ascii_alphanumeric() || chars[i] == '.' || chars[i] == '_')
+                {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+                out.push_str(RESET);
+                continue;
+            }
+            // Identifier / keyword.
+            if c.is_alphabetic() || c == '_' {
+                let start = i;
+                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let word: String = chars[start..i].iter().collect();
+                if ft.keywords.contains(&word.as_str()) {
+                    out.push_str(BLUE);
+                    out.push_str(&word);
+                    out.push_str(RESET);
+                } else {
+                    out.push_str(&word);
+                }
+                continue;
+            }
+            out.push(c);
+            i += 1;
+        }
+        out
+    }
+}
+
+fn starts_with_at(chars: &[char], i: usize, pat: &str) -> bool {
+    let p: Vec<char> = pat.chars().collect();
+    i + p.len() <= chars.len() && chars[i..i + p.len()] == p[..]
+}
+
+const KW_RUST: &[&str] = &[
+    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
+    "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
+    "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true", "type", "union",
+    "unsafe", "use", "where", "while",
+];
+const KW_PY: &[&str] = &[
+    "and", "as", "assert", "async", "await", "break", "class", "continue", "def", "del", "elif",
+    "else", "except", "False", "finally", "for", "from", "global", "if", "import", "in", "is",
+    "lambda", "None", "nonlocal", "not", "or", "pass", "raise", "return", "True", "try", "while",
+    "with", "yield",
+];
+const KW_JS: &[&str] = &[
+    "async", "await", "break", "case", "catch", "class", "const", "continue", "default", "delete",
+    "do", "else", "export", "extends", "false", "finally", "for", "function", "if", "import", "in",
+    "instanceof", "let", "new", "null", "of", "return", "super", "switch", "this", "throw", "true",
+    "try", "typeof", "var", "void", "while", "yield",
+];
+const KW_C: &[&str] = &[
+    "auto", "break", "case", "char", "const", "continue", "default", "do", "double", "else", "enum",
+    "extern", "float", "for", "goto", "if", "int", "long", "register", "return", "short", "signed",
+    "sizeof", "static", "struct", "switch", "typedef", "union", "unsigned", "void", "volatile",
+    "while", "bool", "class", "namespace", "new", "delete", "public", "private", "template",
+];
+const KW_GO: &[&str] = &[
+    "break", "case", "chan", "const", "continue", "default", "defer", "else", "fallthrough", "for",
+    "func", "go", "goto", "if", "import", "interface", "map", "package", "range", "return", "select",
+    "struct", "switch", "type", "var", "nil", "true", "false",
+];
+const KW_SH: &[&str] = &[
+    "if", "then", "else", "elif", "fi", "case", "esac", "for", "while", "until", "do", "done", "in",
+    "function", "select", "return", "export", "local", "readonly", "declare", "echo", "cd", "exit",
+];
+
+/// Pick a syntax profile from the file extension.
+fn detect_ft(path: &std::path::Path) -> Option<Ft> {
+    let ext = path.extension().and_then(|e| e.to_str())?.to_ascii_lowercase();
+    let (line_comment, keywords, backtick): (&str, &[&str], bool) = match ext.as_str() {
+        "rs" => ("//", KW_RUST, false),
+        "py" | "pyw" => ("#", KW_PY, false),
+        "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" => ("//", KW_JS, true),
+        "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "java" | "swift" | "kt" => ("//", KW_C, false),
+        "go" => ("//", KW_GO, true),
+        "sh" | "bash" | "zsh" | "profile" | "bashrc" | "zshrc" => ("#", KW_SH, false),
+        "json" | "toml" | "yaml" | "yml" | "cfg" | "ini" | "conf" => ("#", &[], false),
+        _ => return None,
+    };
+    Some(Ft {
+        line_comment,
+        keywords,
+        backtick,
+    })
 }
 
 fn char_to_byte(s: &str, char_idx: usize) -> usize {
