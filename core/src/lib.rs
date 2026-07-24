@@ -63,8 +63,19 @@ fn ffi_guard<T>(default: T, f: impl FnOnce() -> T) -> T {
 /// Messages to the session's shell thread.
 enum SessionMsg {
     Exec(String),
+    /// Run a command and capture its output separately, replying with
+    /// (exit, stdout, stderr). Used by non-interactive/agent callers.
+    /// (command, optional timeout ms, reply channel).
+    Capture(String, Option<u64>, mpsc::SyncSender<CaptureReply>),
     /// Tab completion: (line, cursor byte offset, reply channel).
     Complete(String, usize, mpsc::SyncSender<CompletionReply>),
+}
+
+/// Captured output of one command (for `ashell_run_capture`).
+pub struct CaptureReply {
+    exit_code: i32,
+    stdout: String,
+    stderr: String,
 }
 
 /// Completion result handed back to the FFI caller.
@@ -81,6 +92,9 @@ pub struct Session {
     stdin_writer: std::io::PipeWriter,
     /// Cleared on free so lingering worker threads suppress their callbacks.
     alive: Arc<AtomicBool>,
+    /// Signalled by `ashell_cancel` to interrupt the command currently running
+    /// on the shell thread (best-effort — see `ashell_cancel`).
+    cancel: Arc<tokio::sync::Notify>,
     reader_handle: Option<JoinHandle<()>>,
     shell_handle: Option<JoinHandle<()>>,
 }
@@ -157,6 +171,98 @@ pub async fn build_shell_for_tests(
     build_shell(HashMap::new(), working_dir).await
 }
 
+/// Runs one command capturing stdout/stderr separately, with an optional
+/// timeout and cooperative cancellation. Used by the non-interactive/agent
+/// path (`ashell_run_capture`).
+async fn run_capture(
+    shell: &mut brush_core::Shell,
+    cmd: String,
+    timeout_ms: Option<u64>,
+    cancel: &tokio::sync::Notify,
+) -> CaptureReply {
+    let (Ok((out_r, out_w)), Ok((err_r, err_w))) = (std::io::pipe(), std::io::pipe()) else {
+        return CaptureReply {
+            exit_code: 127,
+            stdout: String::new(),
+            stderr: "ashell: pipe allocation failed\n".to_string(),
+        };
+    };
+    // Drain both pipes on their own threads so a command producing more than a
+    // pipe buffer (~64 KB) can't deadlock while we're still awaiting run_string.
+    let out_h = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let mut r = out_r;
+        let _ = r.read_to_end(&mut b);
+        b
+    });
+    let err_h = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let mut r = err_r;
+        let _ = r.read_to_end(&mut b);
+        b
+    });
+
+    // Redirect the SHELL's fd 0/1/2 to the capture pipes (not per-command
+    // `params`, which the uutils adapter doesn't see — it resolves fds from the
+    // shell's open_files). Save the originals to restore afterward so the
+    // interactive path keeps working. Commands run one at a time on this thread,
+    // so this temporary redirection is race-free.
+    let nul = brush_core::openfiles::null().ok();
+    let old0 = nul.map(|n| shell.open_files_mut().set_fd(0.into(), n));
+    let old1 = shell.open_files_mut().set_fd(1.into(), OpenFile::from(out_w));
+    let old2 = shell.open_files_mut().set_fd(2.into(), OpenFile::from(err_w));
+
+    let params = shell.default_exec_params();
+    let source_info = brush_core::SourceInfo::from("agent");
+    let exit_code: i32 = tokio::select! {
+        r = shell.run_string(cmd, &source_info, &params) => match r {
+            Ok(result) => i32::from(u8::from(result.exit_code)),
+            Err(_) => 127,
+        },
+        () = cancel.notified() => 130,      // SIGINT-equivalent
+        () = async {
+            match timeout_ms {
+                Some(ms) => tokio::time::sleep(std::time::Duration::from_millis(ms)).await,
+                None => std::future::pending::<()>().await,
+            }
+        } => 124,                           // timeout, like timeout(1)
+    };
+    drop(params);
+
+    // Restore the session's original fds — this also drops the capture write
+    // ends, so the drain threads see EOF.
+    if let Some(Some(f)) = old0 {
+        shell.open_files_mut().set_fd(0.into(), f);
+    }
+    if let Some(f) = old1 {
+        shell.open_files_mut().set_fd(1.into(), f);
+    }
+    if let Some(f) = old2 {
+        shell.open_files_mut().set_fd(2.into(), f);
+    }
+
+    if exit_code == 124 || exit_code == 130 {
+        // Cancelled/timed out: run_string was dropped mid-flight, so a detached
+        // spawn_blocking command may still hold a pipe write end — joining the
+        // drain threads could block forever. Leave them to finish in the
+        // background and return without the (now-moot) output.
+        let reason = if exit_code == 124 { "timed out" } else { "cancelled" };
+        CaptureReply {
+            exit_code,
+            stdout: String::new(),
+            stderr: format!("ashell: command {reason}\n"),
+        }
+    } else {
+        let stdout = String::from_utf8_lossy(&out_h.join().unwrap_or_default()).into_owned();
+        let stderr = String::from_utf8_lossy(&err_h.join().unwrap_or_default()).into_owned();
+        CaptureReply {
+            exit_code,
+            stdout,
+            stderr,
+        }
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn ashell_session_new(
     out_cb: OutputCb,
@@ -168,6 +274,15 @@ pub extern "C" fn ashell_session_new(
         if working_dir.is_null() {
             return std::ptr::null_mut();
         }
+        // As a staticlib in a Swift app there is no Rust `main`, so the std
+        // runtime's default SIGPIPE→SIG_IGN never runs. Without this, a command
+        // that writes to a pipe whose reader has gone away (a cancelled capture,
+        // a `head`-truncated pipeline) kills the whole app. Ignore it so writes
+        // return EPIPE instead. Installed once, process-wide.
+        static SIGPIPE_ONCE: std::sync::Once = std::sync::Once::new();
+        SIGPIPE_ONCE.call_once(|| unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+        });
         // SAFETY: null-checked above; the caller contracts to pass a valid
         // NUL-terminated C string (from Swift's `path` argument).
         let working_dir = unsafe { CStr::from_ptr(working_dir) }
@@ -183,6 +298,8 @@ pub extern "C" fn ashell_session_new(
         };
         let (cmd_tx, cmd_rx) = mpsc::channel::<SessionMsg>();
         let alive = Arc::new(AtomicBool::new(true));
+        let cancel = Arc::new(tokio::sync::Notify::new());
+        let shell_cancel = cancel.clone();
 
         // Pump command output back to Swift.
         let out_ctx = CallbackCtx(ctx);
@@ -241,8 +358,8 @@ pub extern "C" fn ashell_session_new(
                         SessionMsg::Exec(cmd) => {
                             let params = shell.default_exec_params();
                             let source_info = brush_core::SourceInfo::from("terminal");
-                            let exit_code: i32 =
-                                match shell.run_string(cmd, &source_info, &params).await {
+                            let exit_code: i32 = tokio::select! {
+                                r = shell.run_string(cmd, &source_info, &params) => match r {
                                     Ok(result) => i32::from(u8::from(result.exit_code)),
                                     Err(e) => {
                                         let mut err = params.stderr(&shell);
@@ -250,7 +367,11 @@ pub extern "C" fn ashell_session_new(
                                         let _ = err.flush();
                                         127
                                     }
-                                };
+                                },
+                                // Cancelled: the run_string future is dropped,
+                                // aborting async awaits (ssh/curl/…). 130 = SIGINT.
+                                () = shell_cancel.notified() => 130,
+                            };
                             let cwd = CString::new(
                                 shell.working_dir().to_string_lossy().into_owned(),
                             )
@@ -258,6 +379,10 @@ pub extern "C" fn ashell_session_new(
                             if shell_alive.load(Ordering::Acquire) {
                                 done_cb(shell_ctx.0, exit_code, cwd.as_ptr());
                             }
+                        }
+                        SessionMsg::Capture(cmd, timeout_ms, reply) => {
+                            let out = run_capture(&mut shell, cmd, timeout_ms, &shell_cancel).await;
+                            let _ = reply.send(out);
                         }
                         SessionMsg::Complete(line, pos, reply) => {
                             // Config is cloned to avoid borrowing shell immutably
@@ -287,6 +412,7 @@ pub extern "C" fn ashell_session_new(
             cmd_tx,
             stdin_writer,
             alive,
+            cancel,
             reader_handle: Some(reader_handle),
             shell_handle: Some(shell_handle),
         }))
@@ -304,6 +430,92 @@ pub extern "C" fn ashell_exec(session: *mut Session, cmd: *const c_char) {
         let session = unsafe { &*session };
         let cmd = unsafe { CStr::from_ptr(cmd) }.to_string_lossy().into_owned();
         let _ = session.cmd_tx.send(SessionMsg::Exec(cmd));
+    });
+}
+
+/// Captured result of `ashell_run_capture`. Free with `ashell_capture_free`.
+#[repr(C)]
+pub struct CaptureResult {
+    pub exit_code: i32,
+    pub stdout: *mut c_char,
+    pub stderr: *mut c_char,
+}
+
+/// Runs `cmd` to completion and returns its exit code with stdout/stderr
+/// captured SEPARATELY (unlike the interactive `ashell_exec`, whose output is
+/// merged). Blocks the calling thread until the command finishes, is cancelled
+/// (`ashell_cancel`), or hits `timeout_ms` (0 = no timeout). For the agent /
+/// non-interactive path. Returns null on error; free the result with
+/// `ashell_capture_free`.
+#[unsafe(no_mangle)]
+pub extern "C" fn ashell_run_capture(
+    session: *mut Session,
+    cmd: *const c_char,
+    timeout_ms: u64,
+) -> *mut CaptureResult {
+    if session.is_null() || cmd.is_null() {
+        return std::ptr::null_mut();
+    }
+    ffi_guard(std::ptr::null_mut(), || {
+        // SAFETY: both pointers null-checked above; valid per the FFI contract.
+        let session = unsafe { &*session };
+        let cmd = unsafe { CStr::from_ptr(cmd) }.to_string_lossy().into_owned();
+        let (tx, rx) = mpsc::sync_channel::<CaptureReply>(1);
+        let timeout = (timeout_ms != 0).then_some(timeout_ms);
+        if session
+            .cmd_tx
+            .send(SessionMsg::Capture(cmd, timeout, tx))
+            .is_err()
+        {
+            return std::ptr::null_mut();
+        }
+        let Ok(reply) = rx.recv() else {
+            return std::ptr::null_mut();
+        };
+        // A C string can't carry interior NULs; strip them (agent output is
+        // text — binary handling is the caller's policy).
+        let to_c = |s: String| CString::new(s.replace('\0', "")).unwrap_or_default().into_raw();
+        Box::into_raw(Box::new(CaptureResult {
+            exit_code: reply.exit_code,
+            stdout: to_c(reply.stdout),
+            stderr: to_c(reply.stderr),
+        }))
+    })
+}
+
+/// Requests cancellation of the command currently running on the session's
+/// shell thread. Best-effort: async awaits (ssh/mosh/network) are dropped at
+/// their `.await` point; a command executing vendored C in a blocking thread
+/// (uutils/python/node) can't be force-stopped and finishes in the background
+/// while its result is discarded. A no-op when nothing is running.
+#[unsafe(no_mangle)]
+pub extern "C" fn ashell_cancel(session: *mut Session) {
+    if session.is_null() {
+        return;
+    }
+    ffi_guard((), || {
+        // SAFETY: null-checked above; valid per the FFI contract.
+        let session = unsafe { &*session };
+        // notify_waiters (not notify_one) so a cancel with no command running
+        // doesn't leave a permit that would spuriously cancel the next command.
+        session.cancel.notify_waiters();
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ashell_capture_free(result: *mut CaptureResult) {
+    if result.is_null() {
+        return;
+    }
+    ffi_guard((), || {
+        // SAFETY: reclaims a CaptureResult from ashell_run_capture; call once.
+        let r = unsafe { Box::from_raw(result) };
+        if !r.stdout.is_null() {
+            drop(unsafe { CString::from_raw(r.stdout) });
+        }
+        if !r.stderr.is_null() {
+            drop(unsafe { CString::from_raw(r.stderr) });
+        }
     });
 }
 
