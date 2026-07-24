@@ -354,14 +354,38 @@ fn gzip_run<SE: ShellExtensions>(
         return Ok(ExecutionResult::success());
     }
 
+    let mut stderr = context.stderr();
+    let mut had_error = false;
     for f in files {
         let path = abs(&cwd, f);
-        let data = std::fs::read(&path).unwrap_or_default();
+        // Read the input; a read failure must NOT be treated as empty data (that
+        // would write an empty output and then delete the original).
+        let data = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(e) => {
+                let _ = writeln!(stderr, "gzip: {}: {e}", path.display());
+                had_error = true;
+                continue;
+            }
+        };
         let (output, out_path) = if decompress {
+            // Only decompress files that actually end in `.gz`; otherwise the
+            // output path would equal the input path and we'd overwrite then
+            // delete the source.
+            let Some(stripped) = path.to_string_lossy().strip_suffix(".gz").map(str::to_string)
+            else {
+                let _ = writeln!(stderr, "gzip: {}: unknown suffix -- ignored", path.display());
+                had_error = true;
+                continue;
+            };
             let mut d = GzDecoder::new(&data[..]);
             let mut buf = Vec::new();
-            d.read_to_end(&mut buf)?;
-            (buf, path.to_string_lossy().trim_end_matches(".gz").to_string())
+            if let Err(e) = d.read_to_end(&mut buf) {
+                let _ = writeln!(stderr, "gzip: {}: not in gzip format: {e}", path.display());
+                had_error = true;
+                continue;
+            }
+            (buf, stripped)
         } else {
             let mut e = GzEncoder::new(Vec::new(), Compression::default());
             e.write_all(&data)?;
@@ -369,15 +393,16 @@ fn gzip_run<SE: ShellExtensions>(
         };
         if to_stdout {
             stdout.write_all(&output)?;
-        } else {
-            std::fs::write(&out_path, &output)?;
-            if !keep {
-                let _ = std::fs::remove_file(&path);
-            }
+        } else if let Err(e) = std::fs::write(&out_path, &output) {
+            let _ = writeln!(stderr, "gzip: {out_path}: {e}");
+            had_error = true;
+        } else if !keep {
+            // Only remove the source after a confirmed successful write.
+            let _ = std::fs::remove_file(&path);
         }
     }
     stdout.flush()?;
-    Ok(ExecutionResult::success())
+    Ok(ExecutionResult::new(u8::from(had_error)))
 }
 
 // ---------------------------------------------------------------- sed

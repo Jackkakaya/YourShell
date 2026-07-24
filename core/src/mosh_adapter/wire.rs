@@ -146,6 +146,13 @@ impl FragmentAssembler {
     }
 
     pub fn add(&mut self, id: u64, num: u16, is_final: bool, contents: &[u8]) -> Option<Vec<u8>> {
+        // A legitimate full-screen diff is a handful of MTU-sized fragments;
+        // reject an absurd fragment index so a malicious server can't make us
+        // allocate a huge sparse fragment table.
+        const MAX_FRAGMENTS: u16 = 4096;
+        if num >= MAX_FRAGMENTS {
+            return None;
+        }
         if self.id != Some(id) {
             self.id = Some(id);
             self.fragments.clear();
@@ -189,12 +196,20 @@ pub fn zlib_compress(data: &[u8]) -> Vec<u8> {
     e.finish().unwrap_or_default()
 }
 
+/// Upper bound on a single decompressed Instruction. A mosh transport
+/// instruction is at most a few full-screen framebuffer diffs; 8 MiB is far
+/// more than legitimate traffic and caps a decompression bomb from a
+/// compromised/malicious server so it can't OOM the app.
+const MAX_DECOMPRESSED: u64 = 8 * 1024 * 1024;
+
 pub fn zlib_decompress(data: &[u8]) -> Option<Vec<u8>> {
     use flate2::read::ZlibDecoder;
     use std::io::Read;
-    let mut d = ZlibDecoder::new(data);
+    let mut d = ZlibDecoder::new(data).take(MAX_DECOMPRESSED + 1);
     let mut out = Vec::new();
-    d.read_to_end(&mut out).ok().map(|_| out)
+    d.read_to_end(&mut out).ok()?;
+    // Reject anything that hit the cap (potential decompression bomb).
+    (out.len() as u64 <= MAX_DECOMPRESSED).then_some(out)
 }
 
 // --- TransportBuffers.Instruction (proto2, hand-encoded) --------------------
@@ -225,6 +240,16 @@ fn put_varint(mut v: u64, out: &mut Vec<u8>) {
 
 fn put_tag(field: u32, wire: u32, out: &mut Vec<u8>) {
     put_varint(((field as u64) << 3) | wire as u64, out);
+}
+
+/// Reads a length-delimited field's bytes at `pos` and advances past it.
+/// Bounds-checked: returns None if the length overruns the buffer, avoiding the
+/// `pos + len` overflow / out-of-bounds slice on a malformed length field.
+fn read_len_delimited<'a>(buf: &'a [u8], pos: &mut usize) -> Option<&'a [u8]> {
+    let len = get_varint(buf, pos)? as usize;
+    let slice = buf.get(*pos..).and_then(|s| s.get(..len))?;
+    *pos += len;
+    Some(slice)
 }
 
 fn get_varint(buf: &[u8], pos: &mut usize) -> Option<u64> {
@@ -284,26 +309,17 @@ impl Instruction {
                 (3, 0) => inst.new_num = get_varint(buf, &mut pos)?,
                 (4, 0) => inst.ack_num = get_varint(buf, &mut pos)?,
                 (5, 0) => inst.throwaway_num = get_varint(buf, &mut pos)?,
-                (6, 2) => {
-                    let len = get_varint(buf, &mut pos)? as usize;
-                    inst.diff = buf.get(pos..pos + len)?.to_vec();
-                    pos += len;
-                }
-                (7, 2) => {
-                    let len = get_varint(buf, &mut pos)? as usize;
-                    inst.chaff = buf.get(pos..pos + len)?.to_vec();
-                    pos += len;
-                }
+                (6, 2) => inst.diff = read_len_delimited(buf, &mut pos)?.to_vec(),
+                (7, 2) => inst.chaff = read_len_delimited(buf, &mut pos)?.to_vec(),
                 // Skip unknown fields by wire type.
                 (_, 0) => {
                     get_varint(buf, &mut pos)?;
                 }
                 (_, 2) => {
-                    let len = get_varint(buf, &mut pos)? as usize;
-                    pos += len;
+                    read_len_delimited(buf, &mut pos)?;
                 }
-                (_, 5) => pos += 4,
-                (_, 1) => pos += 8,
+                (_, 5) => pos = pos.saturating_add(4),
+                (_, 1) => pos = pos.saturating_add(8),
                 _ => return None,
             }
         }
@@ -359,21 +375,18 @@ fn for_each_field1<'a>(buf: &'a [u8], mut f: impl FnMut(&'a [u8])) {
         let wire = key & 7;
         match wire {
             2 => {
-                let Some(len) = get_varint(buf, &mut pos) else { return };
-                let len = len as usize;
-                let Some(slice) = buf.get(pos..pos + len) else { return };
+                let Some(slice) = read_len_delimited(buf, &mut pos) else { return };
                 if field == 1 {
                     f(slice);
                 }
-                pos += len;
             }
             0 => {
                 if get_varint(buf, &mut pos).is_none() {
                     return;
                 }
             }
-            5 => pos += 4,
-            1 => pos += 8,
+            5 => pos = pos.saturating_add(4),
+            1 => pos = pos.saturating_add(8),
             _ => return,
         }
     }
@@ -389,18 +402,16 @@ fn nested_field<'a>(buf: &'a [u8], field: u64) -> Option<&'a [u8]> {
         let wire = key & 7;
         match wire {
             2 => {
-                let len = get_varint(buf, &mut pos)? as usize;
-                let slice = buf.get(pos..pos + len)?;
+                let slice = read_len_delimited(buf, &mut pos)?;
                 if f == field {
                     return Some(slice);
                 }
-                pos += len;
             }
             0 => {
                 get_varint(buf, &mut pos)?;
             }
-            5 => pos += 4,
-            1 => pos += 8,
+            5 => pos = pos.saturating_add(4),
+            1 => pos = pos.saturating_add(8),
             _ => return None,
         }
     }
@@ -549,6 +560,25 @@ mod tests {
     fn fragment_assembly_single() {
         let mut a = FragmentAssembler::new();
         assert_eq!(a.add(9, 0, true, b"solo"), Some(b"solo".to_vec()));
+    }
+
+    #[test]
+    fn fragment_absurd_index_rejected() {
+        let mut a = FragmentAssembler::new();
+        assert_eq!(a.add(1, 60000, true, b"x"), None);
+    }
+
+    #[test]
+    fn decode_malformed_length_does_not_panic() {
+        // field 6 (diff), wire 2, length varint = huge, but no payload bytes.
+        // 0x32 = (6<<3)|2. Then a 5-byte varint encoding a large length.
+        let bytes = [0x32, 0xff, 0xff, 0xff, 0xff, 0x0f];
+        assert_eq!(Instruction::decode(&bytes), None); // bounded, no panic/overflow
+    }
+
+    #[test]
+    fn decode_truncated_varint_is_none() {
+        assert_eq!(Instruction::decode(&[0x08, 0x80]), None); // varint continues past end
     }
 
     #[test]
