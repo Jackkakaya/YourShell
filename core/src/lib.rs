@@ -11,6 +11,7 @@ mod builtins_extra;
 mod commands_ext;
 mod editor;
 mod git_adapter;
+mod sftp_adapter;
 mod ssh_adapter;
 mod uutils_adapter;
 #[cfg(feature = "python")]
@@ -86,6 +87,8 @@ pub(crate) async fn build_shell(
         .builtin("git", git_adapter::registration())
         .builtin("awk", awk_adapter::registration())
         .builtin("ssh", ssh_adapter::registration())
+        .builtin("scp", sftp_adapter::registration_scp())
+        .builtin("sftp", sftp_adapter::registration_sftp())
         .builtin("edit", core_builtins::builtin::<editor::EditorCommand, DefaultShellExtensions>())
         .builtin("vi", core_builtins::builtin::<editor::EditorCommand, DefaultShellExtensions>())
         .builtin("nano", core_builtins::builtin::<editor::EditorCommand, DefaultShellExtensions>());

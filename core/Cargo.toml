@@ -33,6 +33,7 @@ zip = "8.6.0"
 rusqlite = { version = "0.32", features = ["bundled"] }
 git2 = { version = "0.21.0", default-features = false, features = ["https", "vendored-libgit2", "vendored-openssl"] }
 russh = { version = "0.62", default-features = false, features = ["ring", "flate2", "rsa"] }
+russh-sftp = "2.3"
 tokio-fd = "0.3"
 
 [profile.release]

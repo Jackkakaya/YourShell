@@ -178,7 +178,7 @@ fn parse_opts(argv: &[String], getenv: &dyn Fn(&str) -> Option<String>) -> Resul
 
 /// Accepts any host key (TOFU/insecure). TODO: verify against ~/.ssh/known_hosts
 /// once we surface the fingerprint prompt through the raw channel.
-struct ClientHandler;
+pub(crate) struct ClientHandler;
 
 impl Handler for ClientHandler {
     type Error = russh::Error;
@@ -189,6 +189,64 @@ impl Handler for ClientHandler {
     ) -> Result<bool, Self::Error> {
         Ok(true)
     }
+}
+
+/// Authenticated russh client session, shared by the `ssh` and `sftp`/`scp`
+/// adapters.
+pub(crate) type Session = client::Handle<ClientHandler>;
+
+/// TCP-connect and run the SSH handshake (host key accepted TOFU).
+pub(crate) async fn connect_session(host: &str, port: u16) -> Result<Session, russh::Error> {
+    let config = Arc::new(client::Config {
+        inactivity_timeout: Some(Duration::from_secs(3600)),
+        ..Default::default()
+    });
+    client::connect(config, (host, port), ClientHandler).await
+}
+
+/// Non-interactive auth: each unencrypted key in `-i`/~/.ssh, then
+/// `$SSH_PASSWORD`. Returns true on success. (The `ssh` builtin adds an
+/// interactive no-echo prompt on top of this; `sftp`/`scp` do not.)
+pub(crate) async fn key_and_env_auth(
+    session: &mut Session,
+    user: &str,
+    home: &std::path::Path,
+    identity: Option<&std::path::Path>,
+    password_env: Option<&str>,
+) -> bool {
+    let mut key_paths: Vec<PathBuf> = Vec::new();
+    if let Some(id) = identity {
+        key_paths.push(id.to_path_buf());
+    } else {
+        for name in ["id_ed25519", "id_ecdsa", "id_rsa"] {
+            key_paths.push(home.join(".ssh").join(name));
+        }
+    }
+    for path in key_paths {
+        if !path.exists() {
+            continue;
+        }
+        let Ok(key) = load_secret_key(&path, None) else {
+            continue; // encrypted or unreadable — skip
+        };
+        let hash = session.best_supported_rsa_hash().await.ok().flatten().flatten();
+        if let Ok(res) = session
+            .authenticate_publickey(user, PrivateKeyWithHashAlg::new(Arc::new(key), hash))
+            .await
+        {
+            if res.success() {
+                return true;
+            }
+        }
+    }
+    if let Some(pw) = password_env {
+        if let Ok(res) = session.authenticate_password(user, pw).await {
+            if res.success() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 async fn run_session(opts: Opts, fd0: OwnedFd, fd1: OwnedFd, fd2: OwnedFd) -> u8 {
@@ -203,14 +261,7 @@ async fn run_session(opts: Opts, fd0: OwnedFd, fd1: OwnedFd, fd2: OwnedFd) -> u8
         }};
     }
 
-    let config = Arc::new(client::Config {
-        inactivity_timeout: Some(Duration::from_secs(3600)),
-        ..Default::default()
-    });
-
-    let mut session = match client::connect(config, (opts.host.as_str(), opts.port), ClientHandler)
-        .await
-    {
+    let mut session = match connect_session(&opts.host, opts.port).await {
         Ok(s) => s,
         Err(e) => {
             eprint_fd!("ssh: connect {}:{} failed: {e}\n", opts.host, opts.port);
@@ -219,54 +270,27 @@ async fn run_session(opts: Opts, fd0: OwnedFd, fd1: OwnedFd, fd2: OwnedFd) -> u8
     };
 
     // --- Authentication ---------------------------------------------------
-    let mut authed = false;
+    // Keys + $SSH_PASSWORD first; then an interactive no-echo prompt (raw fd 0).
+    let mut authed = key_and_env_auth(
+        &mut session,
+        &opts.user,
+        &opts.home,
+        opts.identity.as_deref(),
+        opts.password_env.as_deref(),
+    )
+    .await;
 
-    // 1. Public keys from -i or the usual ~/.ssh names (unencrypted only).
-    let mut key_paths: Vec<PathBuf> = Vec::new();
-    if let Some(id) = &opts.identity {
-        key_paths.push(id.clone());
-    } else {
-        for name in ["id_ed25519", "id_ecdsa", "id_rsa"] {
-            key_paths.push(opts.home.join(".ssh").join(name));
-        }
-    }
-    for path in key_paths {
-        if !path.exists() {
-            continue;
-        }
-        let key = match load_secret_key(&path, None) {
-            Ok(k) => k,
-            Err(_) => continue, // encrypted or unreadable — skip
-        };
-        let hash = session.best_supported_rsa_hash().await.ok().flatten().flatten();
-        if let Ok(res) = session
-            .authenticate_publickey(&opts.user, PrivateKeyWithHashAlg::new(Arc::new(key), hash))
-            .await
-        {
-            if res.success() {
-                authed = true;
-                break;
-            }
-        }
-    }
-
-    // 2. $SSH_PASSWORD, then an interactive no-echo prompt (raw off fd 0).
     if !authed {
-        // Enter the alternate screen now so the password prompt reads raw
-        // keystrokes without local echo.
+        // Enter the alternate screen so the password prompt reads raw keystrokes
+        // without local echo.
         let _ = write_all_fd(raw1, b"\x1b[?1049h");
         let restore = FdFlagsGuard::capture(&[raw0, raw1]);
 
-        for attempt in 0..3 {
-            let password = if attempt == 0 && opts.password_env.is_some() {
-                opts.password_env.clone().unwrap()
-            } else {
-                let prompt = format!("\r\n{}@{}'s password: ", opts.user, opts.host);
-                let _ = write_all_fd(raw1, prompt.as_bytes());
-                match read_password_raw(raw0).await {
-                    Some(p) => p,
-                    None => break,
-                }
+        for _ in 0..3 {
+            let prompt = format!("\r\n{}@{}'s password: ", opts.user, opts.host);
+            let _ = write_all_fd(raw1, prompt.as_bytes());
+            let Some(password) = read_password_raw(raw0).await else {
+                break;
             };
             match session.authenticate_password(&opts.user, &password).await {
                 Ok(res) if res.success() => {
