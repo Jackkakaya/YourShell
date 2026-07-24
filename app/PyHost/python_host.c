@@ -137,14 +137,18 @@ int ys_python_run(int argc, const char **argv) {
     PyThreadState *mainstate = PyThreadState_Get();
     PyThreadState_Swap(NULL);
 
+    // Legacy-compatible subinterpreter config: most real-world C extensions
+    // (Pillow, numpy...) still use single-phase init, which own-GIL
+    // subinterpreters refuse to load. We serialize python commands anyway,
+    // so a shared GIL costs nothing and buys the binary-wheel ecosystem.
     PyInterpreterConfig icfg = {
-        .use_main_obmalloc = 0,
+        .use_main_obmalloc = 1,
         .allow_fork = 0,
         .allow_exec = 0,
         .allow_threads = 1,
-        .allow_daemon_threads = 0,
-        .check_multi_interp_extensions = 1,
-        .gil = PyInterpreterConfig_OWN_GIL,
+        .allow_daemon_threads = 1,
+        .check_multi_interp_extensions = 0,
+        .gil = PyInterpreterConfig_SHARED_GIL,
     };
     PyThreadState *sub = NULL;
     PyStatus st = Py_NewInterpreterFromConfig(&sub, &icfg);

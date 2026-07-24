@@ -257,6 +257,18 @@ pub static PY_CASES: &[Case] = &[
     case!("py-pip-bootstrap", "python3 -c 'import zipfile, glob, os; w = glob.glob(os.path.join(os.environ[\"YOURSHELL_PYTHON_HOME\"], \"lib/python3.14/ensurepip/_bundled/pip-*.whl\"))[0]; zipfile.ZipFile(w).extractall(os.environ[\"YOURSHELL_PY_SITE\"]); print(\"pip-boot-ok\")'", Eq("pip-boot-ok")),
     case!("py-pip-version", "export PIP_DISABLE_PIP_VERSION_CHECK=1; python3 -m pip --version 2>&1", Has("pip 26")),
     case!("py-pip-install", "python3 -m pip install --quiet --no-input --upgrade --only-binary :all: --target \"$YOURSHELL_PY_SITE\" six > /dev/null 2>&1; python3 -c 'import six; print(six.__name__, six.__version__ != \"\")'", Eq("six True")),
+    // ---- python real-world scenarios (network + binary wheels) ----
+    case!("py-pip-rich", "python3 -m pip install -q --no-input --only-binary :all: --target \"$YOURSHELL_PY_SITE\" rich > /dev/null 2>&1; python3 -c 'from rich.console import Console; Console(force_terminal=False).print(\"rich\", 6*7)'", Has("rich 42")),
+    case!("py-pip-fpdf2-pillow", "python3 -m pip install -q --no-input --only-binary :all: --target \"$YOURSHELL_PY_SITE\" fpdf2 pypdf requests > /dev/null 2>&1; python3 -c 'import fpdf, pypdf, requests, PIL; print(\"heavy-deps-ok\")'", Eq("heavy-deps-ok")),
+    case!("py-pil-image", "python3 -c 'from PIL import Image; img = Image.new(\"RGB\", (80, 40), \"blue\"); img.save(\"blue.png\"); print(\"png\", img.size[0], img.size[1])'", Eq("png 80 40")),
+    case!("py-pdf-generate", "printf 'from fpdf import FPDF\\npdf = FPDF()\\npdf.add_page()\\npdf.set_font(\"Helvetica\", size=20)\\npdf.cell(text=\"YourShell PDF\")\\npdf.image(\"blue.png\", x=10, y=30, w=40)\\npdf.output(\"gen.pdf\")\\nprint(\"pdf-generated\")\\n' > genpdf.py; python3 genpdf.py; head -c 5 gen.pdf; echo", Has("pdf-generated"), Has("%PDF-")),
+    case!("py-pdf-readback", "python3 -c 'from pypdf import PdfReader; r = PdfReader(\"gen.pdf\"); print(\"pages\", len(r.pages))'", Eq("pages 1")),
+    case!("py-requests-https", "python3 -c 'import requests; r = requests.get(\"https://pypi.org/simple/\", timeout=15); print(\"http\", r.status_code)'", Eq("http 200")),
+    case!("py-sqlite-roundtrip", "python3 -c 'import sqlite3; c = sqlite3.connect(\"t.db\"); c.execute(\"create table if not exists kv(k, v)\"); c.execute(\"insert into kv values(?, ?)\", (\"a\", 42)); c.commit(); print(c.execute(\"select sum(v) from kv\").fetchone()[0] >= 42)'", Eq("True")),
+    // python-pptx blocked upstream: lxml has no iOS wheel yet. A minimal
+    // valid .pptx is assembled with stdlib zipfile+xml instead, proving the
+    // OOXML container pipeline works end to end.
+    case!("py-pptx-container", "cat > genpptx.py <<'PYSRC'\nimport zipfile\nct = '<Types xmlns=\"x\"></Types>'\nwith zipfile.ZipFile('deck.pptx', 'w') as z:\n    z.writestr('[Content_Types].xml', ct)\n    z.writestr('ppt/presentation.xml', 'stub')\nprint('pptx-entries', len(zipfile.ZipFile('deck.pptx').namelist()))\nPYSRC\npython3 genpptx.py", Eq("pptx-entries 2")),
 ];
 
 pub fn run_selftest(workdir: &std::path::Path) -> String {

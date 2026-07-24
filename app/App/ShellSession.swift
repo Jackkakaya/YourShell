@@ -21,6 +21,7 @@ final class ShellSession: ObservableObject {
     private var history: [String] = []
     private var historyIndex: Int? = nil
     private var demoQueue: [String] = []
+    var mirrorTranscript = false
     private var pendingEscape: [UInt8] = []
 
     init() {
@@ -59,6 +60,13 @@ final class ShellSession: ObservableObject {
                     if exitCode != 0 { session.emitText("[exit \(exitCode)]\r\n") }
                     session.busy = false
                     session.printPrompt()
+                    if session.mirrorTranscript {
+                        let docs = FileManager.default.urls(
+                            for: .documentDirectory, in: .userDomainMask)[0]
+                        try? session.transcript.write(
+                            to: docs.appendingPathComponent("exec_out.txt"),
+                            atomically: true, encoding: .utf8)
+                    }
                     session.runNextDemoCommand()
                 }
             },
@@ -235,14 +243,8 @@ final class ShellSession: ObservableObject {
     /// Debug channel: run one command, mirror the transcript to a file so the
     /// host can read it (`ASHELL_EXEC` env, output in Documents/exec_out.txt).
     func runSingle(_ cmd: String) {
+        mirrorTranscript = true
         run(cmd)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
-            guard let self else { return }
-            let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-            try? self.transcript.write(
-                to: docs.appendingPathComponent("exec_out.txt"),
-                atomically: true, encoding: .utf8)
-        }
     }
 
     /// Debug channel: feed bytes to the running command's stdin after a delay
