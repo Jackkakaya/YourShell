@@ -296,6 +296,27 @@ impl ClientState {
         self.input_num += 1;
         self.states.push((self.input_num, self.events.len()));
     }
+
+    /// Drops the events/states the server has already acknowledged so a long
+    /// session's input history can't grow without bound. Events before the
+    /// assumed-ack state are confirmed delivered; keep the rest (still needed
+    /// for retransmit) and rebase their counts to the trimmed vector.
+    fn trim_acked(&mut self) {
+        let keep_from = self.event_count_for(self.assumed_ack);
+        // Only bother once some history has accumulated (avoids per-keystroke
+        // work in the common short session).
+        if keep_from < 64 {
+            return;
+        }
+        self.events.drain(0..keep_from);
+        self.states.retain(|(n, _)| *n >= self.assumed_ack);
+        for (_, c) in &mut self.states {
+            *c = c.saturating_sub(keep_from);
+        }
+        if self.states.first().map(|(n, _)| *n) != Some(self.assumed_ack) {
+            self.states.insert(0, (self.assumed_ack, 0));
+        }
+    }
 }
 
 fn now_ms() -> u16 {
@@ -378,27 +399,31 @@ async fn client_loop(
     st.push_event(wire::UserEvent::Resize(cols as i32, rows as i32));
     send_state(crypto, &sock, &mut st).await;
 
-    // Debug: bound the session length so headless tests can flush the transcript.
-    let max_ticks = std::env::var("MOSH_MAX_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .map(|s| s * 10);
-    // Debug: force a roam at this tick to exercise the roaming path.
-    let roam_at_tick = std::env::var("MOSH_ROAM_AFTER")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .map(|s| s * 10);
+    // Debug: bound the session length (seconds) / force a roam (seconds).
+    let max_secs = std::env::var("MOSH_MAX_SECS").ok().and_then(|v| v.parse::<u64>().ok());
+    let roam_after = std::env::var("MOSH_ROAM_AFTER").ok().and_then(|v| v.parse::<u64>().ok());
 
     let mut kbuf = [0u8; 4096];
     let mut dbuf = [0u8; 2048];
-    let mut tick = tokio::time::interval(Duration::from_millis(100));
-    let mut total_ticks = 0u32;
-    let mut silent_ticks = 0u32;
     let mut recv_errors = 0u32; // consecutive ECONNREFUSED (server gone)
     let mut connected = false; // received at least one server datagram
     let mut escape_armed = false; // Ctrl-^ then '.' quits
+    let mut roamed = false;
+    let start = std::time::Instant::now();
+    let mut last_recv = start;
+    let mut last_heartbeat = start;
 
     loop {
+        // Energy: only poll fast (200ms) while there's unacked input to
+        // retransmit; when idle, wake once a second (both sides still heartbeat
+        // every ~2-3s, and the server's packets wake us via recv). This avoids a
+        // constant 10 Hz timer burning CPU/battery during an idle session.
+        let has_unacked = st.input_num > st.assumed_ack;
+        let tick_dur = if has_unacked {
+            Duration::from_millis(200)
+        } else {
+            Duration::from_millis(1000)
+        };
         tokio::select! {
             r = stdin.read(&mut kbuf) => {
                 match r {
@@ -436,7 +461,7 @@ async fn client_loop(
                         // multiple datagrams), then decode the Instruction.
                         if let Some(opened) = crypto.open(&dbuf[..n]) {
                             connected = true;
-                            silent_ticks = 0;
+                            last_recv = std::time::Instant::now();
                             st.last_recv_ts = opened.timestamp;
                             if let Some((id, num, is_final, contents)) =
                                 wire::parse_fragment(&opened.payload)
@@ -447,6 +472,7 @@ async fn client_loop(
                                     {
                                         if inst.ack_num > st.assumed_ack {
                                             st.assumed_ack = inst.ack_num;
+                                            st.trim_acked();
                                         }
                                         if inst.new_num > st.last_recv_num {
                                             let bytes = decode_host_message(&inst.diff);
@@ -487,36 +513,37 @@ async fn client_loop(
                     }
                 }
             }
-            _ = tick.tick() => {
-                total_ticks += 1;
-                silent_ticks += 1;
-                // Retransmit unacked input every ~200ms.
-                if st.input_num > st.assumed_ack && silent_ticks % 2 == 0 {
+            _ = tokio::time::sleep(tick_dur) => {
+                let now = std::time::Instant::now();
+                // Retransmit unacked input (only reached on the fast tick).
+                if has_unacked {
                     send_state(crypto, &sock, &mut st).await;
                 }
-                // Heartbeat/ack every ~2s of quiet.
-                if silent_ticks % 20 == 0 {
+                // Heartbeat/ack every ~2s of quiet (keeps NAT open + acks).
+                if now.duration_since(last_heartbeat) >= Duration::from_secs(2) {
                     send_state(crypto, &sock, &mut st).await;
+                    last_heartbeat = now;
                 }
                 // Once connected, ~5s of server silence means the remote shell
                 // exited and mosh-server terminated (both sides otherwise
                 // heartbeat every ~3s) — exit cleanly.
-                if connected && silent_ticks > 50 {
+                if connected && now.duration_since(last_recv) >= Duration::from_secs(5) {
                     return 0;
                 }
                 // Never connected after ~15s: UDP is likely blocked.
-                if !connected && total_ticks > 150 {
+                if !connected && now.duration_since(start) >= Duration::from_secs(15) {
                     return 255;
                 }
-                if let Some(max) = max_ticks {
-                    if total_ticks >= max {
+                if let Some(max) = max_secs {
+                    if now.duration_since(start) >= Duration::from_secs(max) {
                         return 0;
                     }
                 }
-                // Debug: force a roam (rebind onto a new local port) at a fixed
-                // time to exercise the roaming path in headless tests.
-                if let Some(at) = roam_at_tick {
-                    if total_ticks == at {
+                // Debug: force a roam (rebind onto a new local port) to exercise
+                // the roaming path in headless tests.
+                if let Some(at) = roam_after {
+                    if !roamed && now.duration_since(start) >= Duration::from_secs(at) {
+                        roamed = true;
                         if let Ok(ns) = rebind(host, udp_port).await {
                             sock = ns;
                             send_state(crypto, &sock, &mut st).await;
@@ -594,6 +621,36 @@ async fn bootstrap_over_ssh(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn trim_acked_preserves_unacked_diff() {
+        let mut st = ClientState::new();
+        // 100 single-byte keystroke events -> input_num 1..=100.
+        for i in 0..100u8 {
+            st.push_event(wire::UserEvent::Keys(vec![b'a' + (i % 26)]));
+        }
+        assert_eq!(st.input_num, 100);
+        // Server acks through state 70.
+        st.assumed_ack = 70;
+        st.trim_acked();
+        // The diff sent from the assumed-ack state must still be exactly the
+        // events after state 70 (events index 70..100 = 30 events).
+        let old_count = st.event_count_for(st.assumed_ack);
+        assert_eq!(st.events.len() - old_count, 30);
+        // And the history before the ack was actually dropped.
+        assert!(st.events.len() <= 30);
+    }
+
+    #[test]
+    fn trim_acked_noop_when_small() {
+        let mut st = ClientState::new();
+        for _ in 0..10 {
+            st.push_event(wire::UserEvent::Keys(vec![b'x']));
+        }
+        st.assumed_ack = 5;
+        st.trim_acked(); // below the 64-event threshold: unchanged
+        assert_eq!(st.events.len(), 10);
+    }
 
     fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         let m: HashMap<String, String> = pairs
