@@ -146,6 +146,12 @@ pub static CASES: &[Case] = &[
     case!("sqlite-file", "sqlite3 test.db 'create table u(name text)'; sqlite3 test.db \"insert into u values('alice')\"; sqlite3 test.db 'select name from u'", Eq("alice")),
     case!("sqlite-stdin", "echo 'select 6*7' | sqlite3 :memory:", Eq("42")),
     case!("sqlite-header", "sqlite3 --header :memory: 'select 1 as x, 2 as y'", Eq("x|y\n1|2")),
+    case!("jq-field", "echo '{\"name\":\"alice\",\"age\":30}' | jq '.name'", Eq("\"alice\"")),
+    case!("jq-raw", "echo '{\"name\":\"alice\"}' | jq -r '.name'", Eq("alice")),
+    case!("jq-array-map", "echo '[1,2,3]' | jq 'map(. * 2)'", Has("2"), Has("4"), Has("6")),
+    case!("jq-pipe", "echo '{\"a\":{\"b\":42}}' | jq '.a.b'", Eq("42")),
+    case!("jq-keys", "echo '{\"x\":1,\"y\":2}' | jq -r 'keys[]'", Eq("x\ny")),
+    case!("jq-select", "echo '[{\"n\":1},{\"n\":5}]' | jq '.[] | select(.n > 3) | .n'", Eq("5")),
     // ---- uutils adapter: session-state sync ----
     case!("uu-env-sync", "export UUV=fromshell; printenv UUV", Eq("fromshell")),
     case!("uu-cwd-sync", "mkdir -p cwt && cd cwt && touch inner.txt && ls && cd ..", Has("inner.txt")),

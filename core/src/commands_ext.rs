@@ -890,3 +890,119 @@ fn run_sqlite_stmt(
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------- jq
+
+/// Process JSON with a jq filter, powered by jaq (pure-Rust jq).
+#[derive(Parser)]
+pub struct JqCommand {
+    /// The jq filter program.
+    filter: String,
+    /// Input files (default: stdin).
+    files: Vec<String>,
+    /// Compact output (no pretty-printing — jaq is compact by default).
+    #[arg(short = 'c')]
+    _compact: bool,
+    /// Raw output: strings without quotes.
+    #[arg(short = 'r')]
+    raw: bool,
+    /// Read each line as a string instead of JSON.
+    #[arg(short = 'R')]
+    raw_input: bool,
+    /// Don't read input; run the filter once with null input.
+    #[arg(short = 'n')]
+    null_input: bool,
+}
+
+impl builtins::Command for JqCommand {
+    type Error = brush_core::Error;
+    async fn execute<SE: ShellExtensions>(
+        &self,
+        context: ExecutionContext<'_, SE>,
+    ) -> Result<ExecutionResult, Self::Error> {
+        use jaq_core::load::{Arena, File, Loader};
+        use jaq_core::{Compiler, Ctx, Vars};
+        use jaq_json::Val;
+
+        // Compile the filter.
+        let program = File {
+            code: self.filter.as_str(),
+            path: (),
+        };
+        let defs = jaq_core::defs().chain(jaq_std::defs()).chain(jaq_json::defs());
+        let funs = jaq_core::funs().chain(jaq_std::funs()).chain(jaq_json::funs());
+        let loader = Loader::new(defs);
+        let arena = Arena::default();
+        let modules = match loader.load(&arena, program) {
+            Ok(m) => m,
+            Err(_) => {
+                writeln!(context.stderr(), "jq: compile error in filter")?;
+                return Ok(ExecutionResult::new(2));
+            }
+        };
+        let filter = match Compiler::default().with_funs(funs).compile(modules) {
+            Ok(f) => f,
+            Err(_) => {
+                writeln!(context.stderr(), "jq: compile error")?;
+                return Ok(ExecutionResult::new(3));
+            }
+        };
+
+        let cwd = context.shell.working_dir().to_path_buf();
+        let mut out = context.stdout();
+
+        // Gather input bytes.
+        let raw = if self.null_input {
+            Vec::new()
+        } else if self.files.is_empty() {
+            let mut b = Vec::new();
+            context.stdin().read_to_end(&mut b)?;
+            b
+        } else {
+            let mut b = Vec::new();
+            for f in &self.files {
+                b.extend(std::fs::read(abs(&cwd, f)).unwrap_or_default());
+            }
+            b
+        };
+
+        // Build the input value stream.
+        let inputs: Vec<Val> = if self.null_input {
+            vec![Val::Null]
+        } else if self.raw_input {
+            String::from_utf8_lossy(&raw)
+                .lines()
+                .map(|l| Val::from(l.to_string()))
+                .collect()
+        } else {
+            jaq_json::read::parse_many(&raw).filter_map(Result::ok).collect()
+        };
+
+        let mut exit = 0u8;
+        for input in inputs {
+            let ctx = Ctx::<jaq_core::data::JustLut<Val>>::new(&filter.lut, Vars::new([]));
+            for result in filter.id.run((ctx, input)) {
+                match result {
+                    Ok(v) => {
+                        if self.raw {
+                            match &v {
+                                Val::TStr(b) | Val::BStr(b) => {
+                                    writeln!(out, "{}", String::from_utf8_lossy(b.as_ref()))?;
+                                    continue;
+                                }
+                                _ => {}
+                            }
+                        }
+                        writeln!(out, "{v}")?;
+                    }
+                    Err(e) => {
+                        writeln!(context.stderr(), "jq: error: {e:?}")?;
+                        exit = 5;
+                    }
+                }
+            }
+        }
+        out.flush()?;
+        Ok(ExecutionResult::new(exit))
+    }
+}

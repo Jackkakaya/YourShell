@@ -77,7 +77,8 @@ pub(crate) async fn build_shell(
         .builtin("tar", core_builtins::builtin::<commands_ext::TarCommand, DefaultShellExtensions>())
         .builtin("zip", core_builtins::builtin::<commands_ext::ZipCommand, DefaultShellExtensions>())
         .builtin("unzip", core_builtins::builtin::<commands_ext::UnzipCommand, DefaultShellExtensions>())
-        .builtin("sqlite3", core_builtins::builtin::<commands_ext::SqliteCommand, DefaultShellExtensions>());
+        .builtin("sqlite3", core_builtins::builtin::<commands_ext::SqliteCommand, DefaultShellExtensions>())
+        .builtin("jq", core_builtins::builtin::<commands_ext::JqCommand, DefaultShellExtensions>());
     for name in uutils_adapter::command_names() {
         builder = builder.builtin(name, uutils_adapter::registration());
     }
