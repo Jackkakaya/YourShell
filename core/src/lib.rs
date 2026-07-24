@@ -49,6 +49,9 @@ pub type DoneCb = extern "C" fn(ctx: *mut c_void, exit_code: i32, cwd: *const c_
 /// threads before returning, so no callback fires after the Swift object is
 /// released. `alive` is checked before every callback as belt-and-suspenders.
 struct CallbackCtx(*mut c_void);
+// SAFETY: the pointer is only dereferenced by Swift inside the callbacks; Rust
+// merely carries it across threads. It stays valid because `ashell_session_free`
+// joins both worker threads before returning (see the struct doc above).
 unsafe impl Send for CallbackCtx {}
 
 /// Runs an FFI body under `catch_unwind`, returning `default` on a panic so a
@@ -165,6 +168,8 @@ pub extern "C" fn ashell_session_new(
         if working_dir.is_null() {
             return std::ptr::null_mut();
         }
+        // SAFETY: null-checked above; the caller contracts to pass a valid
+        // NUL-terminated C string (from Swift's `path` argument).
         let working_dir = unsafe { CStr::from_ptr(working_dir) }
             .to_string_lossy()
             .into_owned();
@@ -294,6 +299,8 @@ pub extern "C" fn ashell_exec(session: *mut Session, cmd: *const c_char) {
         return;
     }
     ffi_guard((), || {
+        // SAFETY: both pointers null-checked above; `session` is a live handle
+        // from ashell_session_new and `cmd` a valid C string, per the contract.
         let session = unsafe { &*session };
         let cmd = unsafe { CStr::from_ptr(cmd) }.to_string_lossy().into_owned();
         let _ = session.cmd_tx.send(SessionMsg::Exec(cmd));
@@ -315,6 +322,7 @@ pub extern "C" fn ashell_complete(
         return empty();
     }
     ffi_guard(empty(), || {
+        // SAFETY: both pointers null-checked above; valid per the FFI contract.
         let session = unsafe { &*session };
         let line = unsafe { CStr::from_ptr(line) }.to_string_lossy().into_owned();
         let (reply_tx, reply_rx) = mpsc::sync_channel::<CompletionReply>(1);
@@ -349,6 +357,7 @@ pub extern "C" fn ashell_stdin_write(session: *mut Session, bytes: *const u8, le
         return;
     }
     ffi_guard((), || {
+        // SAFETY: `session` null-checked above and valid per the contract.
         // `&*session` (shared, not `&mut`) avoids aliasing `&mut Session` with
         // the `&*session` in ashell_exec; `PipeWriter` implements `Write` for
         // `&PipeWriter`.
@@ -356,6 +365,8 @@ pub extern "C" fn ashell_stdin_write(session: *mut Session, bytes: *const u8, le
         let data = if len == 0 {
             &[][..]
         } else {
+            // SAFETY: bytes is non-null here (checked with len above); the
+            // caller contracts that it points to `len` valid bytes.
             unsafe { std::slice::from_raw_parts(bytes, len) }
         };
         let mut w = &session.stdin_writer;
@@ -377,6 +388,8 @@ pub extern "C" fn ashell_session_free(session: *mut Session) {
         return;
     }
     ffi_guard((), || {
+        // SAFETY: null-checked above; reclaims the Box leaked by
+        // ashell_session_new. The caller must not free the same handle twice.
         let mut boxed = unsafe { Box::from_raw(session) };
         // Suppress any further callbacks, then signal both workers to stop.
         boxed.alive.store(false, Ordering::Release);
@@ -409,6 +422,7 @@ pub extern "C" fn ashell_selftest(working_dir: *const c_char) -> *mut c_char {
         return std::ptr::null_mut();
     }
     ffi_guard(std::ptr::null_mut(), || {
+        // SAFETY: null-checked above; a valid C string per the contract.
         let working_dir = unsafe { CStr::from_ptr(working_dir) }
             .to_string_lossy()
             .into_owned();
@@ -426,6 +440,8 @@ pub extern "C" fn ashell_abi_version() -> u32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn ashell_string_free(s: *mut c_char) {
     if !s.is_null() {
+        // SAFETY: null-checked; reclaims a CString produced by into_raw in this
+        // module (ashell_complete/ashell_selftest). Must be called at most once.
         drop(unsafe { CString::from_raw(s) });
     }
 }
