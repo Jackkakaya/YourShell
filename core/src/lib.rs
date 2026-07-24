@@ -11,6 +11,10 @@ mod builtins_extra;
 mod commands_ext;
 mod editor;
 mod git_adapter;
+// Phase 1 of the mosh client (bootstrap parsing); builtin not registered until
+// the transport is implemented.
+#[allow(dead_code)]
+mod mosh_adapter;
 mod sftp_adapter;
 mod ssh_adapter;
 mod uutils_adapter;
