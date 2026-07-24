@@ -19,7 +19,7 @@ use russh_sftp::protocol::OpenFlags;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_fd::AsyncFd;
 
-use crate::ssh_adapter::{connect_session, key_and_env_auth, Session};
+use crate::ssh_adapter::{connect_session, key_and_env_auth, HostKeyOutcome, Session};
 
 // ---------------------------------------------------------------------------
 // Registration
@@ -122,9 +122,18 @@ async fn open_sftp(session: &mut Session) -> Result<SftpSession, String> {
 }
 
 async fn connect_and_open(conn: &Conn) -> Result<SftpSession, String> {
-    let mut session = connect_session(&conn.host, conn.port)
-        .await
-        .map_err(|e| format!("connect {}:{}: {e}", conn.host, conn.port))?;
+    let (res, hostkey) = connect_session(&conn.host, conn.port, &conn.home).await;
+    let mut session = res.map_err(|e| {
+        if hostkey == HostKeyOutcome::Changed {
+            format!(
+                "REMOTE HOST IDENTIFICATION HAS CHANGED for {} — possible MITM; \
+                 remove the stale ~/.ssh/known_hosts line to override",
+                conn.host
+            )
+        } else {
+            format!("connect {}:{}: {e}", conn.host, conn.port)
+        }
+    })?;
     let authed = key_and_env_auth(
         &mut session,
         &conn.user,

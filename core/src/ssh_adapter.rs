@@ -176,18 +176,70 @@ fn parse_opts(argv: &[String], getenv: &dyn Fn(&str) -> Option<String>) -> Resul
     })
 }
 
-/// Accepts any host key (TOFU/insecure). TODO: verify against ~/.ssh/known_hosts
-/// once we surface the fingerprint prompt through the raw channel.
-pub(crate) struct ClientHandler;
+/// Result of matching the server's host key against `~/.ssh/known_hosts`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostKeyOutcome {
+    /// Present in known_hosts and matched.
+    Trusted,
+    /// Not previously known — recorded now (trust-on-first-use).
+    Added,
+    /// Present but the key DIFFERS — rejected (possible MITM).
+    Changed,
+    /// Verification did not run (e.g. connect failed before the handshake).
+    Unknown,
+}
+
+/// Verifies the server host key against `~/.ssh/known_hosts` with trust-on-
+/// first-use: an unknown host is recorded and accepted; a *changed* key is
+/// rejected (aborting the handshake). The outcome is shared out via `outcome`
+/// so the caller can warn on first-use or explain a rejection.
+pub(crate) struct ClientHandler {
+    host: String,
+    port: u16,
+    known_hosts: PathBuf,
+    outcome: Arc<std::sync::Mutex<HostKeyOutcome>>,
+}
 
 impl Handler for ClientHandler {
     type Error = russh::Error;
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &russh::keys::ssh_key::PublicKey,
+        server_public_key: &russh::keys::ssh_key::PublicKey,
     ) -> Result<bool, Self::Error> {
-        Ok(true)
+        use russh::keys::check_known_hosts_path;
+        use russh::keys::known_hosts::learn_known_hosts_path;
+        use russh::keys::Error as KeyError;
+        let (outcome, accept) = match check_known_hosts_path(
+            &self.host,
+            self.port,
+            server_public_key,
+            &self.known_hosts,
+        ) {
+            Ok(true) => (HostKeyOutcome::Trusted, true),
+            Ok(false) => {
+                let _ = learn_known_hosts_path(
+                    &self.host,
+                    self.port,
+                    server_public_key,
+                    &self.known_hosts,
+                );
+                (HostKeyOutcome::Added, true)
+            }
+            Err(KeyError::KeyChanged { .. }) => (HostKeyOutcome::Changed, false),
+            Err(_) => {
+                // No known_hosts file yet (or unreadable): treat as first use.
+                let _ = learn_known_hosts_path(
+                    &self.host,
+                    self.port,
+                    server_public_key,
+                    &self.known_hosts,
+                );
+                (HostKeyOutcome::Added, true)
+            }
+        };
+        *self.outcome.lock().unwrap_or_else(|e| e.into_inner()) = outcome;
+        Ok(accept)
     }
 }
 
@@ -195,13 +247,28 @@ impl Handler for ClientHandler {
 /// adapters.
 pub(crate) type Session = client::Handle<ClientHandler>;
 
-/// TCP-connect and run the SSH handshake (host key accepted TOFU).
-pub(crate) async fn connect_session(host: &str, port: u16) -> Result<Session, russh::Error> {
+/// TCP-connect and run the SSH handshake, verifying the host key against
+/// `<home>/.ssh/known_hosts` (trust-on-first-use). Returns the connect result
+/// plus the host-key outcome (set even when connect fails on a changed key).
+pub(crate) async fn connect_session(
+    host: &str,
+    port: u16,
+    home: &std::path::Path,
+) -> (Result<Session, russh::Error>, HostKeyOutcome) {
+    let outcome = Arc::new(std::sync::Mutex::new(HostKeyOutcome::Unknown));
+    let handler = ClientHandler {
+        host: host.to_string(),
+        port,
+        known_hosts: home.join(".ssh").join("known_hosts"),
+        outcome: outcome.clone(),
+    };
     let config = Arc::new(client::Config {
         inactivity_timeout: Some(Duration::from_secs(3600)),
         ..Default::default()
     });
-    client::connect(config, (host, port), ClientHandler).await
+    let res = client::connect(config, (host, port), handler).await;
+    let out = *outcome.lock().unwrap_or_else(|e| e.into_inner());
+    (res, out)
 }
 
 /// Non-interactive auth: each unencrypted key in `-i`/~/.ssh, then
@@ -261,13 +328,29 @@ async fn run_session(opts: Opts, fd0: OwnedFd, fd1: OwnedFd, fd2: OwnedFd) -> u8
         }};
     }
 
-    let mut session = match connect_session(&opts.host, opts.port).await {
+    let (res, hostkey) = connect_session(&opts.host, opts.port, &opts.home).await;
+    let mut session = match res {
         Ok(s) => s,
         Err(e) => {
-            eprint_fd!("ssh: connect {}:{} failed: {e}\n", opts.host, opts.port);
+            if hostkey == HostKeyOutcome::Changed {
+                eprint_fd!(
+                    "ssh: REMOTE HOST IDENTIFICATION HAS CHANGED for {} — possible \
+                     man-in-the-middle. Remove the stale line from ~/.ssh/known_hosts \
+                     to override.\n",
+                    opts.host
+                );
+            } else {
+                eprint_fd!("ssh: connect {}:{} failed: {e}\n", opts.host, opts.port);
+            }
             return 255;
         }
     };
+    if hostkey == HostKeyOutcome::Added {
+        eprint_fd!(
+            "ssh: warning — permanently added '{}' to ~/.ssh/known_hosts.\n",
+            opts.host
+        );
+    }
 
     // --- Authentication ---------------------------------------------------
     // Keys + $SSH_PASSWORD first; then an interactive no-echo prompt (raw fd 0).
