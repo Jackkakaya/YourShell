@@ -115,6 +115,13 @@ final class ShellSession: ObservableObject {
         setenv("npm_config_fund", "false", 1)
         setenv("npm_config_audit", "false", 1)
         setenv("npm_config_update_notifier", "false", 1)
+        // npm install is network-latency bound (dependency-tree resolution =
+        // one registry round-trip per package; ~86% of install time). The
+        // default registry.npmjs.org is far/slow here; a mirror cuts installs
+        // ~4-5x. Users can override with `npm config` / npm_config_registry.
+        if getenv("npm_config_registry") == nil {
+            setenv("npm_config_registry", "https://registry.npmmirror.com", 1)
+        }
         if getenv("HOME") == nil {
             setenv("HOME", library.deletingLastPathComponent().path, 1)
         }
