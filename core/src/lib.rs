@@ -76,7 +76,8 @@ pub(crate) async fn build_shell(
         .builtin("wget", core_builtins::builtin::<commands_ext::WgetCommand, DefaultShellExtensions>())
         .builtin("tar", core_builtins::builtin::<commands_ext::TarCommand, DefaultShellExtensions>())
         .builtin("zip", core_builtins::builtin::<commands_ext::ZipCommand, DefaultShellExtensions>())
-        .builtin("unzip", core_builtins::builtin::<commands_ext::UnzipCommand, DefaultShellExtensions>());
+        .builtin("unzip", core_builtins::builtin::<commands_ext::UnzipCommand, DefaultShellExtensions>())
+        .builtin("sqlite3", core_builtins::builtin::<commands_ext::SqliteCommand, DefaultShellExtensions>());
     for name in uutils_adapter::command_names() {
         builder = builder.builtin(name, uutils_adapter::registration());
     }
@@ -84,7 +85,9 @@ pub(crate) async fn build_shell(
     {
         builder = builder
             .builtin("python3", python_adapter::registration())
-            .builtin("python", python_adapter::registration());
+            .builtin("python", python_adapter::registration())
+            .builtin("pip", python_adapter::registration())
+            .builtin("pip3", python_adapter::registration());
     }
     #[cfg(feature = "vision")]
     {

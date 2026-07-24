@@ -142,6 +142,10 @@ pub static CASES: &[Case] = &[
     case!("tar-list", "mkdir -p tl; echo a > tl/a.txt; tar -cf tl.tar tl; tar -tf tl.tar | grep -c txt", Has("1")),
     case!("zip-unzip-roundtrip", "mkdir -p zt; echo zipped > zt/z.txt; zip -r z.zip zt > /dev/null; rm -rf zt; unzip z.zip > /dev/null; cat zt/z.txt", Eq("zipped")),
     case!("unzip-list", "echo hi > u.txt; zip u.zip u.txt > /dev/null; unzip -l u.zip | grep -c u.txt", Has("1")),
+    case!("sqlite-memory", "sqlite3 :memory: 'create table t(a,b); insert into t values(1,2),(3,4); select sum(a),sum(b) from t'", Eq("4|6")),
+    case!("sqlite-file", "sqlite3 test.db 'create table u(name text)'; sqlite3 test.db \"insert into u values('alice')\"; sqlite3 test.db 'select name from u'", Eq("alice")),
+    case!("sqlite-stdin", "echo 'select 6*7' | sqlite3 :memory:", Eq("42")),
+    case!("sqlite-header", "sqlite3 --header :memory: 'select 1 as x, 2 as y'", Eq("x|y\n1|2")),
     // ---- uutils adapter: session-state sync ----
     case!("uu-env-sync", "export UUV=fromshell; printenv UUV", Eq("fromshell")),
     case!("uu-cwd-sync", "mkdir -p cwt && cd cwt && touch inner.txt && ls && cd ..", Has("inner.txt")),
@@ -276,6 +280,8 @@ pub static PY_CASES: &[Case] = &[
     // our writable site dir, and installs use --target.
     case!("py-pip-bootstrap", "python3 -c 'import zipfile, glob, os; w = glob.glob(os.path.join(os.environ[\"YOURSHELL_PYTHON_HOME\"], \"lib/python3.14/ensurepip/_bundled/pip-*.whl\"))[0]; zipfile.ZipFile(w).extractall(os.environ[\"YOURSHELL_PY_SITE\"]); print(\"pip-boot-ok\")'", Eq("pip-boot-ok")),
     case!("py-pip-version", "export PIP_DISABLE_PIP_VERSION_CHECK=1; python3 -m pip --version 2>&1", Has("pip 26")),
+    case!("pip-direct-version", "export PIP_DISABLE_PIP_VERSION_CHECK=1; pip --version 2>&1", Has("pip 2")),
+    case!("pip3-direct", "export PIP_DISABLE_PIP_VERSION_CHECK=1; pip3 --version 2>&1", Has("pip 2")),
     case!("py-pip-install", "python3 -m pip install --quiet --no-input --upgrade --only-binary :all: --target \"$YOURSHELL_PY_SITE\" six > /dev/null 2>&1; python3 -c 'import six; print(six.__name__, six.__version__ != \"\")'", Has("six True")),
     // ---- python real-world scenarios (network + binary wheels) ----
     case!("py-pip-rich", "python3 -m pip install -q --no-input --only-binary :all: --target \"$YOURSHELL_PY_SITE\" rich > /dev/null 2>&1; python3 -c 'from rich.console import Console; Console(force_terminal=False).print(\"rich\", 6*7)'", Has("rich 42")),

@@ -51,7 +51,16 @@ fn exec_python(
     args: Vec<CommandArg>,
 ) -> BoxFuture<'_, Result<ExecutionResult, brush_core::Error>> {
     Box::pin(async move {
-        let argv: Vec<String> = args.iter().map(ToString::to_string).collect();
+        let mut argv: Vec<String> = args.iter().map(ToString::to_string).collect();
+
+        // `pip`/`pip3` run as `python -m pip …` in the embedded interpreter
+        // (there's no standalone pip executable on iOS). argv[0] is ignored by
+        // the driver (it reads sys.argv[1:]), so inject `-m pip` after it.
+        if matches!(context.command_name.as_str(), "pip" | "pip3") {
+            let rest = if argv.is_empty() { Vec::new() } else { argv[1..].to_vec() };
+            argv = vec![context.command_name.clone(), "-m".into(), "pip".into()];
+            argv.extend(rest);
+        }
 
         let fds: [Option<std::os::fd::OwnedFd>; 3] = [0, 1, 2].map(|n| {
             context.try_fd(n.into()).and_then(|f| {

@@ -778,3 +778,115 @@ impl builtins::Command for UnzipCommand {
         Ok(ExecutionResult::success())
     }
 }
+
+// ---------------------------------------------------------------- sqlite3
+
+/// Minimal sqlite3 CLI: opens a database and runs SQL from an argument or
+/// stdin, printing query results (pipe-separated, one row per line).
+#[derive(Parser)]
+pub struct SqliteCommand {
+    /// Database file (`:memory:` for an in-memory db).
+    database: Option<String>,
+    /// SQL to execute; if omitted, read from stdin.
+    sql: Option<String>,
+    /// Print a header row of column names.
+    #[arg(long = "header")]
+    header: bool,
+    /// Column separator (default: `|`).
+    #[arg(long = "separator", default_value = "|")]
+    separator: String,
+}
+
+impl builtins::Command for SqliteCommand {
+    type Error = brush_core::Error;
+    async fn execute<SE: ShellExtensions>(
+        &self,
+        context: ExecutionContext<'_, SE>,
+    ) -> Result<ExecutionResult, Self::Error> {
+        let cwd = context.shell.working_dir().to_path_buf();
+        let db_path = self.database.clone().unwrap_or_else(|| ":memory:".to_string());
+        let conn = if db_path == ":memory:" {
+            rusqlite::Connection::open_in_memory()
+        } else {
+            rusqlite::Connection::open(abs(&cwd, &db_path))
+        };
+        let conn = match conn {
+            Ok(c) => c,
+            Err(e) => {
+                writeln!(context.stderr(), "sqlite3: {e}")?;
+                return Ok(ExecutionResult::new(1));
+            }
+        };
+
+        let sql = if let Some(s) = &self.sql {
+            s.clone()
+        } else {
+            let mut s = String::new();
+            context.stdin().read_to_string(&mut s)?;
+            s
+        };
+        if sql.trim().is_empty() {
+            return Ok(ExecutionResult::success());
+        }
+
+        let mut out = context.stdout();
+        let mut exit = 0u8;
+        // Execute each statement; SELECTs print rows, others just run.
+        for stmt_sql in sql.split(';') {
+            let trimmed = stmt_sql.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            match run_sqlite_stmt(&conn, trimmed, self.header, &self.separator, &mut out) {
+                Ok(()) => {}
+                Err(e) => {
+                    writeln!(context.stderr(), "sqlite3: {e}")?;
+                    exit = 1;
+                    break;
+                }
+            }
+        }
+        out.flush()?;
+        Ok(ExecutionResult::new(exit))
+    }
+}
+
+fn run_sqlite_stmt(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    header: bool,
+    sep: &str,
+    out: &mut impl Write,
+) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare(sql)?;
+    let ncols = stmt.column_count();
+    if ncols == 0 {
+        // Non-query (INSERT/CREATE/…).
+        conn.execute(sql, [])?;
+        return Ok(());
+    }
+    let col_names: Vec<String> = stmt
+        .column_names()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    if header {
+        let _ = writeln!(out, "{}", col_names.join(sep));
+    }
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let mut cells = Vec::with_capacity(ncols);
+        for i in 0..ncols {
+            let v: rusqlite::types::Value = row.get(i)?;
+            cells.push(match v {
+                rusqlite::types::Value::Null => String::new(),
+                rusqlite::types::Value::Integer(n) => n.to_string(),
+                rusqlite::types::Value::Real(f) => f.to_string(),
+                rusqlite::types::Value::Text(t) => t,
+                rusqlite::types::Value::Blob(b) => format!("<{} bytes>", b.len()),
+            });
+        }
+        let _ = writeln!(out, "{}", cells.join(sep));
+    }
+    Ok(())
+}
