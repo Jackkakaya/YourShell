@@ -35,6 +35,37 @@ use russh::{ChannelMsg, Disconnect};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_fd::AsyncFd;
 
+/// Picks a `TERM` to request for the remote PTY. The local terminal may be an
+/// exotic type (xterm-ghostty, xterm-kitty, alacritty, wezterm, …) whose
+/// terminfo entry is absent on servers, which breaks terminfo-based tools
+/// (`clear`, `tput`, ncurses apps) with "unknown terminal type". So we forward
+/// the local TERM only if it's one servers almost always have; otherwise we
+/// downgrade to the universal `xterm-256color`.
+pub(crate) fn safe_remote_term(local: Option<&str>) -> String {
+    const SAFE: &[&str] = &[
+        "xterm",
+        "xterm-256color",
+        "xterm-color",
+        "screen",
+        "screen-256color",
+        "tmux",
+        "tmux-256color",
+        "vt100",
+        "vt220",
+        "vt320",
+        "linux",
+        "ansi",
+        "rxvt",
+        "rxvt-unicode",
+        "rxvt-unicode-256color",
+        "dumb",
+    ];
+    match local {
+        Some(t) if SAFE.contains(&t) => t.to_string(),
+        _ => "xterm-256color".to_string(),
+    }
+}
+
 /// Resets the global terminal private modes a remote full-screen program may
 /// have left enabled: bracketed paste, mouse tracking (1000/1002/1003/1006),
 /// application cursor keys, hidden cursor, autowrap; plus an SGR reset. Emitted
@@ -176,7 +207,7 @@ fn parse_opts(argv: &[String], getenv: &dyn Fn(&str) -> Option<String>) -> Resul
         identity,
         command: (!command_parts.is_empty()).then(|| command_parts.join(" ")),
         home,
-        term: getenv("TERM").unwrap_or_else(|| "xterm-256color".to_string()),
+        term: safe_remote_term(getenv("TERM").as_deref()),
         cols,
         rows,
         password_env: getenv("SSH_PASSWORD"),
