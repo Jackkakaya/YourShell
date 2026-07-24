@@ -128,6 +128,56 @@ pub fn parse_fragment(payload: &[u8]) -> Option<(u64, u16, bool, &[u8])> {
     Some((id, ff & 0x7fff, ff & 0x8000 != 0, &payload[10..]))
 }
 
+/// Reassembles a message split across multiple fragments (all sharing one `id`,
+/// numbered 0.. with the last flagged `final`). A datagram carries exactly one
+/// fragment. A fragment with a new `id` supersedes any incomplete message
+/// (matching mosh's FragmentAssembly). Returns the concatenated compressed
+/// bytes once every fragment of the current id has arrived.
+#[derive(Default)]
+pub struct FragmentAssembler {
+    id: Option<u64>,
+    fragments: Vec<Option<Vec<u8>>>,
+    final_num: Option<u16>,
+}
+
+impl FragmentAssembler {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add(&mut self, id: u64, num: u16, is_final: bool, contents: &[u8]) -> Option<Vec<u8>> {
+        if self.id != Some(id) {
+            self.id = Some(id);
+            self.fragments.clear();
+            self.final_num = None;
+        }
+        let idx = num as usize;
+        if idx >= self.fragments.len() {
+            self.fragments.resize(idx + 1, None);
+        }
+        self.fragments[idx] = Some(contents.to_vec());
+        if is_final {
+            self.final_num = Some(num);
+        }
+        // Complete once we've seen the final fragment and every earlier one.
+        if let Some(fnum) = self.final_num {
+            if self.fragments.len() == fnum as usize + 1
+                && self.fragments.iter().all(Option::is_some)
+            {
+                let mut out = Vec::new();
+                for f in &self.fragments {
+                    out.extend_from_slice(f.as_ref().unwrap());
+                }
+                self.id = None;
+                self.fragments.clear();
+                self.final_num = None;
+                return Some(out);
+            }
+        }
+        None
+    }
+}
+
 // --- zlib (network/compressor.cc uses zlib format, RFC 1950) ----------------
 
 pub fn zlib_compress(data: &[u8]) -> Vec<u8> {
@@ -507,6 +557,36 @@ mod tests {
         assert_eq!(num, 0);
         assert!(is_final);
         assert_eq!(contents, b"chunk");
+    }
+
+    #[test]
+    fn fragment_assembly_multi() {
+        let mut a = FragmentAssembler::new();
+        assert_eq!(a.add(1, 0, false, b"AAA"), None);
+        assert_eq!(a.add(1, 1, false, b"BBB"), None);
+        assert_eq!(a.add(1, 2, true, b"CCC"), Some(b"AAABBBCCC".to_vec()));
+    }
+
+    #[test]
+    fn fragment_assembly_out_of_order() {
+        let mut a = FragmentAssembler::new();
+        assert_eq!(a.add(7, 2, true, b"CC"), None); // final arrives first
+        assert_eq!(a.add(7, 0, false, b"AA"), None);
+        assert_eq!(a.add(7, 1, false, b"BB"), Some(b"AABBCC".to_vec()));
+    }
+
+    #[test]
+    fn fragment_assembly_new_id_supersedes() {
+        let mut a = FragmentAssembler::new();
+        assert_eq!(a.add(1, 0, false, b"stale"), None);
+        // A new id discards the incomplete old message.
+        assert_eq!(a.add(2, 0, true, b"fresh"), Some(b"fresh".to_vec()));
+    }
+
+    #[test]
+    fn fragment_assembly_single() {
+        let mut a = FragmentAssembler::new();
+        assert_eq!(a.add(9, 0, true, b"solo"), Some(b"solo".to_vec()));
     }
 
     #[test]

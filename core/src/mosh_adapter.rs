@@ -343,6 +343,7 @@ async fn client_loop(
         Err(_) => return 255,
     };
     let mut st = ClientState::new();
+    let mut assembler = wire::FragmentAssembler::new();
 
     // Announce ourselves, then send the initial window size as the first event.
     send_state(crypto, sock, &mut st).await;
@@ -389,19 +390,33 @@ async fn client_loop(
                 match r {
                     Ok(n) => {
                         recv_errors = 0;
-                        silent_ticks = 0;
-                        if let Some((opened, inst)) = wire::parse_server_datagram(crypto, &dbuf[..n]) {
+                        // Decrypt, reassemble fragments (large screen updates span
+                        // multiple datagrams), then decode the Instruction.
+                        if let Some(opened) = crypto.open(&dbuf[..n]) {
                             connected = true;
+                            silent_ticks = 0;
                             st.last_recv_ts = opened.timestamp;
-                            if inst.ack_num > st.assumed_ack { st.assumed_ack = inst.ack_num; }
-                            if inst.new_num > st.last_recv_num {
-                                let bytes = decode_host_message(&inst.diff);
-                                if !bytes.is_empty() {
-                                    let _ = write_fd(raw1, &bytes);
+                            if let Some((id, num, is_final, contents)) =
+                                wire::parse_fragment(&opened.payload)
+                            {
+                                if let Some(compressed) = assembler.add(id, num, is_final, contents) {
+                                    if let Some(inst) = wire::zlib_decompress(&compressed)
+                                        .and_then(|raw| Instruction::decode(&raw))
+                                    {
+                                        if inst.ack_num > st.assumed_ack {
+                                            st.assumed_ack = inst.ack_num;
+                                        }
+                                        if inst.new_num > st.last_recv_num {
+                                            let bytes = decode_host_message(&inst.diff);
+                                            if !bytes.is_empty() {
+                                                let _ = write_fd(raw1, &bytes);
+                                            }
+                                            st.last_recv_num = inst.new_num;
+                                            // Ack the freshly applied state.
+                                            send_state(crypto, sock, &mut st).await;
+                                        }
+                                    }
                                 }
-                                st.last_recv_num = inst.new_num;
-                                // Ack the freshly applied state.
-                                send_state(crypto, sock, &mut st).await;
                             }
                         }
                     }
