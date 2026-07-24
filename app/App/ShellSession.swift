@@ -91,9 +91,25 @@ final class ShellSession: ObservableObject {
         let portFile = library.appendingPathComponent("node_port.txt").path
         try? FileManager.default.removeItem(atPath: portFile)
         setenv("YS_NODE_PORT_FILE", portFile, 1)
-        // npm/npx CLIs bundled alongside main.js (added in the npm step).
+        // npm/npx CLIs bundled alongside main.js.
         setenv("YS_NODE_NPM_CLI", res + "/NodeResources/node/npm/bin/npm-cli.js", 1)
         setenv("YS_NODE_NPX_CLI", res + "/NodeResources/node/npm/bin/npx-cli.js", 1)
+        // npm needs writable cache/prefix; the bundle is read-only. Point them
+        // into the app's Library, and default installs to ignore lifecycle
+        // scripts (they'd spawn subprocesses, unsupported on iOS).
+        let npmCache = library.appendingPathComponent("npm-cache").path
+        let npmPrefix = library.appendingPathComponent("npm-global").path
+        try? FileManager.default.createDirectory(atPath: npmCache, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(atPath: npmPrefix, withIntermediateDirectories: true)
+        setenv("npm_config_cache", npmCache, 1)
+        setenv("npm_config_prefix", npmPrefix, 1)
+        setenv("npm_config_ignore_scripts", "true", 1)
+        setenv("npm_config_fund", "false", 1)
+        setenv("npm_config_audit", "false", 1)
+        setenv("npm_config_update_notifier", "false", 1)
+        if getenv("HOME") == nil {
+            setenv("HOME", library.deletingLastPathComponent().path, 1)
+        }
 
         ys_node_start_resident(mainJS)
     }
