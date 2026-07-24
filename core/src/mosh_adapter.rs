@@ -241,7 +241,10 @@ async fn run(opts: Opts, fd0: OwnedFd, fd1: OwnedFd, fd2: OwnedFd) -> u8 {
     let _ = write_fd(raw1, b"\x1b[?1049h");
     let restore = FdFlagsGuard::capture(&[raw0, raw1]);
 
-    let code = client_loop(&crypto, &sock, raw0, raw1, opts.cols, opts.rows).await;
+    let code = client_loop(
+        &crypto, sock, &host, udp_port, raw0, raw1, opts.cols, opts.rows,
+    )
+    .await;
 
     drop(restore);
     // Reset any global private modes the remote left on, then leave alt screen
@@ -330,9 +333,36 @@ async fn send_state(crypto: &Crypto, sock: &UdpSocket, st: &mut ClientState) {
     let _ = sock.send(&dg).await;
 }
 
+/// Rebinds a fresh UDP socket to the same server — used for roaming when the
+/// local network changes (new interface/address). The mosh-server learns the
+/// new client address from the next authenticated datagram, so the encrypted
+/// session (key + sequence numbers) simply continues over the new socket.
+async fn rebind(host: &str, port: u16) -> std::io::Result<UdpSocket> {
+    let s = UdpSocket::bind("0.0.0.0:0").await?;
+    s.connect((host, port)).await?;
+    Ok(s)
+}
+
+/// True for errors that mean the local network path changed/went away (as
+/// opposed to the peer refusing) — the cue to roam onto a new socket.
+fn is_network_change(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(
+            libc::ENETUNREACH
+                | libc::EHOSTUNREACH
+                | libc::ENETDOWN
+                | libc::ENETRESET
+                | libc::EADDRNOTAVAIL
+        )
+    )
+}
+
 async fn client_loop(
     crypto: &Crypto,
-    sock: &UdpSocket,
+    mut sock: UdpSocket,
+    host: &str,
+    udp_port: u16,
     raw0: RawFd,
     raw1: RawFd,
     cols: u16,
@@ -346,12 +376,17 @@ async fn client_loop(
     let mut assembler = wire::FragmentAssembler::new();
 
     // Announce ourselves, then send the initial window size as the first event.
-    send_state(crypto, sock, &mut st).await;
+    send_state(crypto, &sock, &mut st).await;
     st.push_event(wire::UserEvent::Resize(cols as i32, rows as i32));
-    send_state(crypto, sock, &mut st).await;
+    send_state(crypto, &sock, &mut st).await;
 
     // Debug: bound the session length so headless tests can flush the transcript.
     let max_ticks = std::env::var("MOSH_MAX_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .map(|s| s * 10);
+    // Debug: force a roam at this tick to exercise the roaming path.
+    let roam_at_tick = std::env::var("MOSH_ROAM_AFTER")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .map(|s| s * 10);
@@ -382,7 +417,7 @@ async fn client_loop(
                             }
                         }
                         st.push_event(wire::UserEvent::Keys(kbuf[..n].to_vec()));
-                        send_state(crypto, sock, &mut st).await;
+                        send_state(crypto, &sock, &mut st).await;
                     }
                 }
             }
@@ -413,23 +448,35 @@ async fn client_loop(
                                             }
                                             st.last_recv_num = inst.new_num;
                                             // Ack the freshly applied state.
-                                            send_state(crypto, sock, &mut st).await;
+                                            send_state(crypto, &sock, &mut st).await;
                                         }
                                     }
                                 }
                             }
                         }
                     }
-                    Err(_) => {
-                        // A connected UDP socket returns ECONNREFUSED (ICMP
-                        // port-unreachable) the moment mosh-server exits — the
-                        // remote shell has quit. Don't reset the silence timer;
-                        // after a short burst of these, end the session cleanly.
-                        recv_errors += 1;
-                        if connected && recv_errors > 5 {
-                            return 0;
+                    Err(e) => {
+                        if is_network_change(&e) {
+                            // The local network path changed (Wi-Fi↔cellular,
+                            // new address). Roam onto a fresh socket and keep the
+                            // same encrypted session; the server learns our new
+                            // address from the next authenticated datagram.
+                            if let Ok(ns) = rebind(host, udp_port).await {
+                                sock = ns;
+                                send_state(crypto, &sock, &mut st).await;
+                            }
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                        } else {
+                            // ECONNREFUSED (ICMP port-unreachable) the moment
+                            // mosh-server exits — the remote shell quit. Don't
+                            // reset the silence timer; after a short burst, end
+                            // the session cleanly.
+                            recv_errors += 1;
+                            if connected && recv_errors > 5 {
+                                return 0;
+                            }
+                            tokio::time::sleep(Duration::from_millis(100)).await;
                         }
-                        tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                 }
             }
@@ -438,11 +485,11 @@ async fn client_loop(
                 silent_ticks += 1;
                 // Retransmit unacked input every ~200ms.
                 if st.input_num > st.assumed_ack && silent_ticks % 2 == 0 {
-                    send_state(crypto, sock, &mut st).await;
+                    send_state(crypto, &sock, &mut st).await;
                 }
                 // Heartbeat/ack every ~2s of quiet.
                 if silent_ticks % 20 == 0 {
-                    send_state(crypto, sock, &mut st).await;
+                    send_state(crypto, &sock, &mut st).await;
                 }
                 // Once connected, ~5s of server silence means the remote shell
                 // exited and mosh-server terminated (both sides otherwise
@@ -457,6 +504,16 @@ async fn client_loop(
                 if let Some(max) = max_ticks {
                     if total_ticks >= max {
                         return 0;
+                    }
+                }
+                // Debug: force a roam (rebind onto a new local port) at a fixed
+                // time to exercise the roaming path in headless tests.
+                if let Some(at) = roam_at_tick {
+                    if total_ticks == at {
+                        if let Ok(ns) = rebind(host, udp_port).await {
+                            sock = ns;
+                            send_state(crypto, &sock, &mut st).await;
+                        }
                     }
                 }
             }
