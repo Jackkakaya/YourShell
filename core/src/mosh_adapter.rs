@@ -360,6 +360,8 @@ async fn client_loop(
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     let mut total_ticks = 0u32;
     let mut silent_ticks = 0u32;
+    let mut recv_errors = 0u32; // consecutive ECONNREFUSED (server gone)
+    let mut connected = false; // received at least one server datagram
     let mut escape_armed = false; // Ctrl-^ then '.' quits
 
     loop {
@@ -384,20 +386,35 @@ async fn client_loop(
                 }
             }
             r = sock.recv(&mut dbuf) => {
-                silent_ticks = 0;
-                if let Ok(n) = r {
-                    if let Some((opened, inst)) = wire::parse_server_datagram(crypto, &dbuf[..n]) {
-                        st.last_recv_ts = opened.timestamp;
-                        if inst.ack_num > st.assumed_ack { st.assumed_ack = inst.ack_num; }
-                        if inst.new_num > st.last_recv_num {
-                            let bytes = decode_host_message(&inst.diff);
-                            if !bytes.is_empty() {
-                                let _ = write_fd(raw1, &bytes);
+                match r {
+                    Ok(n) => {
+                        recv_errors = 0;
+                        silent_ticks = 0;
+                        if let Some((opened, inst)) = wire::parse_server_datagram(crypto, &dbuf[..n]) {
+                            connected = true;
+                            st.last_recv_ts = opened.timestamp;
+                            if inst.ack_num > st.assumed_ack { st.assumed_ack = inst.ack_num; }
+                            if inst.new_num > st.last_recv_num {
+                                let bytes = decode_host_message(&inst.diff);
+                                if !bytes.is_empty() {
+                                    let _ = write_fd(raw1, &bytes);
+                                }
+                                st.last_recv_num = inst.new_num;
+                                // Ack the freshly applied state.
+                                send_state(crypto, sock, &mut st).await;
                             }
-                            st.last_recv_num = inst.new_num;
-                            // Ack the freshly applied state.
-                            send_state(crypto, sock, &mut st).await;
                         }
+                    }
+                    Err(_) => {
+                        // A connected UDP socket returns ECONNREFUSED (ICMP
+                        // port-unreachable) the moment mosh-server exits — the
+                        // remote shell has quit. Don't reset the silence timer;
+                        // after a short burst of these, end the session cleanly.
+                        recv_errors += 1;
+                        if connected && recv_errors > 5 {
+                            return 0;
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                 }
             }
@@ -412,8 +429,14 @@ async fn client_loop(
                 if silent_ticks % 20 == 0 {
                     send_state(crypto, sock, &mut st).await;
                 }
-                // Give up after ~15s with no server packet.
-                if silent_ticks > 150 {
+                // Once connected, ~5s of server silence means the remote shell
+                // exited and mosh-server terminated (both sides otherwise
+                // heartbeat every ~3s) — exit cleanly.
+                if connected && silent_ticks > 50 {
+                    return 0;
+                }
+                // Never connected after ~15s: UDP is likely blocked.
+                if !connected && total_ticks > 150 {
                     return 255;
                 }
                 if let Some(max) = max_ticks {
