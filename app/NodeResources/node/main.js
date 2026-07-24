@@ -147,6 +147,10 @@ function runRequest(req, sock) {
   // no writes (covers commands that never call exit), or a hard ceiling.
   const startedAt = Date.now();
   let done = false;
+  // Declared before `finish` and assigned below: in eval mode we return before
+  // the setInterval line runs, so without this `let` (vs a later `const`) the
+  // `clearInterval(timer)` in finish() hits the temporal dead zone and throws.
+  let timer;
   const finish = () => {
     if (done) return;
     done = true;
@@ -170,7 +174,7 @@ function runRequest(req, sock) {
   // CLI/script mode (npm, npx, user scripts): the authoritative "done" signal
   // is process.exit (npm always calls it). Fall back to a long idle for the
   // rare script that ends without exiting, and a hard ceiling.
-  const timer = setInterval(() => {
+  timer = setInterval(() => {
     const idle = Date.now() - lastWriteAt;
     const elapsed = Date.now() - startedAt;
     if ((exited && idle >= 80) || idle >= 20000 || elapsed >= 600000) {
