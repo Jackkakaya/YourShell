@@ -32,7 +32,7 @@ targets:
       base:
         SWIFT_OBJC_BRIDGING_HEADER: App/Bridging-Header.h
         LIBRARY_SEARCH_PATHS: ["$(PROJECT_DIR)/../core/target/aarch64-apple-ios-sim/release"]
-        OTHER_LDFLAGS: ["-lashellcore"]
+        OTHER_LDFLAGS: ["-lashellcore", "-liconv"]
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         PRODUCT_BUNDLE_IDENTIFIER: dev.sumin.ashellrs
