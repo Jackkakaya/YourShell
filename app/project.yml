@@ -13,11 +13,18 @@ targets:
     sources:
       - App
       - PyHost
+      - NodeHost
       - path: PythonResources
+        type: folder
+        buildPhase: resources
+      - path: NodeResources
         type: folder
         buildPhase: resources
     dependencies:
       - framework: ../vendor/python-ios/Python.xcframework
+        embed: true
+        codeSign: false
+      - framework: ../vendor/nodejs-mobile/NodeMobile.xcframework
         embed: true
         codeSign: false
       - package: SwiftTerm

@@ -12,6 +12,8 @@ mod uutils_adapter;
 mod python_adapter;
 #[cfg(feature = "vision")]
 mod ocr_adapter;
+#[cfg(feature = "node")]
+mod node_adapter;
 pub mod selftest;
 
 use std::collections::HashMap;
@@ -57,6 +59,13 @@ pub(crate) async fn build_shell(
     #[cfg(feature = "vision")]
     {
         builder = builder.builtin("ocr", ocr_adapter::registration());
+    }
+    #[cfg(feature = "node")]
+    {
+        builder = builder
+            .builtin("node", node_adapter::registration())
+            .builtin("npm", node_adapter::registration())
+            .builtin("npx", node_adapter::registration());
     }
     builder
         .fds(fds)

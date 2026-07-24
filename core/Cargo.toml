@@ -19,6 +19,7 @@ uucore = "0.8"
 grep-searcher = "0.1"
 grep-regex = "0.1"
 grep-matcher = "0.1"
+base64 = "0.23.0"
 
 [profile.release]
 opt-level = "s"
@@ -42,3 +43,4 @@ harness = false
 [features]
 python = []
 vision = []
+node = []

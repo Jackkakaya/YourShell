@@ -15,4 +15,6 @@ void ashell_session_free(void *session);
 char *ashell_selftest(const char *working_dir);
 void ashell_string_free(char *s);
 
+void ys_node_start_resident(const char *main_js_path);
+
 #endif

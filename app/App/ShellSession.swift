@@ -39,6 +39,8 @@ final class ShellSession: ObservableObject {
             atPath: pySite, withIntermediateDirectories: true)
         setenv("YOURSHELL_PY_SITE", pySite, 1)
 
+        ShellSession.startResidentNodeOnce()
+
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         cwd = docs.path
         seedDemoFiles(in: docs)
@@ -73,6 +75,27 @@ final class ShellSession: ObservableObject {
             ctx,
             docs.path
         )
+    }
+
+    /// Launches the resident Node instance once per process. The port it
+    /// listens on is written to a file the Rust `node` builtin discovers.
+    private static var nodeStarted = false
+    static func startResidentNodeOnce() {
+        guard !nodeStarted else { return }
+        nodeStarted = true
+        guard let res = Bundle.main.resourcePath else { return }
+        let mainJS = res + "/NodeResources/node/main.js"
+        guard FileManager.default.fileExists(atPath: mainJS) else { return }
+
+        let library = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
+        let portFile = library.appendingPathComponent("node_port.txt").path
+        try? FileManager.default.removeItem(atPath: portFile)
+        setenv("YS_NODE_PORT_FILE", portFile, 1)
+        // npm/npx CLIs bundled alongside main.js (added in the npm step).
+        setenv("YS_NODE_NPM_CLI", res + "/NodeResources/node/npm/bin/npm-cli.js", 1)
+        setenv("YS_NODE_NPX_CLI", res + "/NodeResources/node/npm/bin/npx-cli.js", 1)
+
+        ys_node_start_resident(mainJS)
     }
 
     var promptPathComponent: String {
