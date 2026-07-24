@@ -122,14 +122,32 @@ fn run_git<SE: ShellExtensions>(
                     Ok(i) => i,
                     Err(e) => fail!(e),
                 };
+                let workdir = repo.workdir().map(Path::to_path_buf);
                 for p in rest {
                     if p == "." || p == "-A" {
-                        let _ = index.add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None);
+                        if let Err(e) =
+                            index.add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+                        {
+                            fail!(e);
+                        }
                     } else {
-                        let _ = index.add_path(Path::new(p));
+                        // A user path is relative to cwd, but add_path wants a
+                        // repo-root-relative path — convert it (cwd may be a
+                        // subdirectory of the repo).
+                        let abs = cwd.join(p);
+                        let rel = workdir
+                            .as_deref()
+                            .and_then(|wd| abs.strip_prefix(wd).ok())
+                            .map_or_else(|| Path::new(p).to_path_buf(), Path::to_path_buf);
+                        if let Err(e) = index.add_path(&rel) {
+                            let _ = writeln!(err, "git: cannot add '{p}': {e}");
+                            return 1;
+                        }
                     }
                 }
-                let _ = index.write();
+                if let Err(e) = index.write() {
+                    fail!(e);
+                }
                 0
             }
             Err(e) => fail!(e),
@@ -407,7 +425,13 @@ fn git_fetch(repo: &Repository, merge: bool, out: &mut impl Write, err: &mut imp
 }
 
 fn git_push(repo: &Repository, rest: &[String], out: &mut impl Write, err: &mut impl Write) -> u8 {
-    let remote_name = rest.first().map_or("origin", String::as_str);
+    // Skip flags like `-u`/`--set-upstream`: positionals are [remote] [branch].
+    let positionals: Vec<&str> = rest
+        .iter()
+        .filter(|a| !a.starts_with('-'))
+        .map(String::as_str)
+        .collect();
+    let remote_name = positionals.first().copied().unwrap_or("origin");
     let mut remote = match repo.find_remote(remote_name) {
         Ok(r) => r,
         Err(e) => {
@@ -415,11 +439,15 @@ fn git_push(repo: &Repository, rest: &[String], out: &mut impl Write, err: &mut 
             return 1;
         }
     };
-    let branch = repo
-        .head()
-        .ok()
-        .and_then(|h| h.shorthand().ok().map(String::from))
-        .unwrap_or_else(|| "main".to_string());
+    let branch = positionals.get(1).map_or_else(
+        || {
+            repo.head()
+                .ok()
+                .and_then(|h| h.shorthand().ok().map(String::from))
+                .unwrap_or_else(|| "main".to_string())
+        },
+        |b| (*b).to_string(),
+    );
     let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
     let mut po = git2::PushOptions::new();
     po.remote_callbacks(cred_callback());

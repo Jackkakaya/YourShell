@@ -872,8 +872,10 @@ impl builtins::Command for SqliteCommand {
 
         let mut out = context.stdout();
         let mut exit = 0u8;
-        // Execute each statement; SELECTs print rows, others just run.
-        for stmt_sql in sql.split(';') {
+        // Execute each statement; SELECTs print rows, others just run. Split on
+        // `;` but not inside string literals (naive split(';') would break
+        // `INSERT INTO t VALUES('a;b')`).
+        for stmt_sql in split_sql_statements(&sql) {
             let trimmed = stmt_sql.trim();
             if trimmed.is_empty() {
                 continue;
@@ -890,6 +892,57 @@ impl builtins::Command for SqliteCommand {
         out.flush()?;
         Ok(ExecutionResult::new(exit))
     }
+}
+
+/// Splits a SQL script on `;`, but not inside single/double-quoted string
+/// literals (where `''`/`""` are literal-quote escapes). Comments are not
+/// specially handled — good enough for the common case a naive split breaks.
+fn split_sql_statements(sql: &str) -> Vec<String> {
+    let mut stmts = Vec::new();
+    let mut cur = String::new();
+    let mut chars = sql.chars().peekable();
+    let mut in_single = false;
+    let mut in_double = false;
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' if !in_double => {
+                cur.push(c);
+                if in_single {
+                    if chars.peek() == Some(&'\'') {
+                        cur.push(chars.next().unwrap()); // '' escape
+                    } else {
+                        in_single = false;
+                    }
+                } else {
+                    in_single = true;
+                }
+            }
+            '"' if !in_single => {
+                cur.push(c);
+                if in_double {
+                    if chars.peek() == Some(&'"') {
+                        cur.push(chars.next().unwrap()); // "" escape
+                    } else {
+                        in_double = false;
+                    }
+                } else {
+                    in_double = true;
+                }
+            }
+            ';' if !in_single && !in_double => {
+                if !cur.trim().is_empty() {
+                    stmts.push(std::mem::take(&mut cur));
+                } else {
+                    cur.clear();
+                }
+            }
+            _ => cur.push(c),
+        }
+    }
+    if !cur.trim().is_empty() {
+        stmts.push(cur);
+    }
+    stmts
 }
 
 fn run_sqlite_stmt(
