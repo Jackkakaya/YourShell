@@ -9,7 +9,6 @@
 mod builtins_extra;
 mod commands_ext;
 mod editor;
-mod vi_native;
 mod git_adapter;
 mod uutils_adapter;
 #[cfg(feature = "python")]
@@ -84,7 +83,7 @@ pub(crate) async fn build_shell(
         .builtin("jq", core_builtins::builtin::<commands_ext::JqCommand, DefaultShellExtensions>())
         .builtin("git", git_adapter::registration())
         .builtin("edit", core_builtins::builtin::<editor::EditorCommand, DefaultShellExtensions>())
-        .builtin("vi", vi_native::registration())
+        .builtin("vi", core_builtins::builtin::<editor::EditorCommand, DefaultShellExtensions>())
         .builtin("nano", core_builtins::builtin::<editor::EditorCommand, DefaultShellExtensions>());
     for name in uutils_adapter::command_names() {
         builder = builder.builtin(name, uutils_adapter::registration());

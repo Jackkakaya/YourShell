@@ -1836,9 +1836,26 @@ static void setup_signals(void)
 	sigaction(SIGWINCH, &sa, NULL);
 }
 
+/* YourShell: reset nextvi's persistent globals so vi can be re-invoked in
+ * our long-lived process. nextvi assumes a one-shot process; without this the
+ * stale xquit makes the second `vi` exit immediately ("vi gone"), and the
+ * stale buffer pointers would corrupt. Each vi runs on a fresh thread, but the
+ * process-global statics survive, so we clear them here. */
+static void ys_nextvi_reset(void)
+{
+	/* The one global that breaks re-invocation: a leftover positive/negative
+	 * xquit makes vi()'s `while (!xquit)` loop exit immediately. The buffer
+	 * subsystem is left alone — ec_edit() in ex_init reloads the file. */
+	xquit = 0;
+	xgrec = 0;
+	ibuf_pos = ibuf_cnt = icmd_pos = 0;
+	texec = tn = 0;
+}
+
 int ys_nextvi_main(int argc, char *argv[])
 {
 	int i, j;
+	ys_nextvi_reset();
 	setup_signals();
 	dir_init();
 	syn_init();
