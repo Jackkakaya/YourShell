@@ -261,6 +261,7 @@ impl Editor {
             }
             0x0D | 0x0A => self.insert_newline(),
             0x7F | 0x08 => self.backspace(),
+            0x09 => self.insert_char('\t'), // Tab is a real character
             0x00..=0x1F => {}
             _ => {
                 let ch = self.read_utf8(b, stdin)?;

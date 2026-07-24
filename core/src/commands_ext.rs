@@ -257,8 +257,18 @@ impl builtins::Command for DiffCommand {
         context: ExecutionContext<'_, SE>,
     ) -> Result<ExecutionResult, Self::Error> {
         let cwd = context.shell.working_dir().to_path_buf();
-        let ta = std::fs::read_to_string(abs(&cwd, &self.a)).unwrap_or_default();
-        let tb = std::fs::read_to_string(abs(&cwd, &self.b)).unwrap_or_default();
+        // A missing/non-UTF-8 file is an error (exit 2), not "an empty file" —
+        // otherwise a typo'd path silently diffs against nothing.
+        let read = |name: &str| match std::fs::read_to_string(abs(&cwd, name)) {
+            Ok(s) => Ok(s),
+            Err(e) => {
+                let _ = writeln!(context.stderr(), "diff: {name}: {e}");
+                Err(())
+            }
+        };
+        let (Ok(ta), Ok(tb)) = (read(&self.a), read(&self.b)) else {
+            return Ok(ExecutionResult::new(2));
+        };
         let diff = similar::TextDiff::from_lines(&ta, &tb);
         let mut out = context.stdout();
         if diff.ratio() == 1.0 {
@@ -1069,7 +1079,18 @@ impl builtins::Command for JqCommand {
                 .map(|l| Val::from(l.to_string()))
                 .collect()
         } else {
-            jaq_json::read::parse_many(&raw).filter_map(Result::ok).collect()
+            // Report malformed JSON instead of silently dropping it (exit 0).
+            let mut vals = Vec::new();
+            for r in jaq_json::read::parse_many(&raw) {
+                match r {
+                    Ok(v) => vals.push(v),
+                    Err(e) => {
+                        let _ = writeln!(context.stderr(), "jq: parse error: {e:?}");
+                        return Ok(ExecutionResult::new(2));
+                    }
+                }
+            }
+            vals
         };
 
         let mut exit = 0u8;
