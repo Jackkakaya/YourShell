@@ -152,6 +152,14 @@ pub static CASES: &[Case] = &[
     case!("jq-pipe", "echo '{\"a\":{\"b\":42}}' | jq '.a.b'", Eq("42")),
     case!("jq-keys", "echo '{\"x\":1,\"y\":2}' | jq -r 'keys[]'", Eq("x\ny")),
     case!("jq-select", "echo '[{\"n\":1},{\"n\":5}]' | jq '.[] | select(.n > 3) | .n'", Eq("5")),
+    // ---- git (libgit2, local ops) ----
+    case!("git-version", "git --version", Has("libgit2")),
+    case!("git-init", "rm -rf gr; mkdir gr; (cd gr && git init 2>&1 | head -1)", Has("Initialized")),
+    case!("git-config-commit-log", "(cd gr && git config user.name Tester && git config user.email t@e.com && echo hello > f.txt && git add f.txt && git commit -m 'first commit' 2>&1 | head -1 && git log -n 1 | grep -c 'first commit')", Has("1")),
+    case!("git-status-clean", "(cd gr && git status | tail -1)", Has("clean")),
+    case!("git-status-dirty", "(cd gr && echo more > f2.txt && git status | grep -c f2.txt)", Has("1")),
+    case!("git-branch", "(cd gr && git branch newbr && git branch | grep -c newbr)", Has("1")),
+    case!("git-diff", "(cd gr && echo changed >> f.txt && git diff | grep -c changed)", Has("1")),
     // ---- uutils adapter: session-state sync ----
     case!("uu-env-sync", "export UUV=fromshell; printenv UUV", Eq("fromshell")),
     case!("uu-cwd-sync", "mkdir -p cwt && cd cwt && touch inner.txt && ls && cd ..", Has("inner.txt")),
