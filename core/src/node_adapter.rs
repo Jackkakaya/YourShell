@@ -13,7 +13,6 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
-use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::time::Duration;
 

@@ -15,6 +15,21 @@ void ashell_stdin_write(void *session, const uint8_t *bytes, size_t len);
 void ashell_session_free(void *session);
 char *ashell_selftest(const char *working_dir);
 void ashell_string_free(char *s);
+uint32_t ashell_abi_version(void);
+
+/* Agent / non-interactive path: run a command to completion capturing
+ * stdout/stderr separately. timeout_ms == 0 means no timeout. Free with
+ * ashell_capture_free. ashell_cancel interrupts the running command. */
+typedef struct {
+    int32_t exit_code;
+    char *stdout_str;
+    char *stderr_str;
+} ashell_capture_result;
+
+ashell_capture_result *ashell_run_capture(void *session, const char *cmd,
+                                          uint64_t timeout_ms);
+void ashell_cancel(void *session);
+void ashell_capture_free(ashell_capture_result *result);
 
 void ys_node_start_resident(const char *main_js_path);
 
