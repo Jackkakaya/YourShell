@@ -466,9 +466,11 @@ async fn run_session(opts: Opts, fd0: OwnedFd, fd1: OwnedFd, fd2: OwnedFd) -> u8
             eprint_fd(raw2, &format!("ssh: request_shell failed: {e}\n"));
             return 255;
         }
-    } else if let Err(e) = channel.exec(true, opts.command.as_deref().unwrap()).await {
-        eprint_fd(raw2, &format!("ssh: exec failed: {e}\n"));
-        return 255;
+    } else if let Some(cmd) = opts.command.as_deref() {
+        if let Err(e) = channel.exec(true, cmd).await {
+            eprint_fd(raw2, &format!("ssh: exec failed: {e}\n"));
+            return 255;
+        }
     }
 
     let restore = FdFlagsGuard::capture(&[raw0, raw1, raw2]);
@@ -496,7 +498,9 @@ async fn pump(
     };
     let mut stderr = AsyncFd::try_from(raw2).ok();
     let mut buf = vec![0u8; 8192];
-    let mut stdin_closed = !forward_stdin;
+    // Also treat a failed stdin AsyncFd as "closed" so the select arm below
+    // (which unwraps `stdin`) is never entered with `stdin == None`.
+    let mut stdin_closed = !forward_stdin || stdin.is_none();
     let mut code: u8 = 0;
 
     loop {

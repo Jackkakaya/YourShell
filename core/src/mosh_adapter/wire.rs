@@ -64,10 +64,14 @@ impl Crypto {
         plaintext.extend_from_slice(&timestamp_reply.to_be_bytes());
         plaintext.extend_from_slice(payload);
 
+        // OCB3 encryption only fails for absurdly large plaintexts; mosh
+        // payloads are MTU-bounded so this never happens. Degrade to an empty
+        // ciphertext rather than panic on the hot send path — the resulting
+        // too-short datagram is simply dropped by the peer.
         let ct = self
             .cipher
             .encrypt(GenericArray::from_slice(&nonce12), plaintext.as_ref())
-            .expect("OCB3 encryption is infallible for valid inputs");
+            .unwrap_or_default();
 
         let mut out = Vec::with_capacity(8 + ct.len());
         out.extend_from_slice(&nonce8);
@@ -172,8 +176,8 @@ impl FragmentAssembler {
                 && self.fragments.iter().all(Option::is_some)
             {
                 let mut out = Vec::new();
-                for f in &self.fragments {
-                    out.extend_from_slice(f.as_ref().unwrap());
+                for f in self.fragments.iter().flatten() {
+                    out.extend_from_slice(f);
                 }
                 self.id = None;
                 self.fragments.clear();
