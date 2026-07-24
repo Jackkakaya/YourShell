@@ -244,6 +244,9 @@ async fn run(opts: Opts, fd0: OwnedFd, fd1: OwnedFd, fd2: OwnedFd) -> u8 {
     let code = client_loop(&crypto, &sock, raw0, raw1, opts.cols, opts.rows).await;
 
     drop(restore);
+    // Reset any global private modes the remote left on, then leave alt screen
+    // (see ssh_adapter::TERM_CLEANUP).
+    let _ = write_fd(raw1, crate::ssh_adapter::TERM_CLEANUP);
     let _ = write_fd(raw1, b"\x1b[?1049l");
     code
 }

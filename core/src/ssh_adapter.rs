@@ -35,6 +35,13 @@ use russh::{ChannelMsg, Disconnect};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_fd::AsyncFd;
 
+/// Resets the global terminal private modes a remote full-screen program may
+/// have left enabled: bracketed paste, mouse tracking (1000/1002/1003/1006),
+/// application cursor keys, hidden cursor, autowrap; plus an SGR reset. Emitted
+/// when leaving an ssh/mosh session so no state leaks into the local shell.
+pub(crate) const TERM_CLEANUP: &[u8] =
+    b"\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1l\x1b[?25h\x1b[?7h\x1b[0m";
+
 pub fn registration() -> Registration<DefaultShellExtensions> {
     Registration {
         execute_func: exec_ssh,
@@ -433,6 +440,11 @@ async fn run_session(opts: Opts, fd0: OwnedFd, fd1: OwnedFd, fd2: OwnedFd) -> u8
     let restore = FdFlagsGuard::capture(&[raw0, raw1]);
     let code = pump(&mut channel, raw0, raw1, raw2, interactive).await;
     drop(restore);
+    // The remote shell may leave global private modes on (bracketed paste,
+    // mouse tracking, hidden cursor). These survive the alt-screen leave, so
+    // reset them before restoring the primary screen — otherwise later input
+    // shows stray `~`/paste-wrapper artifacts that even `clear` can't fix.
+    let _ = write_all_fd(raw1, TERM_CLEANUP);
     if interactive {
         let _ = write_all_fd(raw1, b"\x1b[?1049l");
     }
