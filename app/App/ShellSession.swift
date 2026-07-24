@@ -222,12 +222,71 @@ final class ShellSession: ObservableObject {
             emitText("^C\r\n")
             lineBuffer = []
             printPrompt()
+        case 0x09: // Tab: completion
+            completeCurrentLine()
         default:
-            if b >= 0x20 || b == 0x09 {
+            if b >= 0x20 {
                 lineBuffer.append(b)
                 emitBytes([b])
             }
         }
+    }
+
+    /// Tab completion: asks the shell for candidates at the cursor (end of
+    /// line). One candidate completes inline; several print as a list and
+    /// complete the longest common prefix.
+    private func completeCurrentLine() {
+        guard let handle else { return }
+        let line = String(decoding: lineBuffer, as: UTF8.self)
+        guard let raw = ashell_complete(handle, line, line.utf8.count) else { return }
+        let report = String(cString: raw)
+        ashell_string_free(raw)
+
+        let lines = report.split(separator: "\n", omittingEmptySubsequences: false)
+        guard let header = lines.first else { return }
+        let parts = header.split(separator: " ")
+        guard parts.count == 3, let deleteCount = Int(parts[1]) else { return }
+        let candidates = lines.dropFirst().map(String.init)
+        guard !candidates.isEmpty else { return }
+
+        if candidates.count == 1 {
+            insertCompletion(candidates[0], deleteBytes: deleteCount, addSpace: true)
+        } else {
+            let common = longestCommonPrefix(candidates)
+            if common.utf8.count > deleteCount {
+                insertCompletion(common, deleteBytes: deleteCount, addSpace: false)
+            }
+            // Show the candidate list, then redraw the prompt + current line.
+            emitText("\r\n")
+            emitText(candidates.joined(separator: "    "))
+            emitText("\r\n")
+            printPrompt()
+            emitBytes(lineBuffer)
+        }
+    }
+
+    /// Replaces the last `deleteBytes` UTF-8 bytes of the line with `text`.
+    private func insertCompletion(_ text: String, deleteBytes: Int, addSpace: Bool) {
+        for _ in 0..<deleteBytes {
+            if !lineBuffer.isEmpty {
+                lineBuffer.removeLast()
+                emitText("\u{08} \u{08}")
+            }
+        }
+        var insert = Array(text.utf8)
+        if addSpace { insert.append(0x20) }
+        lineBuffer.append(contentsOf: insert)
+        emitBytes(insert)
+    }
+
+    private func longestCommonPrefix(_ strings: [String]) -> String {
+        guard var prefix = strings.first else { return "" }
+        for s in strings.dropFirst() {
+            while !s.hasPrefix(prefix) && !prefix.isEmpty {
+                prefix.removeLast()
+            }
+        }
+        return prefix
     }
 
     private func eraseCurrentLine() {
@@ -313,6 +372,22 @@ final class ShellSession: ObservableObject {
             bytes.withUnsafeBufferPointer { buf in
                 ashell_stdin_write(handle, buf.baseAddress, buf.count)
             }
+        }
+    }
+
+    /// Debug: feed a literal string (with \t for Tab) into the line editor,
+    /// then write the transcript to Documents/type_out.txt.
+    func typeForDebug(_ text: String) {
+        let bytes = Array(text.utf8)
+        keyInput(bytes[...])
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+            guard let self else { return }
+            let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            let logical = String(decoding: self.lineBuffer, as: UTF8.self)
+            let dump = "LINEBUFFER:[\(logical)]\n---transcript---\n" + self.transcript
+            try? dump.write(
+                to: docs.appendingPathComponent("type_out.txt"),
+                atomically: true, encoding: .utf8)
         }
     }
 

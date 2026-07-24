@@ -28,6 +28,10 @@ struct TerminalScreen: View {
                         if let feed = env["ASHELL_STDIN_FEED"] {
                             session.scheduleStdinFeed(feed, after: 4.0)
                         }
+                    } else if let typed = env["ASHELL_TYPE"] {
+                        // Debug: feed keystrokes (incl. \t) into the line editor,
+                        // then mirror the transcript so the host can inspect it.
+                        session.typeForDebug(typed)
                     } else {
                         session.startDemo()
                     }

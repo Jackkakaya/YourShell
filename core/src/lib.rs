@@ -33,8 +33,24 @@ pub type DoneCb = extern "C" fn(ctx: *mut c_void, exit_code: i32, cwd: *const c_
 struct CallbackCtx(*mut c_void);
 unsafe impl Send for CallbackCtx {}
 
+/// Messages to the session's shell thread.
+enum SessionMsg {
+    Exec(String),
+    /// Tab completion: (line, cursor byte offset, reply channel).
+    Complete(String, usize, mpsc::SyncSender<CompletionReply>),
+}
+
+/// Completion result handed back to the FFI caller.
+pub struct CompletionReply {
+    /// Byte offset in the line where candidates are inserted.
+    insertion_index: usize,
+    /// Bytes to delete before insertion (the token prefix).
+    delete_count: usize,
+    candidates: Vec<String>,
+}
+
 pub struct Session {
-    cmd_tx: mpsc::Sender<String>,
+    cmd_tx: mpsc::Sender<SessionMsg>,
     stdin_writer: std::io::PipeWriter,
 }
 
@@ -110,7 +126,7 @@ pub extern "C" fn ashell_session_new(
 
     let (stdout_reader, stdout_writer) = std::io::pipe().expect("pipe");
     let (stdin_reader, stdin_writer) = std::io::pipe().expect("pipe");
-    let (cmd_tx, cmd_rx) = mpsc::channel::<String>();
+    let (cmd_tx, cmd_rx) = mpsc::channel::<SessionMsg>();
 
     // Pump command output back to Swift.
     let out_ctx = CallbackCtx(ctx);
@@ -152,21 +168,46 @@ pub extern "C" fn ashell_session_new(
                 }
             };
 
-            while let Ok(cmd) = cmd_rx.recv() {
-                let params = shell.default_exec_params();
-                let source_info = brush_core::SourceInfo::from("terminal");
-                let exit_code: i32 = match shell.run_string(cmd, &source_info, &params).await {
-                    Ok(result) => i32::from(u8::from(result.exit_code)),
-                    Err(e) => {
-                        let mut err = params.stderr(&shell);
-                        let _ = writeln!(err, "ashell: {e}");
-                        let _ = err.flush();
-                        127
+            while let Ok(msg) = cmd_rx.recv() {
+                match msg {
+                    SessionMsg::Exec(cmd) => {
+                        let params = shell.default_exec_params();
+                        let source_info = brush_core::SourceInfo::from("terminal");
+                        let exit_code: i32 =
+                            match shell.run_string(cmd, &source_info, &params).await {
+                                Ok(result) => i32::from(u8::from(result.exit_code)),
+                                Err(e) => {
+                                    let mut err = params.stderr(&shell);
+                                    let _ = writeln!(err, "ashell: {e}");
+                                    let _ = err.flush();
+                                    127
+                                }
+                            };
+                        let cwd =
+                            CString::new(shell.working_dir().to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                        done_cb(shell_ctx.0, exit_code, cwd.as_ptr());
                     }
-                };
-                let cwd = CString::new(shell.working_dir().to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                done_cb(shell_ctx.0, exit_code, cwd.as_ptr());
+                    SessionMsg::Complete(line, pos, reply) => {
+                        // Config is cloned to avoid borrowing shell immutably
+                        // and mutably at once.
+                        let cfg = shell.completion_config().clone();
+                        let result = cfg.get_completions(&mut shell, &line, pos).await;
+                        let out = match result {
+                            Ok(c) => CompletionReply {
+                                insertion_index: c.insertion_index,
+                                delete_count: c.delete_count,
+                                candidates: c.candidates,
+                            },
+                            Err(_) => CompletionReply {
+                                insertion_index: pos,
+                                delete_count: 0,
+                                candidates: Vec::new(),
+                            },
+                        };
+                        let _ = reply.send(out);
+                    }
+                }
             }
         });
     });
@@ -178,7 +219,44 @@ pub extern "C" fn ashell_session_new(
 pub extern "C" fn ashell_exec(session: *mut Session, cmd: *const c_char) {
     let session = unsafe { &*session };
     let cmd = unsafe { CStr::from_ptr(cmd) }.to_string_lossy().into_owned();
-    let _ = session.cmd_tx.send(cmd);
+    let _ = session.cmd_tx.send(SessionMsg::Exec(cmd));
+}
+
+/// Tab completion. Given the current line and cursor byte offset, returns the
+/// candidates as newline-joined text; the first line is a header
+/// `<insertion_index> <delete_count> <count>` so the caller can apply them.
+/// Caller frees with `ashell_string_free`.
+#[unsafe(no_mangle)]
+pub extern "C" fn ashell_complete(
+    session: *mut Session,
+    line: *const c_char,
+    cursor: usize,
+) -> *mut c_char {
+    let session = unsafe { &*session };
+    let line = unsafe { CStr::from_ptr(line) }.to_string_lossy().into_owned();
+    let (reply_tx, reply_rx) = mpsc::sync_channel::<CompletionReply>(1);
+    if session
+        .cmd_tx
+        .send(SessionMsg::Complete(line, cursor, reply_tx))
+        .is_err()
+    {
+        return CString::new("0 0 0").unwrap().into_raw();
+    }
+    let reply = match reply_rx.recv() {
+        Ok(r) => r,
+        Err(_) => return CString::new("0 0 0").unwrap().into_raw(),
+    };
+    let mut s = format!(
+        "{} {} {}",
+        reply.insertion_index,
+        reply.delete_count,
+        reply.candidates.len()
+    );
+    for c in &reply.candidates {
+        s.push('\n');
+        s.push_str(c);
+    }
+    CString::new(s).unwrap_or_default().into_raw()
 }
 
 #[unsafe(no_mangle)]
