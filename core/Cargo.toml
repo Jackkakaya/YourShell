@@ -10,7 +10,7 @@ crate-type = ["staticlib", "lib"]
 brush-core = { path = "../vendor/brush/brush-core" }
 brush-builtins = { path = "../vendor/brush/brush-builtins" }
 clap = { version = "4.6", features = ["derive"] }
-tokio = { version = "1", features = ["rt", "macros", "time"] }
+tokio = { version = "1", features = ["rt", "macros", "time", "net", "io-util", "sync"] }
 regex-lite = "0.1.9"
 futures = { version = "0.3.33", default-features = false, features = ["std"] }
 libc = "0.2.189"
@@ -32,6 +32,8 @@ tar = "0.4.46"
 zip = "8.6.0"
 rusqlite = { version = "0.32", features = ["bundled"] }
 git2 = { version = "0.21.0", default-features = false, features = ["https", "vendored-libgit2", "vendored-openssl"] }
+russh = { version = "0.62", default-features = false, features = ["ring", "flate2", "rsa"] }
+tokio-fd = "0.3"
 
 [profile.release]
 opt-level = "s"

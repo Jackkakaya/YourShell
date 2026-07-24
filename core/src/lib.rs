@@ -11,6 +11,7 @@ mod builtins_extra;
 mod commands_ext;
 mod editor;
 mod git_adapter;
+mod ssh_adapter;
 mod uutils_adapter;
 #[cfg(feature = "python")]
 mod python_adapter;
@@ -84,6 +85,7 @@ pub(crate) async fn build_shell(
         .builtin("jq", core_builtins::builtin::<commands_ext::JqCommand, DefaultShellExtensions>())
         .builtin("git", git_adapter::registration())
         .builtin("awk", awk_adapter::registration())
+        .builtin("ssh", ssh_adapter::registration())
         .builtin("edit", core_builtins::builtin::<editor::EditorCommand, DefaultShellExtensions>())
         .builtin("vi", core_builtins::builtin::<editor::EditorCommand, DefaultShellExtensions>())
         .builtin("nano", core_builtins::builtin::<editor::EditorCommand, DefaultShellExtensions>());
