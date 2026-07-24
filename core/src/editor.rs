@@ -972,3 +972,120 @@ fn char_to_byte(s: &str, char_idx: usize) -> usize {
         .nth(char_idx)
         .map_or_else(|| s.len(), |(i, _)| i)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// Build a Normal-mode editor seeded with the given lines.
+    fn ed(lines: &[&str]) -> Editor {
+        let mut e = Editor::new(Some(PathBuf::from("t.rs")), 24, 80, false);
+        e.lines = lines.iter().map(|s| (*s).to_string()).collect();
+        e.cx = 0;
+        e.cy = 0;
+        e.dirty = false;
+        e
+    }
+
+    /// Replay a byte stream through the same per-key loop `run()` uses.
+    fn drive(e: &mut Editor, keys: &[u8]) {
+        let mut cur = Cursor::new(keys.to_vec());
+        let mut sink: Vec<u8> = Vec::new();
+        let mut b = [0u8; 1];
+        while Read::read(&mut cur, &mut b).unwrap() == 1 {
+            e.handle_key(b[0], &mut cur, &mut sink).unwrap();
+        }
+    }
+
+    const ESC: u8 = 0x1B;
+    const LF: u8 = 0x0A;
+
+    #[test]
+    fn dw_tilde_append() {
+        let mut e = ed(&["let x = 42"]);
+        // ^ (bol), dw -> drop "let ", ~ -> X, A + " END" + Esc
+        let mut keys = vec![b'^', b'd', b'w', b'~', b'A', b' ', b'E', b'N', b'D'];
+        keys.push(ESC);
+        drive(&mut e, &keys);
+        assert_eq!(e.lines, vec!["X = 42 END"]);
+    }
+
+    #[test]
+    fn dd_then_undo_restores() {
+        let mut e = ed(&["a", "b", "c"]);
+        drive(&mut e, b"dddd"); // delete "a", then "b" -> ["c"]
+        assert_eq!(e.lines, vec!["c"]);
+        drive(&mut e, b"u"); // undo one dd -> ["b","c"]
+        assert_eq!(e.lines, vec!["b", "c"]);
+    }
+
+    #[test]
+    fn count_prefixed_dd() {
+        let mut e = ed(&["a", "b", "c", "d"]);
+        drive(&mut e, b"2dd");
+        assert_eq!(e.lines, vec!["c", "d"]);
+    }
+
+    #[test]
+    fn count_prefixed_motion() {
+        let mut e = ed(&["l0", "l1", "l2", "l3", "l4"]);
+        drive(&mut e, b"3j");
+        assert_eq!(e.cy, 3);
+    }
+
+    #[test]
+    fn search_jumps_to_match() {
+        let mut e = ed(&["foo", "bar", "baz"]);
+        let mut keys = b"/bar".to_vec();
+        keys.push(LF);
+        drive(&mut e, &keys);
+        assert_eq!(e.cy, 1);
+        assert_eq!(e.cx, 0);
+    }
+
+    #[test]
+    fn join_lines() {
+        let mut e = ed(&["foo", "   bar"]);
+        drive(&mut e, b"J");
+        assert_eq!(e.lines, vec!["foo bar"]);
+    }
+
+    #[test]
+    fn delete_to_eol() {
+        let mut e = ed(&["hello world"]);
+        drive(&mut e, b"wD"); // w -> col6, D truncates
+        assert_eq!(e.lines, vec!["hello "]);
+    }
+
+    #[test]
+    fn replace_char() {
+        let mut e = ed(&["cat"]);
+        drive(&mut e, b"rb"); // replace 'c' with 'b'
+        assert_eq!(e.lines, vec!["bat"]);
+    }
+
+    #[test]
+    fn redo_after_undo() {
+        let mut e = ed(&["a", "b"]);
+        drive(&mut e, b"dd"); // ["b"]
+        drive(&mut e, b"u"); // ["a","b"]
+        drive(&mut e, &[0x12]); // Ctrl-R redo -> ["b"]
+        assert_eq!(e.lines, vec!["b"]);
+    }
+
+    #[test]
+    fn highlight_emits_ansi_for_known_ext() {
+        let e = ed(&["let x = 42"]);
+        let painted = e.highlight_line("let x = 42");
+        assert!(painted.contains("\x1b[38;5;75m"), "keyword color");
+        assert!(painted.contains("\x1b[38;5;179m"), "number color");
+    }
+
+    #[test]
+    fn highlight_noop_for_unknown_ext() {
+        let mut e = Editor::new(Some(PathBuf::from("data.unknownext")), 24, 80, false);
+        e.lines = vec!["let x = 42".to_string()];
+        assert_eq!(e.highlight_line("let x = 42"), "let x = 42");
+    }
+}
