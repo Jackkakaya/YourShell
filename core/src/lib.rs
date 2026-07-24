@@ -7,6 +7,7 @@
 //! in one process stay isolated.
 
 mod builtins_extra;
+mod commands_ext;
 mod uutils_adapter;
 #[cfg(feature = "python")]
 mod python_adapter;
@@ -47,7 +48,19 @@ pub(crate) async fn build_shell(
     let mut builder = brush_core::Shell::builder()
         .default_builtins(BuiltinSet::BashMode)
         .builtin("grep", core_builtins::builtin::<builtins_extra::GrepCommand, DefaultShellExtensions>())
-        .builtin("clear", core_builtins::builtin::<builtins_extra::ClearCommand, DefaultShellExtensions>());
+        .builtin("clear", core_builtins::builtin::<builtins_extra::ClearCommand, DefaultShellExtensions>())
+        .builtin("which", core_builtins::builtin::<commands_ext::WhichCommand, DefaultShellExtensions>())
+        .builtin("find", core_builtins::builtin::<commands_ext::FindCommand, DefaultShellExtensions>())
+        .builtin("tree", core_builtins::builtin::<commands_ext::TreeCommand, DefaultShellExtensions>())
+        .builtin("diff", core_builtins::builtin::<commands_ext::DiffCommand, DefaultShellExtensions>())
+        .builtin("gzip", core_builtins::builtin::<commands_ext::GzipCommand, DefaultShellExtensions>())
+        .builtin("gunzip", core_builtins::builtin::<commands_ext::GunzipCommand, DefaultShellExtensions>())
+        .builtin("sed", core_builtins::builtin::<commands_ext::SedCommand, DefaultShellExtensions>())
+        .builtin("curl", core_builtins::builtin::<commands_ext::CurlCommand, DefaultShellExtensions>())
+        .builtin("wget", core_builtins::builtin::<commands_ext::WgetCommand, DefaultShellExtensions>())
+        .builtin("tar", core_builtins::builtin::<commands_ext::TarCommand, DefaultShellExtensions>())
+        .builtin("zip", core_builtins::builtin::<commands_ext::ZipCommand, DefaultShellExtensions>())
+        .builtin("unzip", core_builtins::builtin::<commands_ext::UnzipCommand, DefaultShellExtensions>());
     for name in uutils_adapter::command_names() {
         builder = builder.builtin(name, uutils_adapter::registration());
     }
