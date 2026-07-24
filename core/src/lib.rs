@@ -46,7 +46,8 @@ pub(crate) async fn build_shell(
 ) -> Result<brush_core::Shell, brush_core::Error> {
     let mut builder = brush_core::Shell::builder()
         .default_builtins(BuiltinSet::BashMode)
-        .builtin("grep", core_builtins::builtin::<builtins_extra::GrepCommand, DefaultShellExtensions>());
+        .builtin("grep", core_builtins::builtin::<builtins_extra::GrepCommand, DefaultShellExtensions>())
+        .builtin("clear", core_builtins::builtin::<builtins_extra::ClearCommand, DefaultShellExtensions>());
     for name in uutils_adapter::command_names() {
         builder = builder.builtin(name, uutils_adapter::registration());
     }

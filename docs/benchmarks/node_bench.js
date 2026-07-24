@@ -1,0 +1,11 @@
+const crypto=require('crypto'), fs=require('fs');
+const R=process.env.HOME+'/Documents/nodeperf.txt';
+fs.writeFileSync(R,'=== Node '+process.version+' (jitless, iOS sim) ===\n');
+const w=(l)=>fs.appendFileSync(R,l+'\n');
+let t;
+t=Date.now(); let a=[]; for(let i=0;i<500000;i++)a.push(Math.random()); a.sort((x,y)=>x-y); w('sort 500k floats:        '+(Date.now()-t)+' ms');
+t=Date.now(); let o={}; for(let i=0;i<200000;i++)o['k'+i]=[i,i*2,'v'+i]; const s=JSON.stringify(o); JSON.parse(s); w('JSON 200k keys round:    '+(Date.now()-t)+' ms ('+(s.length/1024|0)+'KB)');
+t=Date.now(); let m=0; const re=/(\d+)-(\w+)/g; const txt='abc 123-foo 456-bar '.repeat(100000); let mm; while((mm=re.exec(txt)))m++; w('regex '+m+' matches:       '+(Date.now()-t)+' ms');
+t=Date.now(); for(let i=0;i<20000;i++)crypto.createHash('sha256').update('data'+i).digest('hex'); w('sha256 x20000:           '+(Date.now()-t)+' ms');
+t=Date.now(); function fib(n){return n<2?n:fib(n-1)+fib(n-2)} fib(32); w('fib(32) recursive:       '+(Date.now()-t)+' ms');
+w('DONE');

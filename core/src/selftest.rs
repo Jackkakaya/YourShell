@@ -122,6 +122,8 @@ pub static CASES: &[Case] = &[
     case!("grep-o-regex", "echo abc123def | grep -o '[0-9]+'", Eq("123")),
     case!("grep-nomatch-exit", "grep zzz poem.txt; echo rc=$?", Eq("rc=1")),
     case!("uname", "uname", Has("Darwin")),
+    case!("clear", "clear -x | wc -c", Has("7")),
+    case!("clear-scrollback", "clear | od -c | head -1", Has("033")),
     // ---- uutils adapter: session-state sync ----
     case!("uu-env-sync", "export UUV=fromshell; printenv UUV", Eq("fromshell")),
     case!("uu-cwd-sync", "mkdir -p cwt && cd cwt && touch inner.txt && ls && cd ..", Has("inner.txt")),
