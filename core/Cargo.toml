@@ -35,12 +35,22 @@ git2 = { version = "0.21.0", default-features = false, features = ["https", "ven
 russh = { version = "0.62", default-features = false, features = ["ring", "flate2", "rsa"] }
 russh-sftp = "2.3"
 tokio-fd = "0.3"
-ocb3 = "0.1.0"
-aes = "0.8"
+# mosh AES-128-OCB3. Pinned exactly and version-coupled: ocb3 0.1 needs an
+# `aes` on cipher 0.4 (= aes 0.8); aes 0.9 (cipher 0.5) will NOT satisfy
+# ocb3 0.1's bounds. Do not bump either without re-verifying OCB3 interop
+# against a real mosh-server (tests::mosh_live_probe in mosh_adapter/wire.rs).
+ocb3 = "=0.1.0"
+aes = "=0.8.4"
 
 [profile.release]
 opt-level = "s"
 lto = true
+# Panic strategy: UNWIND (not abort) on purpose. The uutils/awk/python
+# adapters rely on `catch_unwind` to contain panics from vendored C / uucore
+# code and restore process-global fds. `panic = "abort"` would make those
+# catch_unwind guards useless. To keep panics from unwinding across the C ABI
+# (which is UB), every #[no_mangle] export in lib.rs is itself wrapped in
+# catch_unwind (see ffi_guard).
 
 [patch.crates-io]
 uucore = { path = "../vendor/patches/uucore" }
