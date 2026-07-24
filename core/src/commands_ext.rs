@@ -450,13 +450,17 @@ impl builtins::Command for SedCommand {
         let had_trailing_nl = input.ends_with('\n');
         let mut out = context.stdout();
         let mut result = String::new();
-        for (i, line) in input.split('\n').enumerate() {
-            // split('\n') yields a trailing empty item when input ends with \n;
-            // skip re-adding a line for it.
+        let parts: Vec<&str> = input.split('\n').collect();
+        let n = parts.len();
+        for (i, line) in parts.iter().enumerate() {
             if i > 0 {
                 result.push('\n');
             }
-            if line.is_empty() && had_trailing_nl {
+            // Only the FINAL split item is the trailing-newline artifact (empty
+            // iff the input ended in \n); the '\n' pushed above already preserved
+            // that trailing newline. A *real* interior empty line must still be
+            // run through the expression (e.g. `sed 's/^/X/'` outputs `X`).
+            if i + 1 == n && had_trailing_nl && line.is_empty() {
                 continue;
             }
             match sedregex::find_and_replace(line, &cmds) {
@@ -561,23 +565,35 @@ fn http_get<SE: ShellExtensions>(
 ) -> Result<ExecutionResult, brush_core::Error> {
     match ureq::get(url).call() {
         Ok(mut resp) => {
-            let bytes = match resp.body_mut().read_to_vec() {
-                Ok(b) => b,
+            // Stream the body straight to the destination so a large download
+            // doesn't buffer the whole response in memory (OOM on iOS).
+            let mut reader = resp.body_mut().as_reader();
+            let copy_result = if let Some(d) = dest {
+                let path = abs(cwd, d);
+                match std::fs::File::create(&path) {
+                    Ok(mut f) => std::io::copy(&mut reader, &mut f).map(|_| ()),
+                    Err(e) => {
+                        if !silent {
+                            let _ = writeln!(context.stderr(), "curl: {}: {e}", path.display());
+                        }
+                        return Ok(ExecutionResult::new(1));
+                    }
+                }
+            } else {
+                let mut out = context.stdout();
+                let r = std::io::copy(&mut reader, &mut out).map(|_| ());
+                let _ = out.flush();
+                r
+            };
+            match copy_result {
+                Ok(()) => Ok(ExecutionResult::success()),
                 Err(e) => {
                     if !silent {
                         let _ = writeln!(context.stderr(), "curl: read error: {e}");
                     }
-                    return Ok(ExecutionResult::new(1));
+                    Ok(ExecutionResult::new(1))
                 }
-            };
-            if let Some(d) = dest {
-                std::fs::write(abs(cwd, d), &bytes)?;
-            } else {
-                let mut out = context.stdout();
-                out.write_all(&bytes)?;
-                out.flush()?;
             }
-            Ok(ExecutionResult::success())
         }
         Err(e) => {
             if !silent {

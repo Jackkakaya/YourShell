@@ -155,7 +155,16 @@ fn exec_node(
 
 fn build_request(argv: &[String], cwd: &str, env: &[(String, String)], stdin: &[u8]) -> String {
     let b64 = base64::engine::general_purpose::STANDARD;
-    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+    // Requests are newline-delimited JSON, so any control chars in argv/env
+    // (a value containing a literal newline) must be escaped or they'd split
+    // the frame and break parsing on the node side.
+    let esc = |s: &str| {
+        s.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+            .replace('\t', "\\t")
+    };
     let argv_json: Vec<String> = argv.iter().map(|a| format!("\"{}\"", esc(a))).collect();
     let env_json: Vec<String> = env
         .iter()
