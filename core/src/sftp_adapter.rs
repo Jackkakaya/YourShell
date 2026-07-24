@@ -7,7 +7,7 @@
 //! interactive prompt here). Each runs on a dedicated `enable_all` runtime
 //! inside `spawn_blocking`, driving the session fds directly — no global state.
 
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 
 use brush_core::builtins::Registration;
@@ -19,6 +19,7 @@ use russh_sftp::protocol::OpenFlags;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_fd::AsyncFd;
 
+use crate::ffi_util::{borrow_fd, fail};
 use crate::ssh_adapter::{connect_session, key_and_env_auth, HostKeyOutcome, Session};
 
 // ---------------------------------------------------------------------------
@@ -152,14 +153,7 @@ async fn connect_and_open(conn: &Conn) -> Result<SftpSession, String> {
 }
 
 fn write_fd(fd: RawFd, data: &[u8]) {
-    let mut data = data;
-    while !data.is_empty() {
-        let n = unsafe { libc::write(fd, data.as_ptr().cast(), data.len()) };
-        if n <= 0 {
-            break;
-        }
-        data = &data[n as usize..];
-    }
+    let _ = crate::ffi_util::write_all_fd(fd, data);
 }
 
 // ---------------------------------------------------------------------------
@@ -706,29 +700,6 @@ async fn read_line(stdin: &mut AsyncFd) -> Option<String> {
             Err(_) => return None,
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// helpers
-// ---------------------------------------------------------------------------
-
-fn borrow_fd(context: &ExecutionContext<'_, DefaultShellExtensions>, n: i32) -> Option<OwnedFd> {
-    context.try_fd(n.into()).and_then(|f| {
-        f.try_borrow_as_fd()
-            .ok()
-            .and_then(|bfd| bfd.try_clone_to_owned().ok())
-    })
-}
-
-fn fail(
-    context: &ExecutionContext<'_, DefaultShellExtensions>,
-    msg: &str,
-    code: u8,
-) -> Result<ExecutionResult, brush_core::Error> {
-    let mut err = context.stderr();
-    let _ = std::io::Write::write_all(&mut err, msg.as_bytes());
-    let _ = std::io::Write::write_all(&mut err, b"\n");
-    Ok(ExecutionResult::new(code))
 }
 
 #[cfg(test)]

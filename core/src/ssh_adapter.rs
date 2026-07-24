@@ -35,6 +35,8 @@ use russh::{ChannelMsg, Disconnect};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_fd::AsyncFd;
 
+use crate::ffi_util::{eprint_fd, write_all_fd, FdFlagsGuard};
+
 /// Picks a `TERM` to request for the remote PTY. The local terminal may be an
 /// exotic type (xterm-ghostty, xterm-kitty, alacritty, wezterm, …) whose
 /// terminfo entry is absent on servers, which breaks terminfo-based tools
@@ -359,34 +361,36 @@ async fn run_session(opts: Opts, fd0: OwnedFd, fd1: OwnedFd, fd2: OwnedFd) -> u8
     let raw1 = fd1.as_raw_fd();
     let raw2 = fd2.as_raw_fd();
 
-    macro_rules! eprint_fd {
-        ($($arg:tt)*) => {{
-            let s = format!($($arg)*);
-            unsafe { libc::write(raw2, s.as_ptr().cast(), s.len()); }
-        }};
-    }
+    // Leaves the alternate screen and resets leaked terminal modes on ANY return
+    // path once it's armed, so an error after entering the alt screen (e.g. a
+    // PTY/shell request rejected by the server) can never strand the local
+    // terminal in raw + alt-screen mode.
+    let mut term = TermRestore { raw1, active: false };
 
     let (res, hostkey) = connect_session(&opts.host, opts.port, &opts.home).await;
     let mut session = match res {
         Ok(s) => s,
         Err(e) => {
             if hostkey == HostKeyOutcome::Changed {
-                eprint_fd!(
-                    "ssh: REMOTE HOST IDENTIFICATION HAS CHANGED for {} — possible \
-                     man-in-the-middle. Remove the stale line from ~/.ssh/known_hosts \
-                     to override.\n",
-                    opts.host
+                eprint_fd(
+                    raw2,
+                    &format!(
+                        "ssh: REMOTE HOST IDENTIFICATION HAS CHANGED for {} — possible \
+                         man-in-the-middle. Remove the stale line from ~/.ssh/known_hosts \
+                         to override.\n",
+                        opts.host
+                    ),
                 );
             } else {
-                eprint_fd!("ssh: connect {}:{} failed: {e}\n", opts.host, opts.port);
+                eprint_fd(raw2, &format!("ssh: connect {}:{} failed: {e}\n", opts.host, opts.port));
             }
             return 255;
         }
     };
     if hostkey == HostKeyOutcome::Added {
-        eprint_fd!(
-            "ssh: warning — permanently added '{}' to ~/.ssh/known_hosts.\n",
-            opts.host
+        eprint_fd(
+            raw2,
+            &format!("ssh: warning — permanently added '{}' to ~/.ssh/known_hosts.\n", opts.host),
         );
     }
 
@@ -403,9 +407,10 @@ async fn run_session(opts: Opts, fd0: OwnedFd, fd1: OwnedFd, fd2: OwnedFd) -> u8
 
     if !authed {
         // Enter the alternate screen so the password prompt reads raw keystrokes
-        // without local echo.
+        // without local echo. Include raw2 so its O_NONBLOCK is restored too.
         let _ = write_all_fd(raw1, b"\x1b[?1049h");
-        let restore = FdFlagsGuard::capture(&[raw0, raw1]);
+        term.active = true;
+        let restore = FdFlagsGuard::capture(&[raw0, raw1, raw2]);
 
         for _ in 0..3 {
             let prompt = format!("\r\n{}@{}'s password: ", opts.user, opts.host);
@@ -422,27 +427,24 @@ async fn run_session(opts: Opts, fd0: OwnedFd, fd1: OwnedFd, fd2: OwnedFd) -> u8
                     let _ = write_all_fd(raw1, b"\r\nPermission denied, please try again.");
                 }
                 Err(e) => {
-                    eprint_fd!("\r\nssh: auth error: {e}\n");
+                    eprint_fd(raw2, &format!("\r\nssh: auth error: {e}\n"));
                     break;
                 }
             }
         }
         drop(restore);
-        if !authed {
-            let _ = write_all_fd(raw1, b"\x1b[?1049l");
-        }
     }
 
     if !authed {
-        eprint_fd!("ssh: authentication failed for {}@{}\n", opts.user, opts.host);
-        return 255;
+        eprint_fd(raw2, &format!("ssh: authentication failed for {}@{}\n", opts.user, opts.host));
+        return 255; // `term` drop leaves the alt screen if we entered it.
     }
 
     // --- Channel + PTY/shell or remote command ----------------------------
     let mut channel = match session.channel_open_session().await {
         Ok(c) => c,
         Err(e) => {
-            eprint_fd!("ssh: open channel failed: {e}\n");
+            eprint_fd(raw2, &format!("ssh: open channel failed: {e}\n"));
             return 255;
         }
     };
@@ -453,32 +455,26 @@ async fn run_session(opts: Opts, fd0: OwnedFd, fd1: OwnedFd, fd2: OwnedFd) -> u8
             .request_pty(false, &opts.term, opts.cols, opts.rows, 0, 0, &[])
             .await
         {
-            eprint_fd!("ssh: request_pty failed: {e}\n");
+            eprint_fd(raw2, &format!("ssh: request_pty failed: {e}\n"));
             return 255;
         }
         // Ensure the alternate screen / raw passthrough is active (it already is
         // if we went through the password prompt above).
         let _ = write_all_fd(raw1, b"\x1b[?1049h");
+        term.active = true;
         if let Err(e) = channel.request_shell(true).await {
-            eprint_fd!("ssh: request_shell failed: {e}\n");
+            eprint_fd(raw2, &format!("ssh: request_shell failed: {e}\n"));
             return 255;
         }
     } else if let Err(e) = channel.exec(true, opts.command.as_deref().unwrap()).await {
-        eprint_fd!("ssh: exec failed: {e}\n");
+        eprint_fd(raw2, &format!("ssh: exec failed: {e}\n"));
         return 255;
     }
 
-    let restore = FdFlagsGuard::capture(&[raw0, raw1]);
+    let restore = FdFlagsGuard::capture(&[raw0, raw1, raw2]);
     let code = pump(&mut channel, raw0, raw1, raw2, interactive).await;
     drop(restore);
-    // The remote shell may leave global private modes on (bracketed paste,
-    // mouse tracking, hidden cursor). These survive the alt-screen leave, so
-    // reset them before restoring the primary screen — otherwise later input
-    // shows stray `~`/paste-wrapper artifacts that even `clear` can't fix.
-    let _ = write_all_fd(raw1, TERM_CLEANUP);
-    if interactive {
-        let _ = write_all_fd(raw1, b"\x1b[?1049l");
-    }
+    drop(term); // leaves the alt screen + resets modes now, before disconnect.
     let _ = session
         .disconnect(Disconnect::ByApplication, "", "en")
         .await;
@@ -557,43 +553,20 @@ async fn read_password_raw(raw0: RawFd) -> Option<String> {
     }
 }
 
-fn write_all_fd(fd: RawFd, mut data: &[u8]) -> std::io::Result<()> {
-    while !data.is_empty() {
-        let n = unsafe { libc::write(fd, data.as_ptr().cast(), data.len()) };
-        if n <= 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        data = &data[n as usize..];
-    }
-    Ok(())
+/// Leaves the alternate screen and resets leaked private terminal modes when
+/// dropped, but only once `active` is set (i.e. once we've entered the alt
+/// screen). Being a Drop guard, it fires on every early return, so an error
+/// after entering full-screen mode can't strand the local terminal.
+struct TermRestore {
+    raw1: RawFd,
+    active: bool,
 }
 
-/// Saves the O_NONBLOCK/status flags of some fds and restores them on drop, so
-/// the shell's line reader isn't left with a non-blocking stdin after ssh (the
-/// tokio AsyncFd wrappers set O_NONBLOCK on the shared descriptions).
-struct FdFlagsGuard {
-    saved: Vec<(RawFd, i32)>,
-}
-
-impl FdFlagsGuard {
-    fn capture(fds: &[RawFd]) -> Self {
-        let saved = fds
-            .iter()
-            .filter_map(|&fd| {
-                let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-                (flags >= 0).then_some((fd, flags))
-            })
-            .collect();
-        Self { saved }
-    }
-}
-
-impl Drop for FdFlagsGuard {
+impl Drop for TermRestore {
     fn drop(&mut self) {
-        for &(fd, flags) in &self.saved {
-            unsafe {
-                libc::fcntl(fd, libc::F_SETFL, flags);
-            }
+        if self.active {
+            let _ = write_all_fd(self.raw1, TERM_CLEANUP);
+            let _ = write_all_fd(self.raw1, b"\x1b[?1049l");
         }
     }
 }

@@ -10,6 +10,7 @@ mod awk_adapter;
 mod builtins_extra;
 mod commands_ext;
 mod editor;
+mod ffi_util;
 mod git_adapter;
 mod mosh_adapter;
 mod sftp_adapter;

@@ -142,6 +142,7 @@ use tokio::io::AsyncReadExt;
 use tokio::net::UdpSocket;
 use tokio_fd::AsyncFd;
 
+use crate::ffi_util::{borrow_fd, eprint_fd, fail, write_all_fd, FdFlagsGuard};
 use wire::{build_client_datagram, decode_host_message, Crypto, Instruction, PROTOCOL_VERSION};
 
 pub fn registration() -> Registration<DefaultShellExtensions> {
@@ -194,9 +195,6 @@ fn exec_mosh(
 
 async fn run(opts: Opts, fd0: OwnedFd, fd1: OwnedFd, fd2: OwnedFd) -> u8 {
     let raw2 = fd2.as_raw_fd();
-    macro_rules! eprint_fd {
-        ($($a:tt)*) => {{ let s = format!($($a)*); unsafe { libc::write(raw2, s.as_ptr().cast(), s.len()); } }};
-    }
 
     // Resolve endpoint + key.
     let (host, udp_port, key_b64) = match &opts.mode {
@@ -205,7 +203,7 @@ async fn run(opts: Opts, fd0: OwnedFd, fd1: OwnedFd, fd2: OwnedFd) -> u8 {
             match bootstrap_over_ssh(user, host, *ssh_port, &opts).await {
                 Ok((port, key)) => (host.clone(), port, key),
                 Err(e) => {
-                    eprint_fd!("mosh: {e}\n");
+                    eprint_fd(raw2, &format!("mosh: {e}\n"));
                     return 255;
                 }
             }
@@ -215,7 +213,7 @@ async fn run(opts: Opts, fd0: OwnedFd, fd1: OwnedFd, fd2: OwnedFd) -> u8 {
     let key_bytes = match base64::engine::general_purpose::STANDARD_NO_PAD.decode(key_b64.trim()) {
         Ok(k) if k.len() == 16 => k,
         _ => {
-            eprint_fd!("mosh: invalid MOSH key\n");
+            eprint_fd(raw2, &format!("mosh: invalid MOSH key\n"));
             return 255;
         }
     };
@@ -226,19 +224,19 @@ async fn run(opts: Opts, fd0: OwnedFd, fd1: OwnedFd, fd2: OwnedFd) -> u8 {
     let sock = match UdpSocket::bind("0.0.0.0:0").await {
         Ok(s) => s,
         Err(e) => {
-            eprint_fd!("mosh: bind: {e}\n");
+            eprint_fd(raw2, &format!("mosh: bind: {e}\n"));
             return 255;
         }
     };
     if let Err(e) = sock.connect(format!("{host}:{udp_port}")).await {
-        eprint_fd!("mosh: connect {host}:{udp_port}: {e}\n");
+        eprint_fd(raw2, &format!("mosh: connect {host}:{udp_port}: {e}\n"));
         return 255;
     }
 
     let raw0 = fd0.as_raw_fd();
     let raw1 = fd1.as_raw_fd();
     // Enter the alternate screen (flips Swift into raw key passthrough).
-    let _ = write_fd(raw1, b"\x1b[?1049h");
+    let _ = write_all_fd(raw1, b"\x1b[?1049h");
     let restore = FdFlagsGuard::capture(&[raw0, raw1]);
 
     let code = client_loop(
@@ -249,8 +247,8 @@ async fn run(opts: Opts, fd0: OwnedFd, fd1: OwnedFd, fd2: OwnedFd) -> u8 {
     drop(restore);
     // Reset any global private modes the remote left on, then leave alt screen
     // (see ssh_adapter::TERM_CLEANUP).
-    let _ = write_fd(raw1, crate::ssh_adapter::TERM_CLEANUP);
-    let _ = write_fd(raw1, b"\x1b[?1049l");
+    let _ = write_all_fd(raw1, crate::ssh_adapter::TERM_CLEANUP);
+    let _ = write_all_fd(raw1, b"\x1b[?1049l");
     code
 }
 
@@ -444,7 +442,7 @@ async fn client_loop(
                                         if inst.new_num > st.last_recv_num {
                                             let bytes = decode_host_message(&inst.diff);
                                             if !bytes.is_empty() {
-                                                let _ = write_fd(raw1, &bytes);
+                                                let _ = write_all_fd(raw1, &bytes);
                                             }
                                             st.last_recv_num = inst.new_num;
                                             // Ack the freshly applied state.
@@ -581,62 +579,6 @@ async fn bootstrap_over_ssh(
     parse_mosh_connect(&String::from_utf8_lossy(&buf))
         .map(|c| (c.port, c.key))
         .ok_or_else(|| "mosh-server did not print MOSH CONNECT (is mosh installed on the remote?)".to_string())
-}
-
-fn write_fd(fd: RawFd, mut data: &[u8]) -> std::io::Result<()> {
-    while !data.is_empty() {
-        let n = unsafe { libc::write(fd, data.as_ptr().cast(), data.len()) };
-        if n <= 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        data = &data[n as usize..];
-    }
-    Ok(())
-}
-
-fn borrow_fd(context: &ExecutionContext<'_, DefaultShellExtensions>, n: i32) -> Option<OwnedFd> {
-    context.try_fd(n.into()).and_then(|f| {
-        f.try_borrow_as_fd()
-            .ok()
-            .and_then(|bfd| bfd.try_clone_to_owned().ok())
-    })
-}
-
-fn fail(
-    context: &ExecutionContext<'_, DefaultShellExtensions>,
-    msg: &str,
-    code: u8,
-) -> Result<ExecutionResult, brush_core::Error> {
-    let mut err = context.stderr();
-    let _ = std::io::Write::write_all(&mut err, msg.as_bytes());
-    let _ = std::io::Write::write_all(&mut err, b"\n");
-    Ok(ExecutionResult::new(code))
-}
-
-/// Restores O_NONBLOCK flags on drop (AsyncFd sets them on the shared fds).
-struct FdFlagsGuard {
-    saved: Vec<(RawFd, i32)>,
-}
-impl FdFlagsGuard {
-    fn capture(fds: &[RawFd]) -> Self {
-        let saved = fds
-            .iter()
-            .filter_map(|&fd| {
-                let f = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-                (f >= 0).then_some((fd, f))
-            })
-            .collect();
-        Self { saved }
-    }
-}
-impl Drop for FdFlagsGuard {
-    fn drop(&mut self) {
-        for &(fd, f) in &self.saved {
-            unsafe {
-                libc::fcntl(fd, libc::F_SETFL, f);
-            }
-        }
-    }
 }
 
 #[cfg(test)]
