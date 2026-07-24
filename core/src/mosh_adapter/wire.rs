@@ -289,6 +289,168 @@ pub fn parse_server_datagram(crypto: &Crypto, datagram: &[u8]) -> Option<(Opened
     Some((opened, inst))
 }
 
+// --- statesync payloads -----------------------------------------------------
+// Server→client diff is a HostBuffers.HostMessage; client→server diff is a
+// ClientBuffers.UserMessage. Both are `repeated Instruction instruction = 1`
+// where the inner Instruction carries proto2 extension fields:
+//   HostBuffers.Instruction: field 2 = HostBytes{ hoststring = 4 }
+//   ClientBuffers.Instruction: field 2 = Keystroke{ keys = 4 },
+//                              field 3 = ResizeMessage{ width=5, height=6 }
+
+/// Walks a message for top-level field 1 (length-delimited) submessages,
+/// calling `f` with each submessage's bytes.
+fn for_each_field1<'a>(buf: &'a [u8], mut f: impl FnMut(&'a [u8])) {
+    let mut pos = 0;
+    while pos < buf.len() {
+        let Some(key) = get_varint(buf, &mut pos) else { return };
+        let field = key >> 3;
+        let wire = key & 7;
+        match wire {
+            2 => {
+                let Some(len) = get_varint(buf, &mut pos) else { return };
+                let len = len as usize;
+                let Some(slice) = buf.get(pos..pos + len) else { return };
+                if field == 1 {
+                    f(slice);
+                }
+                pos += len;
+            }
+            0 => {
+                if get_varint(buf, &mut pos).is_none() {
+                    return;
+                }
+            }
+            5 => pos += 4,
+            1 => pos += 8,
+            _ => return,
+        }
+    }
+}
+
+/// Returns the length-delimited bytes of the first occurrence of `field` in a
+/// proto message (used to descend into a known nested/extension field).
+fn nested_field<'a>(buf: &'a [u8], field: u64) -> Option<&'a [u8]> {
+    let mut pos = 0;
+    while pos < buf.len() {
+        let key = get_varint(buf, &mut pos)?;
+        let f = key >> 3;
+        let wire = key & 7;
+        match wire {
+            2 => {
+                let len = get_varint(buf, &mut pos)? as usize;
+                let slice = buf.get(pos..pos + len)?;
+                if f == field {
+                    return Some(slice);
+                }
+                pos += len;
+            }
+            0 => {
+                get_varint(buf, &mut pos)?;
+            }
+            5 => pos += 4,
+            1 => pos += 8,
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Decodes a HostBuffers.HostMessage, returning the concatenated `hoststring`
+/// ANSI updates (the terminal bytes to feed downstream).
+pub fn decode_host_message(diff: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for_each_field1(diff, |instr| {
+        // instr is a HostBuffers.Instruction; extension 2 = HostBytes.
+        if let Some(hostbytes) = nested_field(instr, 2) {
+            // HostBytes.hoststring = field 4.
+            if let Some(s) = nested_field(hostbytes, 4) {
+                out.extend_from_slice(s);
+            }
+        }
+    });
+    out
+}
+
+/// A single user-input event in a UserStream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UserEvent {
+    Keys(Vec<u8>),
+    Resize(i32, i32),
+}
+
+fn push_submessage(field: u32, body: &[u8], out: &mut Vec<u8>) {
+    put_tag(field, 2, out);
+    put_varint(body.len() as u64, out);
+    out.extend_from_slice(body);
+}
+
+/// Encodes a ClientBuffers.UserMessage from a sequence of events (the SSP diff
+/// from the receiver's assumed state to ours).
+pub fn encode_user_message(events: &[UserEvent]) -> Vec<u8> {
+    let mut msg = Vec::new();
+    for ev in events {
+        // Build the inner ClientBuffers.Instruction with its extension field.
+        let mut instr = Vec::new();
+        match ev {
+            UserEvent::Keys(keys) => {
+                let mut keystroke = Vec::new();
+                push_submessage(4, keys, &mut keystroke); // Keystroke.keys = 4
+                push_submessage(2, &keystroke, &mut instr); // ext: keystroke = 2
+            }
+            UserEvent::Resize(w, h) => {
+                let mut resize = Vec::new();
+                put_tag(5, 0, &mut resize);
+                put_varint(*w as u64, &mut resize);
+                put_tag(6, 0, &mut resize);
+                put_varint(*h as u64, &mut resize);
+                push_submessage(3, &resize, &mut instr); // ext: resize = 3
+            }
+        }
+        push_submessage(1, &instr, &mut msg); // UserMessage.instruction = 1
+    }
+    msg
+}
+
+/// Encodes a ClientBuffers.UserMessage carrying a single Keystroke of `keys`.
+pub fn encode_user_keystroke(keys: &[u8]) -> Vec<u8> {
+    // Keystroke { keys = 4 }
+    let mut keystroke = Vec::new();
+    put_tag(4, 2, &mut keystroke);
+    put_varint(keys.len() as u64, &mut keystroke);
+    keystroke.extend_from_slice(keys);
+    // Instruction { [ext 2] = Keystroke }
+    let mut instr = Vec::new();
+    put_tag(2, 2, &mut instr);
+    put_varint(keystroke.len() as u64, &mut instr);
+    instr.extend_from_slice(&keystroke);
+    // UserMessage { instruction = 1 }
+    let mut msg = Vec::new();
+    put_tag(1, 2, &mut msg);
+    put_varint(instr.len() as u64, &mut msg);
+    msg.extend_from_slice(&instr);
+    msg
+}
+
+/// Encodes a ClientBuffers.UserMessage carrying a single resize event.
+pub fn encode_user_resize(width: i32, height: i32) -> Vec<u8> {
+    // ResizeMessage { width = 5, height = 6 }
+    let mut resize = Vec::new();
+    put_tag(5, 0, &mut resize);
+    put_varint(width as u64, &mut resize);
+    put_tag(6, 0, &mut resize);
+    put_varint(height as u64, &mut resize);
+    // Instruction { [ext 3] = ResizeMessage }
+    let mut instr = Vec::new();
+    put_tag(3, 2, &mut instr);
+    put_varint(resize.len() as u64, &mut instr);
+    instr.extend_from_slice(&resize);
+    let mut msg = Vec::new();
+    put_tag(1, 2, &mut msg);
+    put_varint(instr.len() as u64, &mut msg);
+    msg.extend_from_slice(&instr);
+    msg
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,6 +617,44 @@ mod tests {
         }
         assert!(got.is_some(), "no reply from mosh-server (crypto interop FAILED)");
         eprintln!("OCB3 interop with real mosh-server: OK");
+    }
+
+    #[test]
+    fn host_message_decode_concatenates_hoststrings() {
+        fn host_instr(s: &[u8]) -> Vec<u8> {
+            let mut hb = Vec::new();
+            put_tag(4, 2, &mut hb);
+            put_varint(s.len() as u64, &mut hb);
+            hb.extend_from_slice(s);
+            let mut instr = Vec::new();
+            put_tag(2, 2, &mut instr);
+            put_varint(hb.len() as u64, &mut instr);
+            instr.extend_from_slice(&hb);
+            instr
+        }
+        let mut msg = Vec::new();
+        for s in [b"AB".as_ref(), b"CD".as_ref()] {
+            let instr = host_instr(s);
+            put_tag(1, 2, &mut msg);
+            put_varint(instr.len() as u64, &mut msg);
+            msg.extend_from_slice(&instr);
+        }
+        assert_eq!(decode_host_message(&msg), b"ABCD");
+    }
+
+    #[test]
+    fn user_keystroke_encode_is_decodable() {
+        let msg = encode_user_keystroke(b"hi\x1b[A");
+        // field1 -> Instruction -> ext2 (Keystroke) -> field4 (keys)
+        let mut keys = Vec::new();
+        for_each_field1(&msg, |instr| {
+            if let Some(ks) = nested_field(instr, 2) {
+                if let Some(k) = nested_field(ks, 4) {
+                    keys.extend_from_slice(k);
+                }
+            }
+        });
+        assert_eq!(keys, b"hi\x1b[A");
     }
 
     #[test]

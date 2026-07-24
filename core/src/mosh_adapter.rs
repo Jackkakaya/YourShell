@@ -126,6 +126,421 @@ fn parse_opts(
     })
 }
 
+// ===========================================================================
+// Interactive client (Phases 3–5): SSP receive loop + terminal + user input.
+// ===========================================================================
+
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::time::{Duration, SystemTime};
+
+use base64::Engine;
+use brush_core::builtins::Registration;
+use brush_core::extensions::DefaultShellExtensions;
+use brush_core::{CommandArg, ExecutionContext, ExecutionResult};
+use futures::future::BoxFuture;
+use tokio::io::AsyncReadExt;
+use tokio::net::UdpSocket;
+use tokio_fd::AsyncFd;
+
+use wire::{build_client_datagram, decode_host_message, Crypto, Instruction, PROTOCOL_VERSION};
+
+pub fn registration() -> Registration<DefaultShellExtensions> {
+    Registration {
+        execute_func: exec_mosh,
+        content_func: |name, _, _| Ok(format!("{name}: mosh client (pure Rust, in-process)")),
+        disabled: false,
+        special_builtin: false,
+        declaration_builtin: false,
+    }
+}
+
+fn exec_mosh(
+    context: ExecutionContext<'_, DefaultShellExtensions>,
+    args: Vec<CommandArg>,
+) -> BoxFuture<'_, Result<ExecutionResult, brush_core::Error>> {
+    Box::pin(async move {
+        let argv: Vec<String> = args.iter().map(ToString::to_string).collect();
+        let getenv = |k: &str| -> Option<String> {
+            context
+                .shell
+                .env()
+                .get_str(k, context.shell)
+                .map(|c| c.into_owned())
+        };
+        let opts = match parse_opts(&argv, &getenv) {
+            Ok(o) => o,
+            Err(m) => return fail(&context, &m, 2),
+        };
+
+        let fd0 = borrow_fd(&context, 0);
+        let fd1 = borrow_fd(&context, 1);
+        let fd2 = borrow_fd(&context, 2);
+        let (Some(fd0), Some(fd1), Some(fd2)) = (fd0, fd1, fd2) else {
+            return fail(&context, "mosh: no terminal", 1);
+        };
+
+        let code = tokio::task::spawn_blocking(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(_) => return 255u8,
+            };
+            rt.block_on(run(opts, fd0, fd1, fd2))
+        })
+        .await
+        .unwrap_or(255);
+        Ok(ExecutionResult::new(code))
+    })
+}
+
+async fn run(opts: Opts, fd0: OwnedFd, fd1: OwnedFd, fd2: OwnedFd) -> u8 {
+    let raw2 = fd2.as_raw_fd();
+    macro_rules! eprint_fd {
+        ($($a:tt)*) => {{ let s = format!($($a)*); unsafe { libc::write(raw2, s.as_ptr().cast(), s.len()); } }};
+    }
+
+    // Resolve endpoint + key.
+    let (host, udp_port, key_b64) = match &opts.mode {
+        Mode::Direct { host, udp_port, key } => (host.clone(), *udp_port, key.clone()),
+        Mode::Bootstrap { user, host, ssh_port } => {
+            match bootstrap_over_ssh(user, host, *ssh_port, &opts).await {
+                Ok((port, key)) => (host.clone(), port, key),
+                Err(e) => {
+                    eprint_fd!("mosh: {e}\n");
+                    return 255;
+                }
+            }
+        }
+    };
+
+    let key_bytes = match base64::engine::general_purpose::STANDARD_NO_PAD.decode(key_b64.trim()) {
+        Ok(k) if k.len() == 16 => k,
+        _ => {
+            eprint_fd!("mosh: invalid MOSH key\n");
+            return 255;
+        }
+    };
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&key_bytes);
+    let crypto = Crypto::new(&key);
+
+    let sock = match UdpSocket::bind("0.0.0.0:0").await {
+        Ok(s) => s,
+        Err(e) => {
+            eprint_fd!("mosh: bind: {e}\n");
+            return 255;
+        }
+    };
+    if let Err(e) = sock.connect(format!("{host}:{udp_port}")).await {
+        eprint_fd!("mosh: connect {host}:{udp_port}: {e}\n");
+        return 255;
+    }
+
+    let raw0 = fd0.as_raw_fd();
+    let raw1 = fd1.as_raw_fd();
+    // Enter the alternate screen (flips Swift into raw key passthrough).
+    let _ = write_fd(raw1, b"\x1b[?1049h");
+    let restore = FdFlagsGuard::capture(&[raw0, raw1]);
+
+    let code = client_loop(&crypto, &sock, raw0, raw1, opts.cols, opts.rows).await;
+
+    drop(restore);
+    let _ = write_fd(raw1, b"\x1b[?1049l");
+    code
+}
+
+/// Client transport state. The client→server direction synchronizes a
+/// UserStream (an ordered list of `UserEvent`s); each state number maps to how
+/// many events existed at that point, so a diff to `old_num` is just the events
+/// after that state's count.
+struct ClientState {
+    seq: u64,     // outgoing datagram sequence
+    frag_id: u64, // outgoing fragment id
+    events: Vec<wire::UserEvent>,
+    input_num: u64,   // our latest user-state number
+    assumed_ack: u64, // highest input_num the server has acked
+    // (state number, event count at that state); starts at (0, 0).
+    states: Vec<(u64, usize)>,
+    last_recv_num: u64, // highest server state we've applied
+    last_recv_ts: u16,  // last server timestamp (for timestamp_reply)
+}
+
+impl ClientState {
+    fn new() -> Self {
+        Self {
+            seq: 0,
+            frag_id: 0,
+            events: Vec::new(),
+            input_num: 0,
+            assumed_ack: 0,
+            states: vec![(0, 0)],
+            last_recv_num: 0,
+            last_recv_ts: 0,
+        }
+    }
+
+    fn event_count_for(&self, num: u64) -> usize {
+        self.states
+            .iter()
+            .rev()
+            .find(|(n, _)| *n <= num)
+            .map_or(0, |(_, c)| *c)
+    }
+
+    /// Records a new event as a fresh state.
+    fn push_event(&mut self, ev: wire::UserEvent) {
+        self.events.push(ev);
+        self.input_num += 1;
+        self.states.push((self.input_num, self.events.len()));
+    }
+}
+
+fn now_ms() -> u16 {
+    (SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+        % 65536) as u16
+}
+
+/// Sends the current client state as one datagram (diff = the UserStream events
+/// after the server's assumed state).
+async fn send_state(crypto: &Crypto, sock: &UdpSocket, st: &mut ClientState) {
+    let old_count = st.event_count_for(st.assumed_ack);
+    let new_events = &st.events[old_count..];
+    let diff = if new_events.is_empty() {
+        Vec::new()
+    } else {
+        wire::encode_user_message(new_events)
+    };
+    let inst = Instruction {
+        protocol_version: PROTOCOL_VERSION,
+        old_num: st.assumed_ack,
+        new_num: st.input_num,
+        ack_num: st.last_recv_num,
+        throwaway_num: 0,
+        diff,
+        chaff: Vec::new(),
+    };
+    st.seq += 1;
+    st.frag_id += 1;
+    let dg = build_client_datagram(crypto, st.seq, now_ms(), st.last_recv_ts, st.frag_id, &inst);
+    let _ = sock.send(&dg).await;
+}
+
+async fn client_loop(
+    crypto: &Crypto,
+    sock: &UdpSocket,
+    raw0: RawFd,
+    raw1: RawFd,
+    cols: u16,
+    rows: u16,
+) -> u8 {
+    let mut stdin = match AsyncFd::try_from(raw0) {
+        Ok(s) => s,
+        Err(_) => return 255,
+    };
+    let mut st = ClientState::new();
+
+    // Announce ourselves, then send the initial window size as the first event.
+    send_state(crypto, sock, &mut st).await;
+    st.push_event(wire::UserEvent::Resize(cols as i32, rows as i32));
+    send_state(crypto, sock, &mut st).await;
+
+    // Debug: bound the session length so headless tests can flush the transcript.
+    let max_ticks = std::env::var("MOSH_MAX_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .map(|s| s * 10);
+
+    let mut kbuf = [0u8; 4096];
+    let mut dbuf = [0u8; 2048];
+    let mut tick = tokio::time::interval(Duration::from_millis(100));
+    let mut total_ticks = 0u32;
+    let mut silent_ticks = 0u32;
+    let mut escape_armed = false; // Ctrl-^ then '.' quits
+
+    loop {
+        tokio::select! {
+            r = stdin.read(&mut kbuf) => {
+                match r {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        // mosh escape: Ctrl-^ (0x1e) then '.' to quit.
+                        for &b in &kbuf[..n] {
+                            if escape_armed {
+                                escape_armed = false;
+                                if b == b'.' { return 0; }
+                            } else if b == 0x1e {
+                                escape_armed = true;
+                                continue;
+                            }
+                        }
+                        st.push_event(wire::UserEvent::Keys(kbuf[..n].to_vec()));
+                        send_state(crypto, sock, &mut st).await;
+                    }
+                }
+            }
+            r = sock.recv(&mut dbuf) => {
+                silent_ticks = 0;
+                if let Ok(n) = r {
+                    if let Some((opened, inst)) = wire::parse_server_datagram(crypto, &dbuf[..n]) {
+                        st.last_recv_ts = opened.timestamp;
+                        if inst.ack_num > st.assumed_ack { st.assumed_ack = inst.ack_num; }
+                        if inst.new_num > st.last_recv_num {
+                            let bytes = decode_host_message(&inst.diff);
+                            if !bytes.is_empty() {
+                                let _ = write_fd(raw1, &bytes);
+                            }
+                            st.last_recv_num = inst.new_num;
+                            // Ack the freshly applied state.
+                            send_state(crypto, sock, &mut st).await;
+                        }
+                    }
+                }
+            }
+            _ = tick.tick() => {
+                total_ticks += 1;
+                silent_ticks += 1;
+                // Retransmit unacked input every ~200ms.
+                if st.input_num > st.assumed_ack && silent_ticks % 2 == 0 {
+                    send_state(crypto, sock, &mut st).await;
+                }
+                // Heartbeat/ack every ~2s of quiet.
+                if silent_ticks % 20 == 0 {
+                    send_state(crypto, sock, &mut st).await;
+                }
+                // Give up after ~15s with no server packet.
+                if silent_ticks > 150 {
+                    return 255;
+                }
+                if let Some(max) = max_ticks {
+                    if total_ticks >= max {
+                        return 0;
+                    }
+                }
+            }
+        }
+    }
+    0
+}
+
+/// Bootstrap: ssh to the host, run `mosh-server new`, parse MOSH CONNECT.
+async fn bootstrap_over_ssh(
+    user: &str,
+    host: &str,
+    ssh_port: u16,
+    opts: &Opts,
+) -> Result<(u16, String), String> {
+    use crate::ssh_adapter::{connect_session, key_and_env_auth, HostKeyOutcome};
+    use tokio::io::AsyncReadExt as _;
+
+    let (res, hostkey) = connect_session(host, ssh_port, &opts.home).await;
+    let mut session = res.map_err(|e| {
+        if hostkey == HostKeyOutcome::Changed {
+            format!("host key changed for {host} — refusing (see ssh)")
+        } else {
+            format!("ssh connect {host}:{ssh_port}: {e}")
+        }
+    })?;
+    let password_env = std::env::var("SSH_PASSWORD").ok();
+    if !key_and_env_auth(
+        &mut session,
+        user,
+        &opts.home,
+        opts.identity.as_deref(),
+        password_env.as_deref(),
+    )
+    .await
+    {
+        return Err(format!("ssh auth failed for {user}@{host}"));
+    }
+    let mut channel = session
+        .channel_open_session()
+        .await
+        .map_err(|e| format!("open channel: {e}"))?;
+    let cmd = mosh_server_command("en_US.UTF-8");
+    channel
+        .exec(true, cmd.as_str())
+        .await
+        .map_err(|e| format!("exec mosh-server: {e}"))?;
+
+    // Collect stdout until we see the MOSH CONNECT line.
+    let mut stream = channel.into_stream();
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        match tokio::time::timeout(Duration::from_secs(10), stream.read(&mut chunk)).await {
+            Ok(Ok(0)) | Err(_) => break,
+            Ok(Ok(n)) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(c) = parse_mosh_connect(&String::from_utf8_lossy(&buf)) {
+                    return Ok((c.port, c.key));
+                }
+            }
+            Ok(Err(_)) => break,
+        }
+    }
+    parse_mosh_connect(&String::from_utf8_lossy(&buf))
+        .map(|c| (c.port, c.key))
+        .ok_or_else(|| "mosh-server did not print MOSH CONNECT (is mosh installed on the remote?)".to_string())
+}
+
+fn write_fd(fd: RawFd, mut data: &[u8]) -> std::io::Result<()> {
+    while !data.is_empty() {
+        let n = unsafe { libc::write(fd, data.as_ptr().cast(), data.len()) };
+        if n <= 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        data = &data[n as usize..];
+    }
+    Ok(())
+}
+
+fn borrow_fd(context: &ExecutionContext<'_, DefaultShellExtensions>, n: i32) -> Option<OwnedFd> {
+    context.try_fd(n.into()).and_then(|f| {
+        f.try_borrow_as_fd()
+            .ok()
+            .and_then(|bfd| bfd.try_clone_to_owned().ok())
+    })
+}
+
+fn fail(
+    context: &ExecutionContext<'_, DefaultShellExtensions>,
+    msg: &str,
+    code: u8,
+) -> Result<ExecutionResult, brush_core::Error> {
+    let mut err = context.stderr();
+    let _ = std::io::Write::write_all(&mut err, msg.as_bytes());
+    let _ = std::io::Write::write_all(&mut err, b"\n");
+    Ok(ExecutionResult::new(code))
+}
+
+/// Restores O_NONBLOCK flags on drop (AsyncFd sets them on the shared fds).
+struct FdFlagsGuard {
+    saved: Vec<(RawFd, i32)>,
+}
+impl FdFlagsGuard {
+    fn capture(fds: &[RawFd]) -> Self {
+        let saved = fds
+            .iter()
+            .filter_map(|&fd| {
+                let f = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+                (f >= 0).then_some((fd, f))
+            })
+            .collect();
+        Self { saved }
+    }
+}
+impl Drop for FdFlagsGuard {
+    fn drop(&mut self) {
+        for &(fd, f) in &self.saved {
+            unsafe {
+                libc::fcntl(fd, libc::F_SETFL, f);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

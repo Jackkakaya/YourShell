@@ -11,9 +11,6 @@ mod builtins_extra;
 mod commands_ext;
 mod editor;
 mod git_adapter;
-// Phase 1 of the mosh client (bootstrap parsing); builtin not registered until
-// the transport is implemented.
-#[allow(dead_code)]
 mod mosh_adapter;
 mod sftp_adapter;
 mod ssh_adapter;
@@ -93,6 +90,7 @@ pub(crate) async fn build_shell(
         .builtin("ssh", ssh_adapter::registration())
         .builtin("scp", sftp_adapter::registration_scp())
         .builtin("sftp", sftp_adapter::registration_sftp())
+        .builtin("mosh", mosh_adapter::registration())
         .builtin("edit", core_builtins::builtin::<editor::EditorCommand, DefaultShellExtensions>())
         .builtin("vi", core_builtins::builtin::<editor::EditorCommand, DefaultShellExtensions>())
         .builtin("nano", core_builtins::builtin::<editor::EditorCommand, DefaultShellExtensions>());
