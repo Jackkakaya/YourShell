@@ -32,9 +32,25 @@ fn npx_cli() -> Option<PathBuf> {
     std::env::var_os("YS_NODE_NPX_CLI").map(PathBuf::from)
 }
 
-/// Reads the resident instance's port (written by main.js). Retries briefly in
-/// case the very first node command races Node's startup.
+unsafe extern "C" {
+    /// Provided by node_host.c: starts the resident Node instance (idempotent).
+    fn ys_node_start_resident(main_js_path: *const std::ffi::c_char);
+}
+
+/// Ensures the resident Node instance is starting. Idempotent on the C side,
+/// so calling it on every node command is fine — only the first one launches.
+fn ensure_node_started() {
+    if let Some(main_js) = std::env::var_os("YS_NODE_MAIN_JS") {
+        if let Ok(c) = std::ffi::CString::new(main_js.to_string_lossy().into_owned()) {
+            unsafe { ys_node_start_resident(c.as_ptr()) };
+        }
+    }
+}
+
+/// Reads the resident instance's port (written by main.js). Retries while Node
+/// starts up (the first command triggers a lazy launch that takes ~1-2s).
 fn resident_port() -> Option<u16> {
+    ensure_node_started();
     let file = std::env::var_os("YS_NODE_PORT_FILE")?;
     for _ in 0..100 {
         if let Ok(s) = std::fs::read_to_string(&file) {

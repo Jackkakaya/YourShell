@@ -69,37 +69,28 @@ fn exec_python(
             .map(|(k, v)| (k.clone(), v.value().to_cow_str(context.shell).into_owned()))
             .collect();
 
-        // Piped/redirected stdin is pre-drained without the lock, mirroring
-        // the uutils adapter's pipeline-deadlock avoidance.
-        let session_stdin_fd: Option<i32> = context
-            .shell
-            .open_files()
-            .try_fd(0.into())
-            .and_then(|f| f.try_borrow_as_fd().ok().map(|b| b.as_raw_fd()));
-        let stdin_is_interactive = match (&fds[0], session_stdin_fd) {
-            (Some(fd0), Some(base)) => {
-                fd0.as_raw_fd() == base
-                    || crate::uutils_adapter::raw_fd_same_file(fd0.as_raw_fd(), base)
-            }
-            (None, _) => true,
-            _ => false,
-        };
+        // Authoritative interactive check: stdin is interactive only when it
+        // was NOT explicitly specified for this command (no pipe/redirect) —
+        // it's inherited from the session. Non-blocking peeks race with
+        // pipeline writers and dev/ino comparison is unreliable for pipes.
+        let stdin_redirected = context.params.is_fd_specified(0.into());
 
         let code = tokio::task::spawn_blocking(move || {
             let mut fds = fds;
             let mut exported = exported;
-            let stdin_buf: Option<Vec<u8>> = if stdin_is_interactive {
-                // Tell the python driver stdin is a live terminal stream so a
-                // bare `python3` starts a REPL instead of draining stdin.
-                exported.push(("YS_STDIN_TTY".to_string(), "1".to_string()));
-                None
-            } else {
+            let stdin_buf: Option<Vec<u8>> = if stdin_redirected {
+                // Piped/redirected: drain fully and run as a script.
                 fds[0].take().map(|fd| {
                     let mut f = std::fs::File::from(fd);
                     let mut buf = Vec::new();
                     let _ = f.read_to_end(&mut buf);
                     buf
                 })
+            } else {
+                // Inherited session stdin: a live terminal -> REPL for bare
+                // `python3` (the driver reads fd 0 directly).
+                exported.push(("YS_STDIN_TTY".to_string(), "1".to_string()));
+                None
             };
             run_locked(argv, fds, stdin_buf, &cwd, &exported)
         })
@@ -138,6 +129,18 @@ fn run_locked(
         })
         .collect();
 
+    // The persistent interpreter froze os.environ at init, so setenv above is
+    // invisible to it. Hand the exported env to the driver via a JSON file it
+    // reads each command (path fixed at startup, captured in os.environ).
+    if let Some(env_file) = std::env::var_os("YS_PY_ENV_FILE") {
+        let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n");
+        let entries: Vec<String> = exported
+            .iter()
+            .map(|(k, v)| format!("\"{}\":\"{}\"", esc(k), esc(v)))
+            .collect();
+        let _ = std::fs::write(&env_file, format!("{{{}}}", entries.join(",")));
+    }
+
     let mut saved_fds: Vec<(i32, i32)> = Vec::new();
     for (target, fd) in fds.iter().enumerate() {
         if let Some(fd) = fd {
@@ -150,16 +153,30 @@ fn run_locked(
         }
     }
 
-    let cstrings: Vec<CString> = argv
-        .iter()
-        .map(|s| CString::new(s.as_str()).unwrap_or_default())
-        .collect();
-    let ptrs: Vec<*const c_char> = cstrings.iter().map(|c| c.as_ptr()).collect();
-
-    let code = catch_unwind(AssertUnwindSafe(|| unsafe {
-        ys_python_run(ptrs.len() as c_int, ptrs.as_ptr())
-    }))
-    .unwrap_or(134);
+    // Run CPython on a dedicated 16 MiB thread. tokio's blocking-pool threads
+    // have a 2 MiB stack, which overflows on deep recursive deallocation of
+    // nested object graphs (subtype_dealloc -> tuple_dealloc -> ...), crashing
+    // with a bus error in the GC. Desktop Python runs on the 8 MiB main thread;
+    // we match that headroom. fds/cwd/env are already redirected on this
+    // (locked) thread and are process-global, so the child inherits them.
+    let argv_owned = argv;
+    let code = std::thread::Builder::new()
+        .name("yourshell-python".to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            let cstrings: Vec<CString> = argv_owned
+                .iter()
+                .map(|s| CString::new(s.as_str()).unwrap_or_default())
+                .collect();
+            let ptrs: Vec<*const c_char> = cstrings.iter().map(|c| c.as_ptr()).collect();
+            catch_unwind(AssertUnwindSafe(|| unsafe {
+                ys_python_run(ptrs.len() as c_int, ptrs.as_ptr())
+            }))
+            .unwrap_or(134)
+        })
+        .ok()
+        .and_then(|h| h.join().ok())
+        .unwrap_or(134);
 
     for (target, saved) in saved_fds {
         unsafe {

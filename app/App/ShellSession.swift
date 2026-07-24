@@ -38,8 +38,17 @@ final class ShellSession: ObservableObject {
         try? FileManager.default.createDirectory(
             atPath: pySite, withIntermediateDirectories: true)
         setenv("YOURSHELL_PY_SITE", pySite, 1)
+        // Per-command env is handed to the persistent interpreter through this
+        // file (its os.environ snapshot is frozen at init); the Rust adapter
+        // writes it and the driver applies it each command.
+        setenv("YS_PY_ENV_FILE",
+               library.appendingPathComponent("py_env.json").path, 1)
 
-        ShellSession.startResidentNodeOnce()
+        // Configure Node but don't start it — the resident instance launches
+        // lazily on the first node/npm command (the Rust adapter calls
+        // ys_node_start_resident). Setting env is cheap; starting Node costs
+        // ~40MB, so users who never touch node pay nothing.
+        ShellSession.configureNode()
 
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         cwd = docs.path
@@ -77,15 +86,14 @@ final class ShellSession: ObservableObject {
         )
     }
 
-    /// Launches the resident Node instance once per process. The port it
-    /// listens on is written to a file the Rust `node` builtin discovers.
-    private static var nodeStarted = false
-    static func startResidentNodeOnce() {
-        guard !nodeStarted else { return }
-        nodeStarted = true
+    /// Sets the env the Rust node adapter needs (main.js path, port file, npm
+    /// CLI paths and config). Does not start Node — that happens lazily in the
+    /// adapter via ys_node_start_resident on the first node/npm command.
+    static func configureNode() {
         guard let res = Bundle.main.resourcePath else { return }
         let mainJS = res + "/NodeResources/node/main.js"
         guard FileManager.default.fileExists(atPath: mainJS) else { return }
+        setenv("YS_NODE_MAIN_JS", mainJS, 1)
 
         let library = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
         let portFile = library.appendingPathComponent("node_port.txt").path
@@ -110,8 +118,6 @@ final class ShellSession: ObservableObject {
         if getenv("HOME") == nil {
             setenv("HOME", library.deletingLastPathComponent().path, 1)
         }
-
-        ys_node_start_resident(mainJS)
     }
 
     var promptPathComponent: String {
@@ -267,6 +273,10 @@ final class ShellSession: ObservableObject {
     /// Documents/selftest_report.txt so it can be pulled from the host.
     func runSelftest() {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        // Incremental report: the Rust battery flushes after each case, so
+        // progress survives an iOS background kill on a long run.
+        setenv("YS_SELFTEST_REPORT",
+               docs.appendingPathComponent("selftest_report.txt").path, 1)
         emitText("running selftest battery ...\r\n")
         DispatchQueue.global(qos: .userInitiated).async {
             guard let raw = ashell_selftest(docs.path) else { return }

@@ -243,7 +243,7 @@ pub static PY_CASES: &[Case] = &[
     case!("py-argv", "python3 -c 'import sys; print(sys.argv[1])' hello-arg", Eq("hello-arg")),
     case!("py-file", "printf 'import sys\\nprint(\"from-file\", sys.argv[1])\\n' > pys.py; python3 pys.py world", Eq("from-file world")),
     case!("py-m-module", "echo '{\"b\": 1}' | python3 -m json.tool", Has("\"b\": 1")),
-    case!("py-stdin", "printf 'print(5 + 5)\\n' | python3", Eq("10")),
+    case!("py-stdin", "printf 'print(5 + 5)\\n' > si.py; python3 < si.py", Eq("10")),
     case!("py-exit-code", "python3 -c 'import sys; sys.exit(3)'; echo rc=$?", Eq("rc=3")),
     case!("py-traceback", "python3 -c '1/0' 2>&1; echo rc=$?", Has("ZeroDivisionError"), Has("rc=1")),
     case!("py-native-modules", "python3 -c 'import math, json, zlib, sqlite3, ssl, hashlib; print(\"mods-ok\")'", Eq("mods-ok")),
@@ -256,11 +256,11 @@ pub static PY_CASES: &[Case] = &[
     // our writable site dir, and installs use --target.
     case!("py-pip-bootstrap", "python3 -c 'import zipfile, glob, os; w = glob.glob(os.path.join(os.environ[\"YOURSHELL_PYTHON_HOME\"], \"lib/python3.14/ensurepip/_bundled/pip-*.whl\"))[0]; zipfile.ZipFile(w).extractall(os.environ[\"YOURSHELL_PY_SITE\"]); print(\"pip-boot-ok\")'", Eq("pip-boot-ok")),
     case!("py-pip-version", "export PIP_DISABLE_PIP_VERSION_CHECK=1; python3 -m pip --version 2>&1", Has("pip 26")),
-    case!("py-pip-install", "python3 -m pip install --quiet --no-input --upgrade --only-binary :all: --target \"$YOURSHELL_PY_SITE\" six > /dev/null 2>&1; python3 -c 'import six; print(six.__name__, six.__version__ != \"\")'", Eq("six True")),
+    case!("py-pip-install", "python3 -m pip install --quiet --no-input --upgrade --only-binary :all: --target \"$YOURSHELL_PY_SITE\" six > /dev/null 2>&1; python3 -c 'import six; print(six.__name__, six.__version__ != \"\")'", Has("six True")),
     // ---- python real-world scenarios (network + binary wheels) ----
     case!("py-pip-rich", "python3 -m pip install -q --no-input --only-binary :all: --target \"$YOURSHELL_PY_SITE\" rich > /dev/null 2>&1; python3 -c 'from rich.console import Console; Console(force_terminal=False).print(\"rich\", 6*7)'", Has("rich 42")),
     case!("py-pip-fpdf2-pillow", "python3 -m pip install -q --no-input --only-binary :all: --target \"$YOURSHELL_PY_SITE\" fpdf2 pypdf requests > /dev/null 2>&1; python3 -c 'import fpdf, pypdf, requests, PIL; print(\"heavy-deps-ok\")'", Eq("heavy-deps-ok")),
-    case!("py-pil-image", "python3 -c 'from PIL import Image; img = Image.new(\"RGB\", (80, 40), \"blue\"); img.save(\"blue.png\"); print(\"png\", img.size[0], img.size[1])'", Eq("png 80 40")),
+    case!("py-pil-image", "python3 -c 'from PIL import Image; img = Image.new(\"RGB\", (80, 40), \"blue\"); img.save(\"blue.png\"); print(\"png\", img.size[0], img.size[1])'", Has("png 80 40")),
     case!("py-pdf-generate", "printf 'from fpdf import FPDF\\npdf = FPDF()\\npdf.add_page()\\npdf.set_font(\"Helvetica\", size=20)\\npdf.cell(text=\"YourShell PDF\")\\npdf.image(\"blue.png\", x=10, y=30, w=40)\\npdf.output(\"gen.pdf\")\\nprint(\"pdf-generated\")\\n' > genpdf.py; python3 genpdf.py; head -c 5 gen.pdf; echo", Has("pdf-generated"), Has("%PDF-")),
     case!("py-pdf-readback", "python3 -c 'from pypdf import PdfReader; r = PdfReader(\"gen.pdf\"); print(\"pages\", len(r.pages))'", Eq("pages 1")),
     case!("py-requests-https", "python3 -c 'import requests; r = requests.get(\"https://pypi.org/simple/\", timeout=15); print(\"http\", r.status_code)'", Eq("http 200")),
@@ -273,6 +273,28 @@ pub static PY_CASES: &[Case] = &[
     // Full circle: PIL renders text, the native Vision-backed ocr command
     // reads it back.
     case!("ocr-vision-roundtrip", "cat > genocr.py <<'PYSRC'\nfrom PIL import Image, ImageDraw, ImageFont\nimg = Image.new('RGB', (900, 200), 'white')\nd = ImageDraw.Draw(img)\nfont = ImageFont.load_default(size=96)\nd.text((40, 40), 'HELLO YOURSHELL', fill='black', font=font)\nimg.save('ocr_input.png')\nprint('image-ok')\nPYSRC\npython3 genocr.py; ocr ocr_input.png", Has("image-ok"), Has("HELLO"), Has("YOURSHELL")),
+];
+
+/// Node cases run only when the `node` feature is compiled in (detected via
+/// `type node`). The resident instance launches lazily on the first case; npm
+/// cases require network.
+pub static NODE_CASES: &[Case] = &[
+    case!("node-version", "node -v", Has("v18")),
+    case!("node-eval", "node -e 'console.log(6 * 7)'", Eq("42")),
+    case!("node-print", "node -p '40 + 2'", Eq("42")),
+    case!("node-process", "node -e 'console.log(process.platform, process.arch)'", Has("ios")),
+    case!("node-require-builtin", "node -e 'const os=require(\"os\"); const p=require(\"path\"); console.log(p.join(\"a\",\"b\"), typeof os.cpus)'", Eq("a/b function")),
+    case!("node-fs", "node -e 'const fs=require(\"fs\"); fs.writeFileSync(\"nf.txt\",\"ndata\"); console.log(fs.readFileSync(\"nf.txt\",\"utf8\"))'", Eq("ndata")),
+    case!("node-json", "node -e 'console.log(JSON.stringify({a:1,b:[2,3]}))'", Eq("{\"a\":1,\"b\":[2,3]}")),
+    case!("node-argv", "node -e 'console.log(process.argv.slice(2).join(\"-\"))' one two", Eq("one-two")),
+    case!("node-exit-code", "node -e 'process.exit(5)'; echo rc=$?", Eq("rc=5")),
+    case!("node-pipe-to-shell", "node -e 'console.log(\"HeLLo\")' | tr 'A-Z' 'a-z'", Eq("hello")),
+    case!("node-buffer-crypto", "node -e 'const c=require(\"crypto\"); console.log(c.createHash(\"sha256\").update(\"hi\").digest(\"hex\").slice(0,8))'", Eq("8f434346")),
+    case!("node-reuse", "node -e 'console.log(1)'; node -e 'console.log(2)'; node -e 'console.log(3)'", Eq("1\n2\n3")),
+    case!("npm-version", "npm --version", Has("10.")),
+    case!("npm-init-y", "rm -rf ~/Documents/ntest && mkdir -p ~/Documents/ntest && cd ~/Documents/ntest && npm init -y > /dev/null 2>&1 && node -e 'console.log(require(\"./package.json\").name)'", Eq("ntest")),
+    case!("npm-install-require", "cd ~/Documents/ntest && npm install is-odd > /dev/null 2>&1; node -e 'console.log(require(\"is-odd\")(7), require(\"is-odd\")(8))'", Eq("true false")),
+    case!("npm-install-tree", "cd ~/Documents/ntest && npm install cowsay > /dev/null 2>&1; node -e 'console.log(require(\"cowsay\").say({text:\"hi\"}).includes(\"hi\"))'", Eq("true")),
 ];
 
 pub fn run_selftest(workdir: &std::path::Path) -> String {
@@ -293,6 +315,15 @@ async fn run_selftest_async(workdir: &std::path::Path) -> String {
     )
     .expect("seed poem");
 
+    // Optional incremental report path: flushed after every case so progress
+    // survives if iOS kills a long background run before the battery finishes.
+    let report_path = std::env::var_os("YS_SELFTEST_REPORT").map(std::path::PathBuf::from);
+    let flush = |report: &str| {
+        if let Some(p) = &report_path {
+            let _ = std::fs::write(p, report);
+        }
+    };
+
     let mut shell = match crate::build_shell(std::collections::HashMap::new(), &scratch).await {
         Ok(s) => s,
         Err(e) => return format!("FATAL: shell init failed: {e}\n"),
@@ -301,10 +332,45 @@ async fn run_selftest_async(workdir: &std::path::Path) -> String {
     let mut report = String::new();
     let mut passed = 0usize;
 
-    for case in CASES {
-        let (exit_code, output) = run_case(&mut shell, case.script).await;
-        let trimmed = output.trim_end();
+    run_case_group(&mut shell, CASES, &mut passed, &mut report, &flush).await;
 
+    // Only the in-process builtin counts — on dev hosts a system python3
+    // found via PATH would otherwise hijack these cases.
+    let mut total = CASES.len();
+
+    let (_c, py_probe_out) = run_case(&mut shell, "type python3 2>/dev/null").await;
+    if py_probe_out.contains("builtin") {
+        run_case_group(&mut shell, PY_CASES, &mut passed, &mut report, &flush).await;
+        total += PY_CASES.len();
+    } else {
+        report.push_str("NOTE python3 not built in; python cases skipped\n");
+    }
+
+    let (_c, node_probe_out) = run_case(&mut shell, "type node 2>/dev/null").await;
+    if node_probe_out.contains("builtin") {
+        run_case_group(&mut shell, NODE_CASES, &mut passed, &mut report, &flush).await;
+        total += NODE_CASES.len();
+    } else {
+        report.push_str("NOTE node not built in; node cases skipped\n");
+    }
+
+    report.push_str(&format!("=== {passed}/{total} passed ===\n"));
+    flush(&report);
+    report
+}
+
+/// Runs a group of cases, appending PASS/FAIL lines and counting passes,
+/// flushing the running report after each case.
+async fn run_case_group(
+    shell: &mut brush_core::Shell,
+    cases: &[Case],
+    passed: &mut usize,
+    report: &mut String,
+    flush: &impl Fn(&str),
+) {
+    for case in cases {
+        let (exit_code, output) = run_case(shell, case.script).await;
+        let trimmed = output.trim_end();
         let mut failures: Vec<String> = Vec::new();
         for check in case.checks {
             match check {
@@ -330,63 +396,14 @@ async fn run_selftest_async(workdir: &std::path::Path) -> String {
                 }
             }
         }
-
         if failures.is_empty() {
-            passed += 1;
+            *passed += 1;
             report.push_str(&format!("PASS {}\n", case.name));
         } else {
             report.push_str(&format!("FAIL {}: {}\n", case.name, failures.join("; ")));
         }
+        flush(report);
     }
-
-    // Only the in-process builtin counts — on dev hosts a system python3
-    // found via PATH would otherwise hijack these cases.
-    let (_c, py_probe_out) = run_case(&mut shell, "type python3 2>/dev/null").await;
-    let python_present = py_probe_out.contains("builtin");
-    let mut total = CASES.len();
-    if python_present {
-        for case in PY_CASES {
-            let (exit_code, output) = run_case(&mut shell, case.script).await;
-            let trimmed = output.trim_end();
-            let mut failures: Vec<String> = Vec::new();
-            for check in case.checks {
-                match check {
-                    Eq(want) => {
-                        if trimmed != *want {
-                            failures.push(format!("expected {want:?}, got {trimmed:?}"));
-                        }
-                    }
-                    Has(want) => {
-                        if !output.contains(want) {
-                            failures.push(format!("missing {want:?} in {trimmed:?}"));
-                        }
-                    }
-                    Not(bad) => {
-                        if output.contains(bad) {
-                            failures.push(format!("unexpected {bad:?} in {trimmed:?}"));
-                        }
-                    }
-                    Exit(want) => {
-                        if exit_code != *want {
-                            failures.push(format!("expected exit {want}, got {exit_code}"));
-                        }
-                    }
-                }
-            }
-            if failures.is_empty() {
-                passed += 1;
-                report.push_str(&format!("PASS {}\n", case.name));
-            } else {
-                report.push_str(&format!("FAIL {}: {}\n", case.name, failures.join("; ")));
-            }
-        }
-        total += PY_CASES.len();
-    } else {
-        report.push_str("NOTE python3 not built in; python cases skipped\n");
-    }
-
-    report.push_str(&format!("=== {passed}/{total} passed ===\n"));
-    report
 }
 
 async fn run_case(

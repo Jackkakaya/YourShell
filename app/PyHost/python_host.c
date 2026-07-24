@@ -17,7 +17,6 @@
 #include <stdlib.h>
 
 static int ys_py_initialized = 0;
-static PyThreadState *ys_main_tstate = NULL;
 static pthread_mutex_t ys_py_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // Command driver: parses the python CLI subset we support and dispatches,
@@ -25,6 +24,29 @@ static pthread_mutex_t ys_py_mutex = PTHREAD_MUTEX_INITIALIZER;
 static const char *YS_DRIVER =
     "import sys\n"
     "import os as _ys_os\n"
+    "import io as _ys_io\n"
+    // The persistent interpreter caches sys.std* file objects at init, but the
+    // Rust adapter dup2s fresh session fds onto 0/1/2 for each command. Rebind
+    // the streams to the current fds every command (closefd=False so we never
+    // close the session's fd). Without this, once the first command's fd
+    // closes, every later command sees 'I/O operation on closed file'.
+    "try:\n"
+    "    sys.stdin = _ys_io.TextIOWrapper(_ys_io.FileIO(0, 'r', closefd=False), encoding='utf-8')\n"
+    "    sys.stdout = _ys_io.TextIOWrapper(_ys_io.FileIO(1, 'w', closefd=False), encoding='utf-8', write_through=True)\n"
+    "    sys.stderr = _ys_io.TextIOWrapper(_ys_io.FileIO(2, 'w', closefd=False), encoding='utf-8', write_through=True)\n"
+    "except Exception:\n"
+    "    pass\n"
+    // Apply the per-command exported env the Rust adapter wrote (os.environ is
+    // frozen at init for the persistent interpreter).
+    "_ys_ef = _ys_os.environ.get('YS_PY_ENV_FILE')\n"
+    "if _ys_ef:\n"
+    "    try:\n"
+    "        import json as _ys_json\n"
+    "        with open(_ys_ef) as _f:\n"
+    "            for _k, _v in _ys_json.load(_f).items():\n"
+    "                _ys_os.environ[_k] = _v\n"
+    "    except Exception:\n"
+    "        pass\n"
     "_ys_site = _ys_os.environ.get('YOURSHELL_PY_SITE')\n"
     "if _ys_site:\n"
     "    _ys_os.makedirs(_ys_site, exist_ok=True)\n"
@@ -119,7 +141,8 @@ static int ys_python_ensure_init(void) {
         return -1;
     }
 
-    ys_main_tstate = PyEval_SaveThread();
+    // Release the GIL and let PyGILState manage per-thread states from here.
+    PyEval_SaveThread();
     ys_py_initialized = 1;
     return 0;
 }
@@ -131,12 +154,17 @@ int ys_python_run(int argc, const char **argv) {
         return 125;
     }
 
-    // Execute in the persistent main interpreter. Per-command isolation
-    // comes from the driver running user code in a fresh __main__-style
-    // globals dict; module state (sys.modules) deliberately persists, since
-    // major C extensions (lxml, numpy) refuse to load into more than one
-    // interpreter per process. Same semantics as a-Shell / Jupyter kernels.
-    PyEval_RestoreThread(ys_main_tstate);
+    // Commands arrive on arbitrary threads (tokio's blocking pool), so acquire
+    // the GIL with PyGILState_Ensure, which creates/uses a thread state bound
+    // to THIS OS thread. Reusing one saved PyThreadState across different
+    // threads is undefined and corrupts the GC (bus error in dealloc).
+    //
+    // Execute in the persistent main interpreter: per-command isolation comes
+    // from the driver running user code in a fresh __main__-style globals dict,
+    // while module state (sys.modules) deliberately persists — major C
+    // extensions (lxml, numpy) refuse to load into more than one interpreter
+    // per process. Same model as a-Shell / Jupyter kernels.
+    PyGILState_STATE gil = PyGILState_Ensure();
 
     int exit_code = 125;
     PyObject *py_argv = PyList_New(argc);
@@ -155,7 +183,7 @@ int ys_python_run(int argc, const char **argv) {
         exit_code = (int)PyLong_AsLong(code_obj);
     }
 
-    ys_main_tstate = PyEval_SaveThread();
+    PyGILState_Release(gil);
 
     pthread_mutex_unlock(&ys_py_mutex);
     return exit_code;
