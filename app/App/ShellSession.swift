@@ -73,6 +73,10 @@ final class ShellSession: ObservableObject {
                     if !newCwd.isEmpty { session.cwd = newCwd }
                     if exitCode != 0 { session.emitText("[exit \(exitCode)]\r\n") }
                     session.busy = false
+                    // Safety net: a full-screen program (editor/ssh/mosh) that
+                    // exited without emitting ESC[?1049l must not leave the next
+                    // command stuck in raw passthrough with no line editing.
+                    session.rawMode = false
                     session.printPrompt()
                     if session.mirrorTranscript {
                         let docs = FileManager.default.urls(
@@ -156,10 +160,18 @@ final class ShellSession: ObservableObject {
     }
 
     private func emitBytes(_ bytes: [UInt8]) {
-        transcript += String(decoding: bytes, as: UTF8.self)
-        // A full-screen program (our editor) toggles raw passthrough via the
-        // alternate-screen sequences: ESC[?1049h to enter, ESC[?1049l to leave.
         let s = String(decoding: bytes, as: UTF8.self)
+        // Mirror for the debug channels, but bound the memory: keep only the
+        // last ~256 KB so a long-running or noisy session can't grow it without
+        // limit (which would let iOS jetsam the app).
+        transcript += s
+        if transcript.utf8.count > 512 * 1024 {
+            transcript = String(transcript.suffix(256 * 1024))
+        }
+        // A full-screen program (editor / ssh / mosh) toggles raw passthrough
+        // via the alternate-screen sequences: ESC[?1049h to enter, ESC[?1049l to
+        // leave. (rawMode is also force-reset when a command finishes, so a
+        // program that exits without emitting 1049l can't strand us in raw.)
         if s.contains("\u{1B}[?1049h") { rawMode = true }
         if s.contains("\u{1B}[?1049l") { rawMode = false }
         onOutput?(bytes[...])

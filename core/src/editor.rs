@@ -184,9 +184,18 @@ impl Editor {
     fn run(&mut self, stdin: &mut impl Read, out: &mut impl Write) -> std::io::Result<()> {
         // Enter alternate screen (also flips the Swift side into raw passthrough).
         write!(out, "\x1b[?1049h")?;
+        // Run the event loop, but ALWAYS leave the alternate screen afterward —
+        // even if a render/read errors mid-loop. Otherwise the Swift side stays
+        // in raw passthrough and the shell becomes uninputtable.
+        let result = self.event_loop(stdin, out);
+        let _ = write!(out, "\x1b[?1049l");
+        let _ = out.flush();
+        result
+    }
+
+    fn event_loop(&mut self, stdin: &mut impl Read, out: &mut impl Write) -> std::io::Result<()> {
         self.render(out)?;
         out.flush()?;
-
         let mut buf = [0u8; 1];
         while !self.quit {
             let n = stdin.read(&mut buf)?;
@@ -199,9 +208,6 @@ impl Editor {
                 out.flush()?;
             }
         }
-        // Leave alternate screen.
-        write!(out, "\x1b[?1049l")?;
-        out.flush()?;
         Ok(())
     }
 
