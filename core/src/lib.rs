@@ -26,7 +26,11 @@ pub mod selftest;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::io::{Read, Write};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
+use std::thread::JoinHandle;
 
 use brush_builtins::{BuiltinSet, ShellBuilderExt};
 use brush_core::builtins as core_builtins;
@@ -36,8 +40,21 @@ use brush_core::openfiles::OpenFile;
 pub type OutputCb = extern "C" fn(ctx: *mut c_void, bytes: *const u8, len: usize);
 pub type DoneCb = extern "C" fn(ctx: *mut c_void, exit_code: i32, cwd: *const c_char);
 
+/// Opaque Swift-side context pointer handed to the C callbacks.
+///
+/// SAFETY: the pointer is an `Unmanaged<ShellSession>` from Swift. It is only
+/// dereferenced by Swift inside the callbacks; Rust just carries it between
+/// threads. It stays valid because `ashell_session_free` joins both worker
+/// threads before returning, so no callback fires after the Swift object is
+/// released. `alive` is checked before every callback as belt-and-suspenders.
 struct CallbackCtx(*mut c_void);
 unsafe impl Send for CallbackCtx {}
+
+/// Runs an FFI body under `catch_unwind`, returning `default` on a panic so a
+/// panic never unwinds across the C ABI (which is undefined behavior).
+fn ffi_guard<T>(default: T, f: impl FnOnce() -> T) -> T {
+    catch_unwind(AssertUnwindSafe(f)).unwrap_or(default)
+}
 
 /// Messages to the session's shell thread.
 enum SessionMsg {
@@ -58,6 +75,10 @@ pub struct CompletionReply {
 pub struct Session {
     cmd_tx: mpsc::Sender<SessionMsg>,
     stdin_writer: std::io::PipeWriter,
+    /// Cleared on free so lingering worker threads suppress their callbacks.
+    alive: Arc<AtomicBool>,
+    reader_handle: Option<JoinHandle<()>>,
+    shell_handle: Option<JoinHandle<()>>,
 }
 
 /// Builds a Shell configured identically for FFI sessions and the selftest
@@ -139,106 +160,143 @@ pub extern "C" fn ashell_session_new(
     ctx: *mut c_void,
     working_dir: *const c_char,
 ) -> *mut Session {
-    let working_dir = unsafe { CStr::from_ptr(working_dir) }
-        .to_string_lossy()
-        .into_owned();
-
-    let (stdout_reader, stdout_writer) = std::io::pipe().expect("pipe");
-    let (stdin_reader, stdin_writer) = std::io::pipe().expect("pipe");
-    let (cmd_tx, cmd_rx) = mpsc::channel::<SessionMsg>();
-
-    // Pump command output back to Swift.
-    let out_ctx = CallbackCtx(ctx);
-    std::thread::spawn(move || {
-        let out_ctx = out_ctx;
-        let mut reader = stdout_reader;
-        let mut buf = [0u8; 8192];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => out_cb(out_ctx.0, buf.as_ptr(), n),
-            }
+    ffi_guard(std::ptr::null_mut(), || {
+        if working_dir.is_null() {
+            return std::ptr::null_mut();
         }
-    });
+        let working_dir = unsafe { CStr::from_ptr(working_dir) }
+            .to_string_lossy()
+            .into_owned();
 
-    // Shell thread: owns the Shell instance for this session's lifetime.
-    let shell_ctx = CallbackCtx(ctx);
-    std::thread::spawn(move || {
-        let shell_ctx = shell_ctx;
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime");
+        // Resource exhaustion (fd limit) must not abort the app: return null so
+        // Swift can surface the failure.
+        let (Ok((stdout_reader, stdout_writer)), Ok((stdin_reader, stdin_writer))) =
+            (std::io::pipe(), std::io::pipe())
+        else {
+            return std::ptr::null_mut();
+        };
+        let (cmd_tx, cmd_rx) = mpsc::channel::<SessionMsg>();
+        let alive = Arc::new(AtomicBool::new(true));
 
-        runtime.block_on(async move {
-            let mut fds: HashMap<brush_core::ShellFd, OpenFile> = HashMap::new();
-            fds.insert(0.into(), OpenFile::from(stdin_reader));
-            fds.insert(1.into(), OpenFile::from(stdout_writer.try_clone().expect("clone")));
-            fds.insert(2.into(), OpenFile::from(stdout_writer));
-
-            let shell = build_shell(fds, std::path::Path::new(&working_dir)).await;
-
-            let mut shell = match shell {
-                Ok(s) => s,
-                Err(e) => {
-                    let msg = CString::new(format!("shell init failed: {e}")).unwrap();
-                    done_cb(shell_ctx.0, 127, msg.as_ptr());
-                    return;
-                }
-            };
-
-            while let Ok(msg) = cmd_rx.recv() {
-                match msg {
-                    SessionMsg::Exec(cmd) => {
-                        let params = shell.default_exec_params();
-                        let source_info = brush_core::SourceInfo::from("terminal");
-                        let exit_code: i32 =
-                            match shell.run_string(cmd, &source_info, &params).await {
-                                Ok(result) => i32::from(u8::from(result.exit_code)),
-                                Err(e) => {
-                                    let mut err = params.stderr(&shell);
-                                    let _ = writeln!(err, "ashell: {e}");
-                                    let _ = err.flush();
-                                    127
-                                }
-                            };
-                        let cwd =
-                            CString::new(shell.working_dir().to_string_lossy().into_owned())
-                                .unwrap_or_default();
-                        done_cb(shell_ctx.0, exit_code, cwd.as_ptr());
-                    }
-                    SessionMsg::Complete(line, pos, reply) => {
-                        // Config is cloned to avoid borrowing shell immutably
-                        // and mutably at once.
-                        let cfg = shell.completion_config().clone();
-                        let result = cfg.get_completions(&mut shell, &line, pos).await;
-                        let out = match result {
-                            Ok(c) => CompletionReply {
-                                insertion_index: c.insertion_index,
-                                delete_count: c.delete_count,
-                                candidates: c.candidates,
-                            },
-                            Err(_) => CompletionReply {
-                                insertion_index: pos,
-                                delete_count: 0,
-                                candidates: Vec::new(),
-                            },
-                        };
-                        let _ = reply.send(out);
+        // Pump command output back to Swift.
+        let out_ctx = CallbackCtx(ctx);
+        let reader_alive = alive.clone();
+        let reader_handle = std::thread::spawn(move || {
+            let out_ctx = out_ctx;
+            let mut reader = stdout_reader;
+            let mut buf = [0u8; 8192];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if reader_alive.load(Ordering::Acquire) {
+                            out_cb(out_ctx.0, buf.as_ptr(), n);
+                        }
                     }
                 }
             }
         });
-    });
 
-    Box::into_raw(Box::new(Session { cmd_tx, stdin_writer }))
+        // Shell thread: owns the Shell instance for this session's lifetime.
+        let shell_ctx = CallbackCtx(ctx);
+        let shell_alive = alive.clone();
+        let shell_handle = std::thread::spawn(move || {
+            let shell_ctx = shell_ctx;
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+
+            runtime.block_on(async move {
+                let mut fds: HashMap<brush_core::ShellFd, OpenFile> = HashMap::new();
+                fds.insert(0.into(), OpenFile::from(stdin_reader));
+                let Ok(stdout_writer2) = stdout_writer.try_clone() else {
+                    return;
+                };
+                fds.insert(1.into(), OpenFile::from(stdout_writer2));
+                fds.insert(2.into(), OpenFile::from(stdout_writer));
+
+                let mut shell = match build_shell(fds, std::path::Path::new(&working_dir)).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let msg = CString::new(format!("shell init failed: {e}"))
+                            .unwrap_or_default();
+                        if shell_alive.load(Ordering::Acquire) {
+                            done_cb(shell_ctx.0, 127, msg.as_ptr());
+                        }
+                        return;
+                    }
+                };
+
+                while let Ok(msg) = cmd_rx.recv() {
+                    match msg {
+                        SessionMsg::Exec(cmd) => {
+                            let params = shell.default_exec_params();
+                            let source_info = brush_core::SourceInfo::from("terminal");
+                            let exit_code: i32 =
+                                match shell.run_string(cmd, &source_info, &params).await {
+                                    Ok(result) => i32::from(u8::from(result.exit_code)),
+                                    Err(e) => {
+                                        let mut err = params.stderr(&shell);
+                                        let _ = writeln!(err, "ashell: {e}");
+                                        let _ = err.flush();
+                                        127
+                                    }
+                                };
+                            let cwd = CString::new(
+                                shell.working_dir().to_string_lossy().into_owned(),
+                            )
+                            .unwrap_or_default();
+                            if shell_alive.load(Ordering::Acquire) {
+                                done_cb(shell_ctx.0, exit_code, cwd.as_ptr());
+                            }
+                        }
+                        SessionMsg::Complete(line, pos, reply) => {
+                            // Config is cloned to avoid borrowing shell immutably
+                            // and mutably at once.
+                            let cfg = shell.completion_config().clone();
+                            let result = cfg.get_completions(&mut shell, &line, pos).await;
+                            let out = match result {
+                                Ok(c) => CompletionReply {
+                                    insertion_index: c.insertion_index,
+                                    delete_count: c.delete_count,
+                                    candidates: c.candidates,
+                                },
+                                Err(_) => CompletionReply {
+                                    insertion_index: pos,
+                                    delete_count: 0,
+                                    candidates: Vec::new(),
+                                },
+                            };
+                            let _ = reply.send(out);
+                        }
+                    }
+                }
+            });
+        });
+
+        Box::into_raw(Box::new(Session {
+            cmd_tx,
+            stdin_writer,
+            alive,
+            reader_handle: Some(reader_handle),
+            shell_handle: Some(shell_handle),
+        }))
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ashell_exec(session: *mut Session, cmd: *const c_char) {
-    let session = unsafe { &*session };
-    let cmd = unsafe { CStr::from_ptr(cmd) }.to_string_lossy().into_owned();
-    let _ = session.cmd_tx.send(SessionMsg::Exec(cmd));
+    if session.is_null() || cmd.is_null() {
+        return;
+    }
+    ffi_guard((), || {
+        let session = unsafe { &*session };
+        let cmd = unsafe { CStr::from_ptr(cmd) }.to_string_lossy().into_owned();
+        let _ = session.cmd_tx.send(SessionMsg::Exec(cmd));
+    });
 }
 
 /// Tab completion. Given the current line and cursor byte offset, returns the
@@ -251,55 +309,117 @@ pub extern "C" fn ashell_complete(
     line: *const c_char,
     cursor: usize,
 ) -> *mut c_char {
-    let session = unsafe { &*session };
-    let line = unsafe { CStr::from_ptr(line) }.to_string_lossy().into_owned();
-    let (reply_tx, reply_rx) = mpsc::sync_channel::<CompletionReply>(1);
-    if session
-        .cmd_tx
-        .send(SessionMsg::Complete(line, cursor, reply_tx))
-        .is_err()
-    {
-        return CString::new("0 0 0").unwrap().into_raw();
+    let empty = || CString::new("0 0 0").unwrap_or_default().into_raw();
+    if session.is_null() || line.is_null() {
+        return empty();
     }
-    let reply = match reply_rx.recv() {
-        Ok(r) => r,
-        Err(_) => return CString::new("0 0 0").unwrap().into_raw(),
-    };
-    let mut s = format!(
-        "{} {} {}",
-        reply.insertion_index,
-        reply.delete_count,
-        reply.candidates.len()
-    );
-    for c in &reply.candidates {
-        s.push('\n');
-        s.push_str(c);
-    }
-    CString::new(s).unwrap_or_default().into_raw()
+    ffi_guard(empty(), || {
+        let session = unsafe { &*session };
+        let line = unsafe { CStr::from_ptr(line) }.to_string_lossy().into_owned();
+        let (reply_tx, reply_rx) = mpsc::sync_channel::<CompletionReply>(1);
+        if session
+            .cmd_tx
+            .send(SessionMsg::Complete(line, cursor, reply_tx))
+            .is_err()
+        {
+            return empty();
+        }
+        let reply = match reply_rx.recv() {
+            Ok(r) => r,
+            Err(_) => return empty(),
+        };
+        let mut s = format!(
+            "{} {} {}",
+            reply.insertion_index,
+            reply.delete_count,
+            reply.candidates.len()
+        );
+        for c in &reply.candidates {
+            s.push('\n');
+            s.push_str(c);
+        }
+        CString::new(s).unwrap_or_default().into_raw()
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ashell_stdin_write(session: *mut Session, bytes: *const u8, len: usize) {
-    let session = unsafe { &mut *session };
-    let data = unsafe { std::slice::from_raw_parts(bytes, len) };
-    let _ = session.stdin_writer.write_all(data);
-    let _ = session.stdin_writer.flush();
+    if session.is_null() || (bytes.is_null() && len != 0) {
+        return;
+    }
+    ffi_guard((), || {
+        // `&*session` (shared, not `&mut`) avoids aliasing `&mut Session` with
+        // the `&*session` in ashell_exec; `PipeWriter` implements `Write` for
+        // `&PipeWriter`.
+        let session = unsafe { &*session };
+        let data = if len == 0 {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts(bytes, len) }
+        };
+        let mut w = &session.stdin_writer;
+        let _ = w.write_all(data);
+        let _ = w.flush();
+    });
 }
 
+/// Frees a session, joining its worker threads first so no callback can fire
+/// against a released Swift context afterward. Idempotent-safe against null.
+///
+/// Note: if a command is still running when a session is freed (e.g. a hung
+/// network command in `block_on`), the shell thread only exits after that
+/// command returns, so this can block. Sessions are normally long-lived and
+/// freed at teardown, so this is acceptable.
 #[unsafe(no_mangle)]
 pub extern "C" fn ashell_session_free(session: *mut Session) {
-    drop(unsafe { Box::from_raw(session) });
+    if session.is_null() {
+        return;
+    }
+    ffi_guard((), || {
+        let mut boxed = unsafe { Box::from_raw(session) };
+        // Suppress any further callbacks, then signal both workers to stop.
+        boxed.alive.store(false, Ordering::Release);
+        let shell_handle = boxed.shell_handle.take();
+        let reader_handle = boxed.reader_handle.take();
+        // Drop the command channel + stdin so the shell thread's recv() ends and
+        // any command blocked on stdin sees EOF; the shell thread then drops the
+        // stdout writer, giving the reader thread EOF.
+        let Session {
+            cmd_tx,
+            stdin_writer,
+            ..
+        } = *boxed;
+        drop(cmd_tx);
+        drop(stdin_writer);
+        if let Some(h) = shell_handle {
+            let _ = h.join();
+        }
+        if let Some(h) = reader_handle {
+            let _ = h.join();
+        }
+    });
 }
 
 /// Runs the full test battery in-process; returns a heap-allocated report
 /// string the caller must free with `ashell_string_free`.
 #[unsafe(no_mangle)]
 pub extern "C" fn ashell_selftest(working_dir: *const c_char) -> *mut c_char {
-    let working_dir = unsafe { CStr::from_ptr(working_dir) }
-        .to_string_lossy()
-        .into_owned();
-    let report = selftest::run_selftest(std::path::Path::new(&working_dir));
-    CString::new(report).unwrap_or_default().into_raw()
+    if working_dir.is_null() {
+        return std::ptr::null_mut();
+    }
+    ffi_guard(std::ptr::null_mut(), || {
+        let working_dir = unsafe { CStr::from_ptr(working_dir) }
+            .to_string_lossy()
+            .into_owned();
+        let report = selftest::run_selftest(std::path::Path::new(&working_dir));
+        CString::new(report).unwrap_or_default().into_raw()
+    })
+}
+
+/// ABI version, so the Swift host can verify it matches the linked core.
+#[unsafe(no_mangle)]
+pub extern "C" fn ashell_abi_version() -> u32 {
+    1
 }
 
 #[unsafe(no_mangle)]
