@@ -327,7 +327,9 @@ pub fn build_client_datagram(
 }
 
 /// Decrypt a server datagram and, if it is a single complete fragment, return
-/// the parsed Instruction. (Multi-fragment reassembly comes in a later phase.)
+/// the parsed Instruction. Used by the live interop probe; the client loop uses
+/// the incremental `FragmentAssembler` path instead.
+#[cfg(test)]
 pub fn parse_server_datagram(crypto: &Crypto, datagram: &[u8]) -> Option<(Opened, Instruction)> {
     let opened = crypto.open(datagram)?;
     let (_, _, is_final, contents) = parse_fragment(&opened.payload)?;
@@ -458,46 +460,6 @@ pub fn encode_user_message(events: &[UserEvent]) -> Vec<u8> {
         }
         push_submessage(1, &instr, &mut msg); // UserMessage.instruction = 1
     }
-    msg
-}
-
-/// Encodes a ClientBuffers.UserMessage carrying a single Keystroke of `keys`.
-pub fn encode_user_keystroke(keys: &[u8]) -> Vec<u8> {
-    // Keystroke { keys = 4 }
-    let mut keystroke = Vec::new();
-    put_tag(4, 2, &mut keystroke);
-    put_varint(keys.len() as u64, &mut keystroke);
-    keystroke.extend_from_slice(keys);
-    // Instruction { [ext 2] = Keystroke }
-    let mut instr = Vec::new();
-    put_tag(2, 2, &mut instr);
-    put_varint(keystroke.len() as u64, &mut instr);
-    instr.extend_from_slice(&keystroke);
-    // UserMessage { instruction = 1 }
-    let mut msg = Vec::new();
-    put_tag(1, 2, &mut msg);
-    put_varint(instr.len() as u64, &mut msg);
-    msg.extend_from_slice(&instr);
-    msg
-}
-
-/// Encodes a ClientBuffers.UserMessage carrying a single resize event.
-pub fn encode_user_resize(width: i32, height: i32) -> Vec<u8> {
-    // ResizeMessage { width = 5, height = 6 }
-    let mut resize = Vec::new();
-    put_tag(5, 0, &mut resize);
-    put_varint(width as u64, &mut resize);
-    put_tag(6, 0, &mut resize);
-    put_varint(height as u64, &mut resize);
-    // Instruction { [ext 3] = ResizeMessage }
-    let mut instr = Vec::new();
-    put_tag(3, 2, &mut instr);
-    put_varint(resize.len() as u64, &mut instr);
-    instr.extend_from_slice(&resize);
-    let mut msg = Vec::new();
-    put_tag(1, 2, &mut msg);
-    put_varint(instr.len() as u64, &mut msg);
-    msg.extend_from_slice(&instr);
     msg
 }
 
@@ -724,7 +686,7 @@ mod tests {
 
     #[test]
     fn user_keystroke_encode_is_decodable() {
-        let msg = encode_user_keystroke(b"hi\x1b[A");
+        let msg = encode_user_message(&[UserEvent::Keys(b"hi\x1b[A".to_vec())]);
         // field1 -> Instruction -> ext2 (Keystroke) -> field4 (keys)
         let mut keys = Vec::new();
         for_each_field1(&msg, |instr| {

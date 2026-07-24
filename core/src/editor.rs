@@ -27,14 +27,13 @@ enum Mode {
     Command,
 }
 
-/// Edit a text file in a full-screen editor.
+/// Edit a text file in a full-screen editor. Whether it starts modeless
+/// (edit/nano) or modal (vi) is decided from the invoked command name in
+/// `execute`, not from a flag.
 #[derive(Parser)]
 pub struct EditorCommand {
     /// File to edit (created on save if missing).
     file: Option<String>,
-    /// Internal: start modeless in Insert mode (edit/nano) vs modal (vi).
-    #[arg(skip)]
-    pub modeless: bool,
 }
 
 impl builtins::Command for EditorCommand {

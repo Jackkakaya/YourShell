@@ -40,6 +40,14 @@ const SKIP: &[&str] = &["yes", "more"];
 /// Serializes every mutation of process-global state (fds 0/1/2, cwd, env).
 /// Shared by the uutils adapter and the Python runner — anything that dup2s
 /// must hold this lock.
+///
+/// KNOWN LIMITATION (single-session-safe): a uutils command reading the
+/// *interactive* stdin (e.g. a bare `cat`/`tr` waiting on the keyboard) holds
+/// this lock for its whole run, since its stdin is not drained. With one
+/// terminal session that is harmless (nothing else runs concurrently). If
+/// multiple concurrent sessions are ever added, such a command would block the
+/// others until it gets EOF — that path would need per-session fd isolation
+/// rather than a single process-global lock.
 pub(crate) fn process_state_lock() -> &'static Mutex<()> {
     static LOCK: Mutex<()> = Mutex::new(());
     &LOCK
@@ -105,20 +113,13 @@ fn exec_uutils(
         // fully drained BEFORE taking the global lock — otherwise two uutils
         // stages in one pipeline deadlock (downstream grabs the lock, blocks
         // reading input that upstream can't produce without the lock).
-        let session_stdin_fd: Option<i32> = context
-            .shell
-            .open_files()
-            .try_fd(0.into())
-            .and_then(|f| f.try_borrow_as_fd().ok().map(|b| b.as_raw_fd()));
-        let stdin_is_interactive = match (&fds[0], session_stdin_fd) {
-            (Some(fd0), Some(base)) => {
-                // Same underlying description as the session's base stdin?
-                // Arc-shared OpenFiles resolve to the same raw fd.
-                fd0.as_raw_fd() == base || raw_fd_same_file(fd0.as_raw_fd(), base)
-            }
-            (None, _) => true,
-            _ => false,
-        };
+        //
+        // Use brush's authoritative "was fd 0 specified for this command?"
+        // rather than comparing fd identity: a dev+inode comparison is
+        // unreliable for pipes (two distinct pipes can share dev/ino), and a
+        // false "interactive" verdict reintroduces the pipeline deadlock this
+        // whole dance exists to avoid. awk/python use the same signal.
+        let stdin_is_interactive = !context.params.is_fd_specified(0.into());
         let cwd = context.shell.working_dir().to_path_buf();
         let exported: Vec<(String, String)> = context
             .shell
@@ -156,19 +157,6 @@ fn exec_uutils(
         #[expect(clippy::cast_sign_loss)]
         Ok(ExecutionResult::new((code & 0xff) as u8))
     })
-}
-
-/// Compares two fds by file description identity (dev + inode), so a dup'd
-/// clone of the session stdin still registers as "interactive".
-pub(crate) fn raw_fd_same_file(a: i32, b: i32) -> bool {
-    unsafe {
-        let mut sa: libc::stat = std::mem::zeroed();
-        let mut sb: libc::stat = std::mem::zeroed();
-        libc::fstat(a, &raw mut sa) == 0
-            && libc::fstat(b, &raw mut sb) == 0
-            && sa.st_dev == sb.st_dev
-            && sa.st_ino == sb.st_ino
-    }
 }
 
 /// Materializes a drained stdin buffer as an unlinked temp file fd.

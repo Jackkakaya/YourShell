@@ -125,25 +125,14 @@ fn exec_node(
 
         // Drain redirected/piped stdin to forward to node. The session's base
         // stdin is a pipe (the keyboard), so is_terminal() can't distinguish
-        // interactive from redirected — compare fd identity instead, matching
-        // the python/uutils adapters. Draining the live keyboard would block
-        // forever on an EOF that never comes.
-        let session_stdin_fd: Option<i32> = context
-            .shell
-            .open_files()
-            .try_fd(0.into())
-            .and_then(|f| f.try_borrow_as_fd().ok().map(|b| b.as_raw_fd()));
+        // interactive from redirected — use brush's authoritative "was fd 0
+        // specified?" (matching the awk/python/uutils adapters). Draining the
+        // live keyboard would block forever on an EOF that never comes; a
+        // dev+inode fd comparison is unreliable for pipes.
+        let stdin_is_interactive = !context.params.is_fd_specified(0.into());
         let cmd_stdin = context
             .try_fd(0.into())
             .and_then(|f| f.try_borrow_as_fd().ok().and_then(|b| b.try_clone_to_owned().ok()));
-        let stdin_is_interactive = match (&cmd_stdin, session_stdin_fd) {
-            (Some(fd0), Some(base)) => {
-                fd0.as_raw_fd() == base
-                    || crate::uutils_adapter::raw_fd_same_file(fd0.as_raw_fd(), base)
-            }
-            (None, _) => true,
-            _ => false,
-        };
         let mut stdin_data = Vec::new();
         if !stdin_is_interactive {
             if let Some(fd) = cmd_stdin {

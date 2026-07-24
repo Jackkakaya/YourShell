@@ -552,7 +552,7 @@ async fn bootstrap_over_ssh(
     {
         return Err(format!("ssh auth failed for {user}@{host}"));
     }
-    let mut channel = session
+    let channel = session
         .channel_open_session()
         .await
         .map_err(|e| format!("open channel: {e}"))?;

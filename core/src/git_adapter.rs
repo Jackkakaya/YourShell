@@ -5,7 +5,7 @@
 //! GIT_USERNAME + GIT_PASSWORD (or token) env vars.
 
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use brush_core::{builtins, ExecutionContext, ExecutionResult, ShellExtensions};
 use git2::{Repository, Signature};
