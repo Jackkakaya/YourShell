@@ -22,6 +22,9 @@ final class ShellSession: ObservableObject {
     private var historyIndex: Int? = nil
     private var demoQueue: [String] = []
     var mirrorTranscript = false
+    /// True while a full-screen program (the editor) owns the terminal; set by
+    /// the alternate-screen escape sequences in emitBytes.
+    private var rawMode = false
     private var pendingEscape: [UInt8] = []
 
     init() {
@@ -154,6 +157,11 @@ final class ShellSession: ObservableObject {
 
     private func emitBytes(_ bytes: [UInt8]) {
         transcript += String(decoding: bytes, as: UTF8.self)
+        // A full-screen program (our editor) toggles raw passthrough via the
+        // alternate-screen sequences: ESC[?1049h to enter, ESC[?1049l to leave.
+        let s = String(decoding: bytes, as: UTF8.self)
+        if s.contains("\u{1B}[?1049h") { rawMode = true }
+        if s.contains("\u{1B}[?1049l") { rawMode = false }
         onOutput?(bytes[...])
     }
 
@@ -165,7 +173,18 @@ final class ShellSession: ObservableObject {
 
     func keyInput(_ bytes: ArraySlice<UInt8>) {
         if busy {
-            // Raw mode: the running command owns stdin. Map CR to LF for
+            if rawMode {
+                // Full-screen program (editor): forward keystrokes verbatim,
+                // no echo, no CR->LF mapping. The program controls the screen.
+                if let handle {
+                    let arr = Array(bytes)
+                    arr.withUnsafeBufferPointer { buf in
+                        ashell_stdin_write(handle, buf.baseAddress, buf.count)
+                    }
+                }
+                return
+            }
+            // Cooked mode: the running command owns stdin. Map CR to LF for
             // canonical line-based readers.
             var raw = Array(bytes)
             for i in raw.indices where raw[i] == 0x0D { raw[i] = 0x0A }

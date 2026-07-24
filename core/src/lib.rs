@@ -8,6 +8,7 @@
 
 mod builtins_extra;
 mod commands_ext;
+mod editor;
 mod git_adapter;
 mod uutils_adapter;
 #[cfg(feature = "python")]
@@ -80,7 +81,10 @@ pub(crate) async fn build_shell(
         .builtin("unzip", core_builtins::builtin::<commands_ext::UnzipCommand, DefaultShellExtensions>())
         .builtin("sqlite3", core_builtins::builtin::<commands_ext::SqliteCommand, DefaultShellExtensions>())
         .builtin("jq", core_builtins::builtin::<commands_ext::JqCommand, DefaultShellExtensions>())
-        .builtin("git", git_adapter::registration());
+        .builtin("git", git_adapter::registration())
+        .builtin("edit", core_builtins::builtin::<editor::EditorCommand, DefaultShellExtensions>())
+        .builtin("vi", core_builtins::builtin::<editor::EditorCommand, DefaultShellExtensions>())
+        .builtin("nano", core_builtins::builtin::<editor::EditorCommand, DefaultShellExtensions>());
     for name in uutils_adapter::command_names() {
         builder = builder.builtin(name, uutils_adapter::registration());
     }
