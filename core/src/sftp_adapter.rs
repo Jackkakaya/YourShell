@@ -16,7 +16,7 @@ use brush_core::{CommandArg, ExecutionContext, ExecutionResult};
 use futures::future::BoxFuture;
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::OpenFlags;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio_fd::AsyncFd;
 
 use crate::ffi_util::{borrow_fd, fail};
@@ -74,12 +74,20 @@ fn env_reader<'a>(
 /// Splits `[user@]host:path` into its parts. Returns None when `s` is a local
 /// path (no `:` before the first `/`, matching scp's heuristic).
 fn parse_remote(s: &str, default_user: &str) -> Option<(String, String, String)> {
-    let colon = s.find(':')?;
-    let slash = s.find('/');
-    if slash.is_some_and(|sl| sl < colon) {
-        return None; // "./a:b" style local path
-    }
-    let (hostpart, path) = s.split_at(colon);
+    // Bracketed IPv6 literal host: [user@][::1]:path — the path colon is the
+    // first one AFTER the closing bracket, so a raw `find(':')` would mis-split.
+    let path_colon = if let Some(close) = s.find(']') {
+        s[close..].find(':').map(|off| close + off)
+    } else {
+        let colon = s.find(':')?;
+        // A `:` after the first `/` means it's a local path (e.g. ./a:b).
+        if s.find('/').is_some_and(|sl| sl < colon) {
+            return None;
+        }
+        Some(colon)
+    }?;
+
+    let (hostpart, path) = s.split_at(path_colon);
     let path = &path[1..]; // drop ':'
     let (user, host) = match hostpart.split_once('@') {
         Some((u, h)) => (u.to_string(), h.to_string()),
@@ -87,25 +95,6 @@ fn parse_remote(s: &str, default_user: &str) -> Option<(String, String, String)>
     };
     let path = if path.is_empty() { ".".to_string() } else { path.to_string() };
     Some((user, host, path))
-}
-
-/// Uploads `data` to `dest`, waiting for the server to acknowledge every write
-/// before returning. The high-level `SftpSession::write` sends writes
-/// fire-and-forget (`write_nowait`) and does not flush, so a caller that tears
-/// the connection down immediately can lose the data — `flush()` drains the
-/// pending write-acks and `shutdown()` closes the handle.
-async fn write_remote_file(sftp: &SftpSession, dest: &str, data: &[u8]) -> Result<(), String> {
-    let mut f = sftp
-        .open_with_flags(
-            dest.to_string(),
-            OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNCATE,
-        )
-        .await
-        .map_err(|e| format!("open {dest}: {e}"))?;
-    f.write_all(data).await.map_err(|e| format!("write {dest}: {e}"))?;
-    f.flush().await.map_err(|e| format!("flush {dest}: {e}"))?;
-    f.shutdown().await.map_err(|e| format!("close {dest}: {e}"))?;
-    Ok(())
 }
 
 async fn open_sftp(session: &mut Session) -> Result<SftpSession, String> {
@@ -332,13 +321,48 @@ async fn download(
     } else {
         local.to_path_buf()
     };
-    let data = sftp
-        .read(rpath.to_string())
-        .await
-        .map_err(|e| format!("read {rpath}: {e}"))?;
-    std::fs::write(&dest, &data).map_err(|e| format!("write {}: {e}", dest.display()))?;
-    write_fd(fd1, format!("{rpath} -> {} ({} bytes)\n", dest.display(), data.len()).as_bytes());
+    let n = download_file(sftp, rpath, &dest).await?;
+    write_fd(fd1, format!("{rpath} -> {} ({n} bytes)\n", dest.display()).as_bytes());
     Ok(())
+}
+
+/// Streams a remote file to a local path (constant memory, no full buffering).
+async fn download_file(sftp: &SftpSession, rpath: &str, dest: &Path) -> Result<u64, String> {
+    use tokio::io::AsyncWriteExt;
+    let mut remote = sftp
+        .open(rpath.to_string())
+        .await
+        .map_err(|e| format!("open {rpath}: {e}"))?;
+    let mut out = tokio::fs::File::create(dest)
+        .await
+        .map_err(|e| format!("create {}: {e}", dest.display()))?;
+    let n = tokio::io::copy(&mut remote, &mut out)
+        .await
+        .map_err(|e| format!("download {rpath}: {e}"))?;
+    out.flush().await.map_err(|e| format!("flush {}: {e}", dest.display()))?;
+    Ok(n)
+}
+
+/// Streams a local file to a remote path, waiting for the server to confirm all
+/// writes (flush drains the write-acks) before returning.
+async fn upload_file(sftp: &SftpSession, local: &Path, dest: &str) -> Result<u64, String> {
+    use tokio::io::AsyncWriteExt;
+    let mut src = tokio::fs::File::open(local)
+        .await
+        .map_err(|e| format!("open {}: {e}", local.display()))?;
+    let mut f = sftp
+        .open_with_flags(
+            dest.to_string(),
+            OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::TRUNCATE,
+        )
+        .await
+        .map_err(|e| format!("open {dest}: {e}"))?;
+    let n = tokio::io::copy(&mut src, &mut f)
+        .await
+        .map_err(|e| format!("upload {dest}: {e}"))?;
+    f.flush().await.map_err(|e| format!("flush {dest}: {e}"))?;
+    f.shutdown().await.map_err(|e| format!("close {dest}: {e}"))?;
+    Ok(n)
 }
 
 fn download_dir<'a>(
@@ -363,12 +387,7 @@ fn download_dir<'a>(
             if entry.file_type().is_dir() {
                 download_dir(sftp, &child_r, &child_l, fd1).await?;
             } else {
-                let data = sftp
-                    .read(child_r.clone())
-                    .await
-                    .map_err(|e| format!("read {child_r}: {e}"))?;
-                std::fs::write(&child_l, &data)
-                    .map_err(|e| format!("write {}: {e}", child_l.display()))?;
+                download_file(sftp, &child_r, &child_l).await?;
                 write_fd(fd1, format!("{child_r} -> {}\n", child_l.display()).as_bytes());
             }
         }
@@ -404,9 +423,8 @@ async fn upload(
     } else {
         rpath.to_string()
     };
-    let data = std::fs::read(local).map_err(|e| format!("read {}: {e}", local.display()))?;
-    write_remote_file(sftp, &dest, &data).await?;
-    write_fd(fd1, format!("{} -> {dest} ({} bytes)\n", local.display(), data.len()).as_bytes());
+    let n = upload_file(sftp, local, &dest).await?;
+    write_fd(fd1, format!("{} -> {dest} ({n} bytes)\n", local.display()).as_bytes());
     Ok(())
 }
 
@@ -427,8 +445,7 @@ fn upload_dir<'a>(
             if child_l.is_dir() {
                 upload_dir(sftp, &child_l, &child_r, fd1).await?;
             } else {
-                let data = std::fs::read(&child_l).map_err(|e| format!("read {}: {e}", child_l.display()))?;
-                write_remote_file(sftp, &child_r, &data).await?;
+                upload_file(sftp, &child_l, &child_r).await?;
                 write_fd(fd1, format!("{} -> {child_r}\n", child_l.display()).as_bytes());
             }
         }
@@ -623,12 +640,9 @@ async fn run_sftp_repl(conn: Conn, cwd: PathBuf, fd0: RawFd, fd1: RawFd, fd2: Ra
                 };
                 let local = resolve_local(&ldir, localn);
                 let rpath = join_remote(&rdir, arg2.unwrap_or_else(|| basename(localn)));
-                match std::fs::read(&local) {
-                    Ok(data) => match write_remote_file(&sftp, &rpath, &data).await {
-                        Ok(()) => write_fd(fd1, format!("uploaded {rpath} ({} bytes)\n", data.len()).as_bytes()),
-                        Err(e) => write_fd(fd2, format!("put: {e}\n").as_bytes()),
-                    },
-                    Err(e) => write_fd(fd2, format!("put: read {}: {e}\n", local.display()).as_bytes()),
+                match upload_file(&sftp, &local, &rpath).await {
+                    Ok(n) => write_fd(fd1, format!("uploaded {rpath} ({n} bytes)\n").as_bytes()),
+                    Err(e) => write_fd(fd2, format!("put: {e}\n").as_bytes()),
                 }
             }
             "mkdir" => {
@@ -722,6 +736,14 @@ mod tests {
     fn remote_spec_empty_path_is_dot() {
         let r = parse_remote("host:", "me").unwrap();
         assert_eq!(r.2, ".");
+    }
+
+    #[test]
+    fn remote_spec_ipv6_bracketed() {
+        let r = parse_remote("user@[::1]:/etc/hosts", "def").unwrap();
+        assert_eq!(r, ("user".into(), "[::1]".into(), "/etc/hosts".into()));
+        let r2 = parse_remote("[2001:db8::1]:file", "me").unwrap();
+        assert_eq!(r2, ("me".into(), "[2001:db8::1]".into(), "file".into()));
     }
 
     #[test]

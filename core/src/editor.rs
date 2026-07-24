@@ -149,7 +149,17 @@ impl Editor {
     /// Snapshot the buffer before a mutation so `u` can revert it.
     fn push_undo(&mut self) {
         self.undo.push((self.lines.clone(), self.cy, self.cx));
-        if self.undo.len() > 500 {
+        // Bound memory by a budget, not a fixed snapshot count: each snapshot is
+        // a full clone of the buffer, so a large file needs far fewer snapshots
+        // to stay within ~8 MiB. (A count-only cap could reach hundreds of MB.)
+        let file_bytes = self
+            .lines
+            .iter()
+            .map(|l| l.len() + 1)
+            .sum::<usize>()
+            .max(1);
+        let max_snapshots = (8 * 1024 * 1024 / file_bytes).clamp(16, 500);
+        while self.undo.len() > max_snapshots {
             self.undo.remove(0);
         }
         self.redo.clear();

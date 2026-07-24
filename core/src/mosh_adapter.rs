@@ -404,18 +404,27 @@ async fn client_loop(
                 match r {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        // mosh escape: Ctrl-^ (0x1e) then '.' to quit.
+                        // mosh escape: Ctrl-^ (0x1e) then '.' quits. Filter the
+                        // escape bytes out of what's forwarded so a bare Ctrl-^
+                        // (or Ctrl-^ <other>) doesn't leak to the remote shell.
+                        let mut forward = Vec::with_capacity(n);
                         for &b in &kbuf[..n] {
                             if escape_armed {
                                 escape_armed = false;
-                                if b == b'.' { return 0; }
+                                if b == b'.' {
+                                    return 0;
+                                }
+                                forward.push(b); // Ctrl-^ was just the prefix
                             } else if b == 0x1e {
-                                escape_armed = true;
-                                continue;
+                                escape_armed = true; // hold the ^ back
+                            } else {
+                                forward.push(b);
                             }
                         }
-                        st.push_event(wire::UserEvent::Keys(kbuf[..n].to_vec()));
-                        send_state(crypto, &sock, &mut st).await;
+                        if !forward.is_empty() {
+                            st.push_event(wire::UserEvent::Keys(forward));
+                            send_state(crypto, &sock, &mut st).await;
+                        }
                     }
                 }
             }
