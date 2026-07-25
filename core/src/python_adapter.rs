@@ -46,6 +46,65 @@ fn content(
     Ok(format!("{name}: CPython 3.14 (in-process, subinterpreter)"))
 }
 
+/// Make `pip` usable on iOS. `ensurepip` can't run — it shells out to a
+/// subprocess, which iOS forbids (`OSError: ios does not support processes`) —
+/// so we bootstrap pip the way it actually works here: unzip the CPython-bundled
+/// pip wheel into the writable site dir (`YOURSHELL_PY_SITE`, already on
+/// `sys.path`). Idempotent (skips if pip is already extracted) and best-effort:
+/// any failure just leaves `python -m pip` to report "No module named pip".
+fn ensure_pip_bootstrapped() {
+    let Ok(site) = std::env::var("YOURSHELL_PY_SITE") else {
+        return;
+    };
+    let site = std::path::PathBuf::from(site);
+    if site.join("pip").is_dir() {
+        return; // already bootstrapped
+    }
+    let Ok(home) = std::env::var("YOURSHELL_PYTHON_HOME") else {
+        return;
+    };
+    let bundled = std::path::Path::new(&home).join("lib/python3.14/ensurepip/_bundled");
+    let Ok(entries) = std::fs::read_dir(&bundled) else {
+        return;
+    };
+    let wheel = entries.filter_map(Result::ok).map(|e| e.path()).find(|p| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("pip-") && n.ends_with(".whl"))
+    });
+    let Some(wheel) = wheel else {
+        return;
+    };
+    if let Ok(f) = std::fs::File::open(&wheel) {
+        if let Ok(mut zip) = zip::ZipArchive::new(f) {
+            let _ = std::fs::create_dir_all(&site);
+            let _ = zip.extract(&site);
+        }
+    }
+}
+
+/// iOS disables per-user site-packages and the bundle is read-only, so a bare
+/// `pip install X` has nowhere to write and fails. Default installs to the
+/// writable site dir via `--target`, unless the user already chose a
+/// destination (`--target`/`-t`/`--prefix`/`--user`). Only touches `install`.
+fn inject_pip_target(argv: &mut Vec<String>) {
+    if !argv.iter().any(|a| a == "install") {
+        return;
+    }
+    let has_dest = argv.iter().any(|a| {
+        a == "--target" || a == "-t" || a.starts_with("--target=") || a == "--prefix" || a == "--user"
+    });
+    if has_dest {
+        return;
+    }
+    if let Ok(site) = std::env::var("YOURSHELL_PY_SITE") {
+        if !site.trim().is_empty() {
+            argv.push("--target".into());
+            argv.push(site);
+        }
+    }
+}
+
 fn exec_python(
     context: ExecutionContext<'_, DefaultShellExtensions>,
     args: Vec<CommandArg>,
@@ -56,10 +115,14 @@ fn exec_python(
         // `pip`/`pip3` run as `python -m pip …` in the embedded interpreter
         // (there's no standalone pip executable on iOS). argv[0] is ignored by
         // the driver (it reads sys.argv[1:]), so inject `-m pip` after it.
+        // First make sure pip exists (bootstrap from the bundled wheel) and that
+        // installs land in the writable site dir — both no-ops after the first run.
         if matches!(context.command_name.as_str(), "pip" | "pip3") {
+            ensure_pip_bootstrapped();
             let rest = if argv.is_empty() { Vec::new() } else { argv[1..].to_vec() };
             argv = vec![context.command_name.clone(), "-m".into(), "pip".into()];
             argv.extend(rest);
+            inject_pip_target(&mut argv);
         }
 
         let fds: [Option<std::os::fd::OwnedFd>; 3] = [0, 1, 2].map(|n| {

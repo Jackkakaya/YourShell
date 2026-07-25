@@ -4,3 +4,9 @@ target/
 DerivedData/
 app/PythonResources/
 vendor/python-ios/
+
+# Cross-compiled iOS Python wheels + prebundled sites (large; reproducible via tools/build-ios-wheel.sh)
+ios-wheels/
+ios-prebundle/
+node-prebundle/
+app/build/

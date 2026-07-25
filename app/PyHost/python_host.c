@@ -52,6 +52,13 @@ static const char *YS_DRIVER =
     "    _ys_os.makedirs(_ys_site, exist_ok=True)\n"
     "    if _ys_site not in sys.path:\n"
     "        sys.path.insert(0, _ys_site)\n"
+    // Read-only prebundled site shipped inside the app (cross-compiled iOS
+    // wheels: lxml/Pillow + pure-Python office libs). No makedirs (bundle is
+    // read-only); appended after the writable site so a user pip-installed copy
+    // wins over the bundled one.
+    "_ys_pre = _ys_os.environ.get('YOURSHELL_PY_PREBUNDLED')\n"
+    "if _ys_pre and _ys_os.path.isdir(_ys_pre) and _ys_pre not in sys.path:\n"
+    "    sys.path.append(_ys_pre)\n"
     "def _ys_main():\n"
     "    args = sys.argv[1:]\n"
     "    if not args:\n"
