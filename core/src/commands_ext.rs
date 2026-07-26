@@ -491,22 +491,57 @@ impl builtins::Command for SedCommand {
 
 // ---------------------------------------------------------------- curl / wget
 
-/// Transfer a URL (HTTP/HTTPS GET), printing the body to stdout.
+/// Transfer a URL over HTTP/HTTPS. Supports the common real-`curl` flags so the
+/// agent's reflexes work instead of tripping a "this isn't standard curl" error:
+/// method (`-X`), headers (`-H`, repeatable), request body (`-d`/`--data`/
+/// `--data-raw`/`--data-binary`, implies POST; `@file` reads a file), `--json`,
+/// basic auth (`-u`), user-agent (`-A`), include response headers (`-i`),
+/// fail-on-error (`-f`), and output (`-o`/`-O`). Backed by `ureq`.
 #[derive(Parser)]
 pub struct CurlCommand {
     url: String,
+    /// HTTP method (GET, POST, PUT, PATCH, DELETE, HEAD, ...).
+    #[arg(short = 'X', long = "request")]
+    method: Option<String>,
+    /// Extra header "Name: value" (repeatable).
+    #[arg(short = 'H', long = "header")]
+    header: Vec<String>,
+    /// Request body; implies POST unless -X is given. `@file` reads from a file.
+    #[arg(short = 'd', long = "data", visible_aliases = ["data-raw", "data-binary", "data-ascii"])]
+    data: Option<String>,
+    /// JSON body: sets Content-Type/Accept: application/json and implies POST.
+    #[arg(long = "json")]
+    json: Option<String>,
+    /// Basic auth "user:password".
+    #[arg(short = 'u', long = "user")]
+    user: Option<String>,
+    /// User-Agent header.
+    #[arg(short = 'A', long = "user-agent")]
+    user_agent: Option<String>,
     /// Write output to this file instead of stdout.
-    #[arg(short = 'o')]
+    #[arg(short = 'o', long = "output")]
     output: Option<String>,
-    /// Follow the remote name (save as the URL's basename).
-    #[arg(short = 'O')]
+    /// Save as the URL's basename.
+    #[arg(short = 'O', long = "remote-name")]
     remote_name: bool,
-    /// Silent: no error text.
-    #[arg(short = 's')]
+    /// Include response headers in the output.
+    #[arg(short = 'i', long = "include")]
+    include: bool,
+    /// Fail (exit 22) on HTTP >= 400, with no body.
+    #[arg(short = 'f', long = "fail")]
+    fail: bool,
+    /// Silent: suppress progress/error text.
+    #[arg(short = 's', long = "silent")]
     silent: bool,
-    /// Include headers (ignored beyond status) / fail flag placeholder.
-    #[arg(short = 'L', default_value_t = true)]
+    /// Show errors even with -s (accepted; errors already print unless -s).
+    #[arg(short = 'S', long = "show-error")]
+    _show_error: bool,
+    /// Follow redirects (accepted; ureq follows by default).
+    #[arg(short = 'L', long = "location")]
     _location: bool,
+    /// Allow insecure TLS (accepted; no-op).
+    #[arg(short = 'k', long = "insecure")]
+    _insecure: bool,
 }
 
 impl builtins::Command for CurlCommand {
@@ -521,8 +556,62 @@ impl builtins::Command for CurlCommand {
         } else {
             self.output.clone()
         };
-        http_get(&self.url, dest.as_deref(), self.silent, &cwd, &context)
+
+        // Assemble headers: -H first, then --json content negotiation, then auth.
+        let mut headers = self.header.clone();
+        let mut body: Option<String> = None;
+        if let Some(j) = &self.json {
+            headers.push("Content-Type: application/json".into());
+            headers.push("Accept: application/json".into());
+            body = Some(j.clone());
+        } else if let Some(d) = &self.data {
+            body = Some(read_data_arg(d, &cwd));
+        }
+        if let Some(u) = &self.user {
+            use base64::Engine as _;
+            let enc = base64::engine::general_purpose::STANDARD.encode(u.as_bytes());
+            headers.push(format!("Authorization: Basic {enc}"));
+        }
+        // Method: explicit -X wins; else -d/--json implies POST; else GET.
+        let method = self
+            .method
+            .as_deref()
+            .map(|m| m.to_ascii_uppercase())
+            .unwrap_or_else(|| if body.is_some() { "POST".into() } else { "GET".into() });
+
+        http_request(
+            &method,
+            &self.url,
+            &headers,
+            body.as_deref(),
+            self.user_agent.as_deref(),
+            dest.as_deref(),
+            self.silent,
+            self.include,
+            self.fail,
+            &cwd,
+            &context,
+        )
     }
+}
+
+/// `-d @path` reads the body from a file; otherwise the value is the literal body.
+fn read_data_arg(data: &str, cwd: &Path) -> String {
+    if let Some(rest) = data.strip_prefix('@') {
+        std::fs::read_to_string(abs(cwd, rest)).unwrap_or_default()
+    } else {
+        data.to_string()
+    }
+}
+
+/// Split a "Name: value" header line; trims surrounding whitespace.
+fn parse_header(h: &str) -> Option<(String, String)> {
+    let (k, v) = h.split_once(':')?;
+    let k = k.trim();
+    if k.is_empty() {
+        return None;
+    }
+    Some((k.to_string(), v.trim().to_string()))
 }
 
 /// Retrieve a URL, saving to a local file (like wget).
@@ -566,6 +655,7 @@ fn url_basename(url: &str) -> String {
     }
 }
 
+/// GET wrapper used by `wget` (and the simple curl path).
 fn http_get<SE: ShellExtensions>(
     url: &str,
     dest: Option<&str>,
@@ -573,8 +663,86 @@ fn http_get<SE: ShellExtensions>(
     cwd: &Path,
     context: &ExecutionContext<'_, SE>,
 ) -> Result<ExecutionResult, brush_core::Error> {
-    match ureq::get(url).call() {
+    http_request("GET", url, &[], None, None, dest, silent, false, false, cwd, context)
+}
+
+/// Perform an HTTP request with an arbitrary method, headers and optional body,
+/// streaming the response body to `dest` (a file) or stdout. Powers `curl`.
+#[allow(clippy::too_many_arguments)]
+fn http_request<SE: ShellExtensions>(
+    method: &str,
+    url: &str,
+    headers: &[String],
+    body: Option<&str>,
+    user_agent: Option<&str>,
+    dest: Option<&str>,
+    silent: bool,
+    include_headers: bool,
+    fail: bool,
+    cwd: &Path,
+    context: &ExecutionContext<'_, SE>,
+) -> Result<ExecutionResult, brush_core::Error> {
+    let parsed: Vec<(String, String)> = headers.iter().filter_map(|h| parse_header(h)).collect();
+    let has_ua = parsed.iter().any(|(k, _)| k.eq_ignore_ascii_case("user-agent"));
+
+    // POST/PUT/PATCH carry a body (ureq's WithBody builder); everything else
+    // uses the WithoutBody builder. An unknown custom method falls back to GET.
+    let with_body = matches!(method, "POST" | "PUT" | "PATCH");
+    let resp_result: Result<ureq::http::Response<ureq::Body>, ureq::Error> = if with_body {
+        let mut b = match method {
+            "PUT" => ureq::put(url),
+            "PATCH" => ureq::patch(url),
+            _ => ureq::post(url),
+        };
+        for (k, v) in &parsed {
+            b = b.header(k, v);
+        }
+        if let (Some(ua), false) = (user_agent, has_ua) {
+            b = b.header("User-Agent", ua);
+        }
+        match body {
+            Some(d) => b.send(d),
+            None => b.send_empty(),
+        }
+    } else {
+        let mut b = match method {
+            "DELETE" => ureq::delete(url),
+            "HEAD" => ureq::head(url),
+            "OPTIONS" => ureq::options(url),
+            _ => ureq::get(url),
+        };
+        for (k, v) in &parsed {
+            b = b.header(k, v);
+        }
+        if let (Some(ua), false) = (user_agent, has_ua) {
+            b = b.header("User-Agent", ua);
+        }
+        b.call()
+    };
+
+    match resp_result {
         Ok(mut resp) => {
+            let status = resp.status().as_u16();
+            // -i/--include: emit the status line and response headers first.
+            if include_headers {
+                let mut out = context.stdout();
+                let _ = writeln!(out, "HTTP/1.1 {status}");
+                for (k, v) in resp.headers() {
+                    let _ = writeln!(out, "{}: {}", k.as_str(), v.to_str().unwrap_or(""));
+                }
+                let _ = writeln!(out);
+                let _ = out.flush();
+            }
+            // -f/--fail: HTTP >= 400 → no body, exit 22 (curl's convention).
+            if fail && status >= 400 {
+                if !silent {
+                    let _ = writeln!(
+                        context.stderr(),
+                        "curl: The requested URL returned error: {status}"
+                    );
+                }
+                return Ok(ExecutionResult::new(22));
+            }
             // Stream the body straight to the destination so a large download
             // doesn't buffer the whole response in memory (OOM on iOS).
             let mut reader = resp.body_mut().as_reader();
