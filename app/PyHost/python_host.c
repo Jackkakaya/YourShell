@@ -59,6 +59,26 @@ static const char *YS_DRIVER =
     "_ys_pre = _ys_os.environ.get('YOURSHELL_PY_PREBUNDLED')\n"
     "if _ys_pre and _ys_os.path.isdir(_ys_pre) and _ys_pre not in sys.path:\n"
     "    sys.path.append(_ys_pre)\n"
+    // sys.executable: iOS has no python binary. pip builds spawn commands as
+    // [sys.executable, ...]; point it at a stub (created so os.path.exists passes)
+    // so the in-process subprocess shim recognizes 'run our python' and diverts
+    // it in-process instead of fork/exec (which iOS forbids).
+    "try:\n"
+    "    _ys_exe = _ys_os.path.join(_ys_site or _ys_os.environ.get('HOME', '/tmp'), 'ys-python3')\n"
+    "    if not _ys_os.path.exists(_ys_exe):\n"
+    "        open(_ys_exe, 'w').close()\n"
+    "    sys.executable = _ys_exe\n"
+    "    sys._base_executable = _ys_exe\n"
+    "except Exception:\n"
+    "    pass\n"
+    // Install the in-process subprocess shim: pip / PEP 517 build backends spawn
+    // python subprocesses for build isolation and hooks; iOS bans fork, so route
+    // self-python spawns in-process. Lets pure-Python sdists `pip install`.
+    "try:\n"
+    "    import _ys_subprocess as _ys_sp\n"
+    "    _ys_sp.install()\n"
+    "except Exception:\n"
+    "    pass\n"
     "def _ys_main():\n"
     "    args = sys.argv[1:]\n"
     "    if not args:\n"
