@@ -1289,3 +1289,97 @@ impl builtins::Command for JqCommand {
         Ok(ExecutionResult::new(exit))
     }
 }
+
+// ----------------------------------------------------- find / tar arg shims
+//
+// `find` and `tar` have historical CLI syntaxes that clap can't parse directly:
+// find uses single-dash long predicates (`-name`/`-type`/`-maxdepth`) and tar
+// accepts a dashless leading mode bundle (`tar czf …`). Both are what agents
+// reflexively type. These custom registrations rewrite argv into the clap form,
+// then reuse the existing FindCommand/TarCommand logic.
+
+fn find_content(
+    _n: &str,
+    _t: builtins::ContentType,
+    _o: &builtins::ContentOptions,
+) -> Result<String, brush_core::Error> {
+    Ok("find: walk the file hierarchy".to_string())
+}
+
+fn exec_find(
+    context: ExecutionContext<'_, brush_core::extensions::DefaultShellExtensions>,
+    args: Vec<brush_core::CommandArg>,
+) -> futures::future::BoxFuture<'_, Result<ExecutionResult, brush_core::Error>> {
+    Box::pin(async move {
+        let argv = args.iter().skip(1).map(ToString::to_string).map(|a| {
+            match a.as_str() {
+                "-name" | "-iname" => "--name".to_string(),
+                "-type" => "--type".to_string(),
+                "-maxdepth" => "--maxdepth".to_string(),
+                other => other.to_string(),
+            }
+        });
+        match FindCommand::try_parse_from(std::iter::once("find".to_string()).chain(argv)) {
+            Ok(cmd) => builtins::Command::execute(&cmd, context).await,
+            Err(e) => {
+                let _ = write!(context.stderr(), "{e}");
+                Ok(ExecutionResult::new(2))
+            }
+        }
+    })
+}
+
+pub fn find_registration() -> builtins::Registration<brush_core::extensions::DefaultShellExtensions> {
+    builtins::Registration {
+        execute_func: exec_find,
+        content_func: find_content,
+        disabled: false,
+        special_builtin: false,
+        declaration_builtin: false,
+    }
+}
+
+fn tar_content(
+    _n: &str,
+    _t: builtins::ContentType,
+    _o: &builtins::ContentOptions,
+) -> Result<String, brush_core::Error> {
+    Ok("tar: create/extract archives (optionally gzip)".to_string())
+}
+
+fn exec_tar(
+    context: ExecutionContext<'_, brush_core::extensions::DefaultShellExtensions>,
+    args: Vec<brush_core::CommandArg>,
+) -> futures::future::BoxFuture<'_, Result<ExecutionResult, brush_core::Error>> {
+    Box::pin(async move {
+        let mut argv: Vec<String> = args.iter().skip(1).map(ToString::to_string).collect();
+        // Old-style `tar czf f.tgz …` (no leading dash): if the first token is a
+        // bare mode bundle, dash it so clap sees `-czf`.
+        if let Some(first) = argv.first_mut() {
+            if !first.starts_with('-')
+                && !first.is_empty()
+                && first.chars().all(|c| "cxtruzjJvfhO".contains(c))
+                && first.chars().any(|c| "cxtru".contains(c))
+            {
+                *first = format!("-{first}");
+            }
+        }
+        match TarCommand::try_parse_from(std::iter::once("tar".to_string()).chain(argv)) {
+            Ok(cmd) => builtins::Command::execute(&cmd, context).await,
+            Err(e) => {
+                let _ = write!(context.stderr(), "{e}");
+                Ok(ExecutionResult::new(2))
+            }
+        }
+    })
+}
+
+pub fn tar_registration() -> builtins::Registration<brush_core::extensions::DefaultShellExtensions> {
+    builtins::Registration {
+        execute_func: exec_tar,
+        content_func: tar_content,
+        disabled: false,
+        special_builtin: false,
+        declaration_builtin: false,
+    }
+}

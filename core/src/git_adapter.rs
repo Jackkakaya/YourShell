@@ -85,10 +85,18 @@ fn run_git<SE: ShellExtensions>(
 
     match sub.as_str() {
         "init" => {
-            let dir = rest.first().map_or_else(|| cwd.to_path_buf(), |d| cwd.join(d));
+            // Skip flags (`-q`/`--quiet`/`-b main`…) when picking the target dir —
+            // `git init -q` must init in cwd, not a directory literally named "-q".
+            let dir = rest
+                .iter()
+                .find(|a| !a.starts_with('-'))
+                .map_or_else(|| cwd.to_path_buf(), |d| cwd.join(d));
+            let quiet = rest.iter().any(|a| a == "-q" || a == "--quiet");
             match Repository::init(&dir) {
                 Ok(_) => {
-                    let _ = writeln!(out, "Initialized empty Git repository in {}", dir.display());
+                    if !quiet {
+                        let _ = writeln!(out, "Initialized empty Git repository in {}", dir.display());
+                    }
                     0
                 }
                 Err(e) => fail!(e),
