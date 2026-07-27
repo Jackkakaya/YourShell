@@ -138,6 +138,58 @@ def _run_inproc(mode, payload, rest, stdin_bytes, cwd, env):
     return rc, out_buf.getvalue(), err_buf.getvalue()
 
 
+class _StdinBuf(io.BytesIO):
+    """Writable stdin buffer. pip asserts ``proc.stdin`` then closes it; the PEP
+    517 hook passes its args via a control dir, not stdin, so we just retain
+    whatever (if anything) was written and hand it to the in-process run."""
+
+    saved = b""
+
+    def close(self):
+        try:
+            self.saved = self.getvalue()
+        except Exception:
+            pass
+        super().close()
+
+    def value(self):
+        try:
+            return self.getvalue()
+        except Exception:
+            return self.saved
+
+
+class _LazyReader:
+    """proc.stdout / proc.stderr proxy that triggers the (deferred) in-process
+    run on first read, so callers can write+close proc.stdin first."""
+
+    def __init__(self, popen, which):
+        self._p = popen
+        self._which = which
+
+    def _s(self):
+        self._p._ensure_ran()
+        return self._p._out_stream if self._which == "out" else self._p._err_stream
+
+    def read(self, *a):
+        return self._s().read(*a)
+
+    def readline(self, *a):
+        return self._s().readline(*a)
+
+    def readlines(self, *a):
+        return self._s().readlines(*a)
+
+    def __iter__(self):
+        return iter(self._s())
+
+    def close(self):
+        try:
+            self._s().close()
+        except Exception:
+            pass
+
+
 class _ShimPopen:
     """Popen-compatible object that runs our Python in-process (else defers to
     the real Popen, which raises the iOS 'no processes' error)."""
@@ -147,17 +199,9 @@ class _ShimPopen:
                  cwd=None, env=None, universal_newlines=None, startupinfo=None,
                  creationflags=0, restore_signals=True, start_new_session=False,
                  pass_fds=(), *, text=None, encoding=None, errors=None, **kwargs):
-        if shell:
-            # A shell command — argv[0] would be /bin/sh; not us.
-            self._real = _RealPopen(
-                args, bufsize=bufsize, executable=executable, stdin=stdin,
-                stdout=stdout, stderr=stderr, cwd=cwd, env=env,
-                universal_newlines=universal_newlines, text=text,
-                encoding=encoding, errors=errors, **kwargs)
-            return
         argv = shlex.split(args) if isinstance(args, str) else list(args)
         exe = executable or (argv[0] if argv else None)
-        if not _is_our_python(exe):
+        if shell or not _is_our_python(exe):
             self._real = _RealPopen(
                 args, bufsize=bufsize, executable=executable, stdin=stdin,
                 stdout=stdout, stderr=stderr, cwd=cwd, env=env,
@@ -168,47 +212,24 @@ class _ShimPopen:
         self._real = None
         self.args = args
         self.pid = -1
-        want_out = stdout == _sp.PIPE
-        want_err = stderr == _sp.PIPE
-        merge_err = stderr == _sp.STDOUT
-        self._text = bool(text or universal_newlines or encoding)
-        enc = encoding or "utf-8"
-        self._encoding = enc
-
-        # Run eagerly: pip's call_subprocess creates Popen(stdout=PIPE) then reads
-        # ``proc.stdout`` as a stream (not communicate()), so the streams must
-        # exist right after construction. Build subprocesses don't read stdin.
-        mode, payload, rest = _dispatch(argv[1:])
-        if mode == "none":
-            rc, ob, eb = 0, b"", b""
-        else:
-            rc, ob, eb = _run_inproc(mode, payload, rest, None, cwd, env)
-        self.returncode = rc
-        if merge_err:
-            ob, eb = ob + eb, b""
-
-        # Streams not captured by the caller inherit → echo to the session stdio.
-        if not want_out and ob:
-            try:
-                sys.stdout.write(ob.decode(enc, "replace"))
-                sys.stdout.flush()
-            except Exception:
-                pass
-        if not want_err and eb and not merge_err:
-            try:
-                sys.stderr.write(eb.decode(enc, "replace"))
-                sys.stderr.flush()
-            except Exception:
-                pass
-
-        def _stream(data):
-            return io.StringIO(data.decode(enc, "replace")) if self._text else io.BytesIO(data)
-
-        self.stdin = None
-        self.stdout = _stream(ob) if want_out else None
-        self.stderr = _stream(eb) if (want_err and not merge_err) else None
-        self._out_cache = ob if want_out else None
-        self._err_cache = eb if (want_err and not merge_err) else None
+        self.returncode = None
+        self._argv = argv
+        self._cwd = cwd
+        self._env = env
+        # subprocess is in text mode if ANY of text/encoding/errors/
+        # universal_newlines is set — `errors` alone (pip uses it) counts.
+        self._text = bool(text or universal_newlines or encoding or errors)
+        self._encoding = encoding or "utf-8"
+        self._want_out = stdout == _sp.PIPE
+        self._want_err = stderr == _sp.PIPE
+        self._merge_err = stderr == _sp.STDOUT
+        self._ran = False
+        self._out_stream = None
+        self._err_stream = None
+        # Deferred execution so pip can write+close proc.stdin before we run.
+        self.stdin = _StdinBuf() if stdin == _sp.PIPE else None
+        self.stdout = _LazyReader(self, "out") if self._want_out else None
+        self.stderr = _LazyReader(self, "err") if (self._want_err and not self._merge_err) else None
 
     # -- passthrough proxy when we delegated to the real Popen --
     def __getattr__(self, name):
@@ -217,27 +238,61 @@ class _ShimPopen:
             return getattr(real, name)
         raise AttributeError(name)
 
+    def _ensure_ran(self):
+        if self._ran:
+            return
+        self._ran = True
+        stdin_bytes = self.stdin.value() if isinstance(self.stdin, _StdinBuf) else None
+        if not stdin_bytes:
+            stdin_bytes = None
+        mode, payload, rest = _dispatch(self._argv[1:])
+        if mode == "none":
+            rc, ob, eb = 0, b"", b""
+        else:
+            rc, ob, eb = _run_inproc(mode, payload, rest, stdin_bytes, self._cwd, self._env)
+        self.returncode = rc
+        if self._merge_err:
+            ob, eb = ob + eb, b""
+        enc = self._encoding
+        if not self._want_out and ob:
+            try:
+                sys.stdout.write(ob.decode(enc, "replace"))
+                sys.stdout.flush()
+            except Exception:
+                pass
+        if not self._want_err and eb and not self._merge_err:
+            try:
+                sys.stderr.write(eb.decode(enc, "replace"))
+                sys.stderr.flush()
+            except Exception:
+                pass
+        self._out_cache = ob
+        self._err_cache = eb
+        self._out_stream = io.StringIO(ob.decode(enc, "replace")) if self._text else io.BytesIO(ob)
+        self._err_stream = io.StringIO(eb.decode(enc, "replace")) if self._text else io.BytesIO(eb)
+
     def communicate(self, input=None, timeout=None):
         if self._real is not None:
             return self._real.communicate(input, timeout)
-
-        def _val(cache):
-            if cache is None:
-                return None
-            return cache.decode(self._encoding, "replace") if self._text else cache
-        return (_val(self._out_cache), _val(self._err_cache))
+        if input is not None and isinstance(self.stdin, _StdinBuf) and not self._ran:
+            data = input if isinstance(input, (bytes, bytearray)) else input.encode(self._encoding)
+            self.stdin.saved = bytes(data)
+        self._ensure_ran()
+        enc = self._encoding
+        out = (self._out_cache.decode(enc, "replace") if self._text else self._out_cache) if self._want_out else None
+        err = (self._err_cache.decode(enc, "replace") if self._text else self._err_cache) if (self._want_err and not self._merge_err) else None
+        return (out, err)
 
     def wait(self, timeout=None):
         if self._real is not None:
             return self._real.wait(timeout)
-        if self.returncode is None:
-            self.communicate()
+        self._ensure_ran()
         return self.returncode
 
     def poll(self):
         if self._real is not None:
             return self._real.poll()
-        return self.returncode
+        return self.returncode if self._ran else None
 
     def __enter__(self):
         return self
