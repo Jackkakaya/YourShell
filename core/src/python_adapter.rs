@@ -83,10 +83,17 @@ fn ensure_pip_bootstrapped() {
     }
 }
 
-/// iOS disables per-user site-packages and the bundle is read-only, so a bare
-/// `pip install X` has nowhere to write and fails. Default installs to the
-/// writable site dir via `--target`, unless the user already chose a
-/// destination (`--target`/`-t`/`--prefix`/`--user`). Only touches `install`.
+/// The read-only app bundle isn't a writable install site, so a bare
+/// `pip install X` has nowhere to write. Default to `--user` (writable
+/// PYTHONUSERBASE, set by the host) UNLESS the user already chose a destination
+/// (`--target`/`-t`/`--prefix`/`--user`). Only touches `install`.
+///
+/// `--user` (not `--target`) is deliberate: `--target` isolates pip's resolver,
+/// so a dependency already provided by the read-only prebundled dir (e.g. numpy)
+/// gets reinstalled from source → meson build → fails on iOS. `--user` resolves
+/// against the whole environment, so prebundled numpy/pandas/lxml/… are seen as
+/// installed and skipped. Requires a non-isolated interpreter with user-site
+/// enabled (see python_host.c).
 fn inject_pip_target(argv: &mut Vec<String>) {
     if !argv.iter().any(|a| a == "install") {
         return;
@@ -97,12 +104,7 @@ fn inject_pip_target(argv: &mut Vec<String>) {
     if has_dest {
         return;
     }
-    if let Ok(site) = std::env::var("YOURSHELL_PY_SITE") {
-        if !site.trim().is_empty() {
-            argv.push("--target".into());
-            argv.push(site);
-        }
-    }
+    argv.push("--user".into());
 }
 
 fn exec_python(

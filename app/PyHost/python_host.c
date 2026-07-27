@@ -141,12 +141,20 @@ static int ys_python_ensure_init(void) {
     }
 
     PyConfig_InitIsolatedConfig(&config);
+    // Isolated config forces -I (= -s -E), which hard-disables user-site
+    // (sys.flags.no_user_site=1) regardless of user_site_directory. Turn isolated
+    // off and re-enable env so `pip install --user` works: --user resolves against
+    // the whole environment (so prebundled numpy/pandas/… are treated as installed
+    // and NOT rebuilt from source), installing new packages under PYTHONUSERBASE.
+    // Also lets the user's own PYTHONPATH take effect (a-Shell-like).
+    config.isolated = 0;
+    config.use_environment = 1;
     config.buffered_stdio = 0;          // session pipes want bytes immediately
     config.use_system_logger = 0;       // iOS default routes stdio to os_log;
                                         // we want the real fds (session pipes)
     config.write_bytecode = 0;          // bundle is signed/read-only
     config.install_signal_handlers = 0; // the shell owns signal handling
-    config.user_site_directory = 1;     // allow pip --user installs
+    config.user_site_directory = 1;     // enable pip --user installs
 
     const char *home = getenv("YOURSHELL_PYTHON_HOME");
     if (home != NULL) {
