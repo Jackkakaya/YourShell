@@ -101,10 +101,19 @@ fn inject_pip_target(argv: &mut Vec<String>) {
     let has_dest = argv.iter().any(|a| {
         a == "--target" || a == "-t" || a.starts_with("--target=") || a == "--prefix" || a == "--user"
     });
-    if has_dest {
-        return;
+    if !has_dest {
+        argv.push("--user".into());
     }
-    argv.push("--user".into());
+    // Force --no-build-isolation. iOS has no fork, so pip's build isolation runs
+    // a *nested* `pip install <build-deps>` (pip-in-pip) which is fragile in the
+    // in-process subprocess shim and dies silently (e.g. legacy setup.py packages
+    // like ppt). Instead use the prebundled build backends directly (setuptools/
+    // wheel/flit_core/hatchling are shipped and on sys.path), so the PEP 517
+    // build backend runs in-process without a nested pip. Skip if the user set it.
+    let has_iso = argv.iter().any(|a| a == "--no-build-isolation" || a == "--build-isolation");
+    if !has_iso {
+        argv.push("--no-build-isolation".into());
+    }
 }
 
 fn exec_python(
