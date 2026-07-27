@@ -168,16 +168,47 @@ class _ShimPopen:
         self._real = None
         self.args = args
         self.pid = -1
-        self.returncode = None
-        self.stdin = self.stdout = self.stderr = None
-        self._argv = argv
-        self._cwd = cwd
-        self._env = env
-        self._want_out = stdout == _sp.PIPE
-        self._want_err = stderr == _sp.PIPE
-        self._merge_err = stderr == _sp.STDOUT
+        want_out = stdout == _sp.PIPE
+        want_err = stderr == _sp.PIPE
+        merge_err = stderr == _sp.STDOUT
         self._text = bool(text or universal_newlines or encoding)
-        self._encoding = encoding or "utf-8"
+        enc = encoding or "utf-8"
+        self._encoding = enc
+
+        # Run eagerly: pip's call_subprocess creates Popen(stdout=PIPE) then reads
+        # ``proc.stdout`` as a stream (not communicate()), so the streams must
+        # exist right after construction. Build subprocesses don't read stdin.
+        mode, payload, rest = _dispatch(argv[1:])
+        if mode == "none":
+            rc, ob, eb = 0, b"", b""
+        else:
+            rc, ob, eb = _run_inproc(mode, payload, rest, None, cwd, env)
+        self.returncode = rc
+        if merge_err:
+            ob, eb = ob + eb, b""
+
+        # Streams not captured by the caller inherit → echo to the session stdio.
+        if not want_out and ob:
+            try:
+                sys.stdout.write(ob.decode(enc, "replace"))
+                sys.stdout.flush()
+            except Exception:
+                pass
+        if not want_err and eb and not merge_err:
+            try:
+                sys.stderr.write(eb.decode(enc, "replace"))
+                sys.stderr.flush()
+            except Exception:
+                pass
+
+        def _stream(data):
+            return io.StringIO(data.decode(enc, "replace")) if self._text else io.BytesIO(data)
+
+        self.stdin = None
+        self.stdout = _stream(ob) if want_out else None
+        self.stderr = _stream(eb) if (want_err and not merge_err) else None
+        self._out_cache = ob if want_out else None
+        self._err_cache = eb if (want_err and not merge_err) else None
 
     # -- passthrough proxy when we delegated to the real Popen --
     def __getattr__(self, name):
@@ -189,34 +220,12 @@ class _ShimPopen:
     def communicate(self, input=None, timeout=None):
         if self._real is not None:
             return self._real.communicate(input, timeout)
-        stdin_bytes = None
-        if input is not None:
-            stdin_bytes = input.encode(self._encoding) if isinstance(input, str) else input
-        mode, payload, rest = _dispatch(self._argv[1:])
-        if mode == "none":
-            self.returncode = 0
-            return (("" if self._text else b"") if self._want_out else None,
-                    ("" if self._text else b"") if (self._want_err) else None)
-        rc, ob, eb = _run_inproc(mode, payload, rest, stdin_bytes, self._cwd, self._env)
-        self.returncode = rc
-        if self._merge_err:
-            ob, eb = ob + eb, b""
-        # Non-captured streams inherit: echo to the real session stdio.
-        if not self._want_out and ob:
-            try:
-                sys.stdout.write(ob.decode(self._encoding, "replace"))
-                sys.stdout.flush()
-            except Exception:
-                pass
-        if not self._want_err and eb and not self._merge_err:
-            try:
-                sys.stderr.write(eb.decode(self._encoding, "replace"))
-                sys.stderr.flush()
-            except Exception:
-                pass
-        out = (ob.decode(self._encoding, "replace") if self._text else ob) if self._want_out else None
-        err = (eb.decode(self._encoding, "replace") if self._text else eb) if self._want_err else None
-        return (out, err)
+
+        def _val(cache):
+            if cache is None:
+                return None
+            return cache.decode(self._encoding, "replace") if self._text else cache
+        return (_val(self._out_cache), _val(self._err_cache))
 
     def wait(self, timeout=None):
         if self._real is not None:
