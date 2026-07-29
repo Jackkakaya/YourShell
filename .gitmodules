@@ -1,4 +1,4 @@
 [submodule "vendor/brush"]
 	path = vendor/brush
-	url = git@github.com:Jackkakaya/brush.git
+	url = https://github.com/Jackkakaya/brush.git
 	branch = ios-target-support
