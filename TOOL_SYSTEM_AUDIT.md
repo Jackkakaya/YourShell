@@ -5,9 +5,9 @@ Code snapshot: `a2cdddae7785ae75e19b866493fa5e8573fa11e6` plus this audit.
 The source of truth is `core/src/lib.rs::build_shell`, Brush's
 `default_builtins(BuiltinSet::BashMode)`, and
 `brush_coreutils_builtins::bundled_commands()`. The current iOS build exposes
-178 unique command names:
+174 unique command names:
 
-- 61 Brush Bash builtins
+- 57 Brush Bash builtins
 - 74 uutils/coreutils commands
 - 43 explicitly registered project/upstream/Host commands
 
@@ -30,7 +30,7 @@ Legend:
 | iOS Host | Rust command calls an app-installed UIKit/Vision callback | Correct boundary for clipboard, URL opening, OCR |
 | Resident runtime | Node/Python runtime stays alive; adapter sends each invocation and Session state | Correct iOS lifecycle direction, with runtime-specific package/process limits |
 
-## Brush Bash builtins — 61
+## Brush Bash builtins — 57
 
 | Command | Integration | Result | Notes |
 |---|---|---|---|
@@ -51,11 +51,9 @@ Legend:
 | `continue` | Brush special builtin | OK | Mutates current control flow |
 | `declare` | Brush declaration builtin | OK | Current Shell variables/attributes |
 | `dirs` | Brush directory-stack builtin | OK | Session-local directory stack |
-| `disown` | Brush `UnimplementedCommand` | NO | Name is registered but implementation is explicitly absent |
 | `echo` | Brush builtin | OK | Kept over uutils so Shell semantics and no global lock win |
 | `enable` | Brush builtin | OK | Session builtin enable/disable state |
 | `eval` | Brush special builtin | OK | Evaluates in current Shell |
-| `exec` | Brush Unix builtin | NO | No-argument form works, but command form tries OS `exec`; replacing an iOS app process is not a supported command model |
 | `exit` | Brush special builtin | OK | Exits Shell/Session, not the host app process |
 | `export` | Brush declaration builtin | OK | Correctly mutates current Session environment |
 | `false` | Brush builtin | OK | Correct status without Host overhead |
@@ -69,7 +67,6 @@ Legend:
 | `kill` | Brush Unix builtin | PARTIAL | Brush jobs/signals only; arbitrary PID signalling is inappropriate and potentially dangerous in an app |
 | `let` | Brush builtin | OK | Current Shell arithmetic/variables |
 | `local` | Brush declaration builtin | OK | Function-local variables |
-| `logout` | Brush `UnimplementedCommand` | NO | Name is registered but implementation is explicitly absent |
 | `mapfile` | Brush builtin | OK | Reads through Session stdin and updates Shell arrays |
 | `popd` | Brush directory-stack builtin | OK | Session-local |
 | `printf` | Brush builtin | OK | Kept over uutils for Shell semantics |
@@ -83,7 +80,6 @@ Legend:
 | `shift` | Brush special builtin | OK | Current positional arguments |
 | `shopt` | Brush builtin | OK | Current Shell options |
 | `source` | Brush `dot` alias | OK | Sources into current Shell |
-| `suspend` | Brush Unix signal builtin | NO | Sends `SIGTSTP` to the app process; wrong lifecycle operation for iOS |
 | `test` | Brush builtin | OK | Kept over uutils for Shell semantics |
 | `times` | Brush builtin | PARTIAL | Process accounting is of limited meaning without child processes |
 | `trap` | Brush special builtin | PARTIAL | Shell traps work; Unix signal coverage is constrained by the iOS app host |
@@ -264,16 +260,14 @@ The command-selection and argv-forwarding direction now mostly matches the
 intended architecture. It is not yet accurate to say the tool system as a
 whole is finished:
 
-1. Remove or replace misleading/unsafe registered builtins: `disown`,
-   `logout`, command-form `exec`, and `suspend`.
-2. Split Process Host isolation by Session or replace it with injected
+1. Split Process Host isolation by Session or replace it with injected
    cwd/env/stdio entry points. Today one `cat`, `sleep`, `tail -f`, curl
    transfer, or Python invocation can serialize unrelated Sessions.
-3. Wire cooked-mode Ctrl-C to `ashell_cancel`, and do not report a command
+2. Wire cooked-mode Ctrl-C to `ashell_cancel`, and do not report a command
    finished while its blocking worker is still running against global state.
-4. Decide compatibility contracts for all `PARTIAL` branded commands. The
+3. Decide compatibility contracts for all `PARTIAL` branded commands. The
    most misleading names today are `nano`, `vi`, `wget`, `git`, `ssh`,
    `sftp`, `scp`, and `mosh`.
-5. Add permanent simulator/device tests for Node, SSH/SFTP/SCP, mosh-server
+4. Add permanent simulator/device tests for Node, SSH/SFTP/SCP, mosh-server
    interoperability, cancellation, background/resume, and multi-Session
    overlap.

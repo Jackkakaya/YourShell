@@ -48,7 +48,7 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
-use brush_builtins::{BuiltinSet, ShellBuilderExt};
+use brush_builtins::BuiltinSet;
 use brush_core::builtins as core_builtins;
 use brush_core::extensions::DefaultShellExtensions;
 use brush_core::openfiles::OpenFile;
@@ -121,8 +121,18 @@ pub(crate) async fn build_shell(
     fds: HashMap<brush_core::ShellFd, OpenFile>,
     working_dir: &std::path::Path,
 ) -> Result<brush_core::Shell, brush_core::Error> {
+    let mut bash_builtins =
+        brush_builtins::default_builtins::<DefaultShellExtensions>(BuiltinSet::BashMode);
+    // These Unix process/job-control commands are either explicitly
+    // unimplemented by Brush or fundamentally wrong for an iOS app host.
+    // Remove them from the registry entirely so lookup, help and completion do
+    // not advertise functionality that YourShell cannot safely provide.
+    for unsupported in ["disown", "logout", "exec", "suspend"] {
+        bash_builtins.remove(unsupported);
+    }
+
     let mut builder = brush_core::Shell::builder()
-        .default_builtins(BuiltinSet::BashMode)
+        .builtins(bash_builtins)
         .builtin("grep", grep_adapter::registration())
         .builtin("egrep", grep_adapter::registration())
         .builtin("fgrep", grep_adapter::registration())

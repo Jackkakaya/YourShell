@@ -107,12 +107,16 @@ pub static CASES: &[Case] = &[
     case!("wait-noargs", "wait; echo wait-rc=$?", Eq("wait-rc=0")),
     case!("times", "times > /dev/null; echo times-rc=$?", Eq("times-rc=0")),
     case!("trap-set-list", "trap 'true' INT; tl=$(trap); [[ $tl == *INT* ]] && echo has-INT; trap - INT", Has("has-INT")),
-    case!("exec-noargs", "exec; echo exec-ok", Eq("exec-ok")),
     case!("help", "help > /dev/null 2>&1; echo help-rc=$?", Eq("help-rc=0")),
     case!("history-noerror", "history > /dev/null 2>&1; echo h-rc=$?", Has("h-rc=")),
     case!("pushd-popd", "mkdir -p pdt; pushd pdt > /dev/null && popd > /dev/null && echo pp-ok", Eq("pp-ok")),
     case!("dirs", "dirs | wc -l", Eq("1")),
-    case!("interactive-builtins-exist", "type bg fg jobs suspend disown bind enable fc caller compgen complete compopt kill ulimit set unset return break continue exit read > /dev/null; echo all-exist=$?", Eq("all-exist=0")),
+    case!("interactive-builtins-exist", "type bg fg jobs bind enable fc caller compgen complete compopt kill ulimit set unset return break continue exit read > /dev/null; echo all-exist=$?", Eq("all-exist=0")),
+    case!(
+        "unsupported-builtins-absent",
+        "for c in disown logout exec suspend; do if type \"$c\" >/dev/null 2>&1; then echo present:$c; fi; done; echo done",
+        Eq("done")
+    ),
     // ---- custom in-process commands ----
     case!("grep-basic", "grep fork poem.txt", Eq("no fork, no exec — and yet")),
     case!("egrep-alias", "printf 'ab\nac\n' | egrep 'a[bc]'", Eq("ab\nac")),
