@@ -28,6 +28,14 @@ fail() {
     failures=$((failures + 1))
 }
 
+if [[ "$PLATFORM" == "iphoneos" ]] && [[ -d "$APP/PythonResources/wheels" ]]; then
+    fail "device app contains duplicate/off-platform Python wheel cache"
+fi
+
+while IFS= read -r wheel; do
+    fail "wrong-platform Python wheel: ${wheel#$APP/}"
+done < <(find "$APP" -type f -name "*-${FORBIDDEN_SUFFIX}.whl" -print)
+
 while IFS= read -r wrong; do
     fail "wrong-platform Python extension filename: ${wrong#$APP/}"
 done < <(find "$APP" -type f -name "*cpython-*-${FORBIDDEN_SUFFIX}.so" -print)

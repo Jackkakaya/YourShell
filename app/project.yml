@@ -19,17 +19,24 @@ targets:
           set -euo pipefail
           export PATH="/Users/$USER/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
           case "$PLATFORM_NAME" in
-            iphonesimulator) RUST_TARGET="aarch64-apple-ios-sim" ;;
-            iphoneos) RUST_TARGET="aarch64-apple-ios" ;;
+            iphonesimulator) YOURSHELL_PLATFORM="sim" ;;
+            iphoneos) YOURSHELL_PLATFORM="device" ;;
             *) echo "Unsupported Apple platform: $PLATFORM_NAME" >&2; exit 1 ;;
           esac
-          cd "$PROJECT_DIR/../core"
-          cargo build --target "$RUST_TARGET" --release --features python,node,vision
+          YOURSHELL_IOS_DEPLOYMENT_TARGET="$IPHONEOS_DEPLOYMENT_TARGET" \
+          YOURSHELL_CARGO_FEATURES="python,node,vision" \
+            "$PROJECT_DIR/../scripts/build-ios.sh" "$YOURSHELL_PLATFORM"
     postBuildScripts:
       - name: Prepare python-ios-lib native extensions
         basedOnDependencyAnalysis: false
         shell: /bin/bash
         path: Scripts/prepare-python-ios-lib.sh
+      - name: Prune platform-incompatible runtime assets
+        basedOnDependencyAnalysis: false
+        script: |
+          "$PROJECT_DIR/Scripts/prune-ios-runtime.sh" \
+            "$BUILT_PRODUCTS_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH" \
+            "$PLATFORM_NAME"
     sources:
       - App
       - PyHost

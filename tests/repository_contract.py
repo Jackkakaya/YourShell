@@ -103,10 +103,12 @@ class RepositoryContractTests(unittest.TestCase):
         bootstrap = ROOT / "scripts/bootstrap-ios.sh"
         build = ROOT / "scripts/build-ios.sh"
         manifest = ROOT / "scripts/ios-runtime.env"
-        for path in (bootstrap, build, manifest):
+        prune = ROOT / "app/Scripts/prune-ios-runtime.sh"
+        for path in (bootstrap, build, manifest, prune):
             self.assertTrue(path.is_file(), path)
         self.assertTrue(os.access(bootstrap, os.X_OK))
         self.assertTrue(os.access(build, os.X_OK))
+        self.assertTrue(os.access(prune, os.X_OK))
 
         values = {}
         for line in manifest.read_text(encoding="utf-8").splitlines():
@@ -130,12 +132,23 @@ class RepositoryContractTests(unittest.TestCase):
             self.assertIn(required, bootstrap_text)
 
     def test_ios_scripts_have_valid_shell_syntax(self) -> None:
-        for script in ("scripts/bootstrap-ios.sh", "scripts/build-ios.sh"):
+        for script in (
+            "scripts/bootstrap-ios.sh",
+            "scripts/build-ios.sh",
+            "app/Scripts/prune-ios-runtime.sh",
+            "app/Scripts/verify-ios-app.sh",
+        ):
             subprocess.run(
                 ["bash", "-n", str(ROOT / script)],
                 cwd=ROOT,
                 check=True,
             )
+
+    def test_ios_project_uses_canonical_runtime_scripts(self) -> None:
+        project = (ROOT / "app/project.yml").read_text(encoding="utf-8")
+        self.assertIn("scripts/build-ios.sh", project)
+        self.assertIn("Scripts/prune-ios-runtime.sh", project)
+        self.assertIn("YOURSHELL_IOS_DEPLOYMENT_TARGET", project)
 
 
 if __name__ == "__main__":
