@@ -2,7 +2,7 @@
 The main entry point into ripgrep.
 */
 
-use std::{io::Write, process::ExitCode};
+use std::{cell::Cell, io::Write, process::ExitCode};
 
 use ignore::WalkState;
 
@@ -38,6 +38,41 @@ mod search;
 #[cfg(all(target_env = "musl", target_pointer_width = "64"))]
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+thread_local! {
+    static STDIN_IS_INTERACTIVE_OVERRIDE: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+pub(crate) fn is_readable_stdin() -> bool {
+    STDIN_IS_INTERACTIVE_OVERRIDE
+        .get()
+        .map_or_else(grep::cli::is_readable_stdin, |interactive| !interactive)
+}
+
+/// Run ripgrep with an embedding host's authoritative stdin classification.
+///
+/// Process-shaped hosts frequently expose an interactive terminal through a
+/// pipe. Ripgrep's normal process heuristic then mistakes `rg pattern` for
+/// piped input and searches stdin instead of the working directory. The
+/// override is thread-local and scoped to this call, so the regular CLI entry
+/// point keeps its original behavior.
+pub fn run_with_stdin_is_interactive<I, T>(args: I, interactive: bool) -> ExitCode
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString>,
+{
+    struct Reset(Option<bool>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            STDIN_IS_INTERACTIVE_OVERRIDE.set(self.0);
+        }
+    }
+
+    let reset = Reset(STDIN_IS_INTERACTIVE_OVERRIDE.replace(Some(interactive)));
+    let code = run(args);
+    drop(reset);
+    code
+}
 
 /// Then, as it was, then again it will be.
 pub fn run<I, T>(args: I) -> ExitCode

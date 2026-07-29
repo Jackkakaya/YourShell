@@ -20,7 +20,10 @@ fn content(
 fn ripgrep_main(ctx: &command_host::CmdCtx<'_>) -> i32 {
     // Upstream expects the iterator after argv[0], exactly as its former
     // std::env::args_os().skip(1) did.
-    let code = ripgrep_cli::run(ctx.argv.iter().skip(1));
+    let code = ripgrep_cli::run_with_stdin_is_interactive(
+        ctx.argv.iter().skip(1),
+        ctx.stdin_is_interactive,
+    );
     if code == ExitCode::SUCCESS {
         0
     } else if code == ExitCode::from(1) {

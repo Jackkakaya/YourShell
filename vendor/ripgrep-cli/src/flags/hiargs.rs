@@ -1110,7 +1110,7 @@ impl Paths {
         // mode, but there really is no good way to mitigate it. It's just a
         // consequence of letting the user type 'rg foo' and "guessing" that
         // they meant to search the CWD.
-        let is_readable_stdin = grep::cli::is_readable_stdin();
+        let is_readable_stdin = crate::is_readable_stdin();
         let use_cwd = !is_readable_stdin
             || state.stdin_consumed
             || !matches!(low.mode, Mode::Search(_));
