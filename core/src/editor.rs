@@ -83,6 +83,7 @@ struct Editor {
     path: Option<PathBuf>,
     dirty: bool,
     status: String,
+    modeless: bool,
     clipboard: Option<String>,
     quit: bool,
     mode: Mode,
@@ -141,6 +142,7 @@ impl Editor {
             } else {
                 format!("{name} — press i to insert, :w to save, :q to quit")
             },
+            modeless,
             clipboard: None,
             quit: false,
             mode: if modeless { Mode::Insert } else { Mode::Normal },
@@ -242,7 +244,7 @@ impl Editor {
         match b {
             0x1B => {
                 // Esc: back to Normal (unless modeless/nano — Esc does nothing there)
-                if self.status.contains("nano") {
+                if self.modeless {
                     // consume a possible arrow escape
                     self.handle_escape(stdin)?;
                 } else {
@@ -254,7 +256,7 @@ impl Editor {
                 }
             }
             0x13 => self.save(), // Ctrl-S works in both styles
-            0x11 | 0x18 if self.status.contains("nano") => {
+            0x11 | 0x18 if self.modeless => {
                 if self.dirty {
                     self.status = "^S to save, ^Q again to discard".to_string();
                     self.dirty = false;
@@ -1208,5 +1210,114 @@ mod tests {
         let mut e = Editor::new(Some(PathBuf::from("data.unknownext")), 24, 80, false);
         e.lines = vec!["let x = 42".to_string()];
         assert_eq!(e.highlight_line("let x = 42"), "let x = 42");
+    }
+
+    #[test]
+    fn full_event_loop_inserts_unicode_saves_and_restores_screen() {
+        let path = std::env::temp_dir().join(format!(
+            "yourshell-editor-test-{}-{:?}.rs",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let mut e = Editor::new(Some(path.clone()), 4, 24, false);
+        let mut keys = b"ihello\n".to_vec();
+        keys.extend_from_slice("世界".as_bytes());
+        keys.push(ESC);
+        keys.extend_from_slice(b":wq\n");
+        let mut input = Cursor::new(keys);
+        let mut output = Vec::new();
+
+        e.run(&mut input, &mut output).unwrap();
+
+        assert!(e.quit);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\n世界\n");
+        assert!(output.starts_with(b"\x1b[?1049h"));
+        assert!(output.ends_with(b"\x1b[?1049l"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn normal_mode_editing_commands_cover_yank_paste_change_and_open_lines() {
+        let mut e = ed(&["  alpha beta", "gamma"]);
+        drive(&mut e, b"yyjpPggI>");
+        drive(&mut e, &[ESC]);
+        drive(&mut e, b"G0cwlast");
+        drive(&mut e, &[ESC]);
+        drive(&mut e, b"Oabove");
+        drive(&mut e, &[ESC]);
+        drive(&mut e, b"obelow");
+        drive(&mut e, &[ESC]);
+
+        assert!(e.lines.iter().any(|line| line == "above"));
+        assert!(e.lines.iter().any(|line| line == "below"));
+        assert!(e.lines.iter().any(|line| line.contains(">alpha")));
+        assert!(e.dirty);
+    }
+
+    #[test]
+    fn arrows_boundaries_search_and_empty_undo_redo_are_safe() {
+        let mut e = ed(&["one", "two target", "three"]);
+        e.do_undo();
+        assert_eq!(e.status, "already at oldest change");
+        e.do_redo();
+        assert_eq!(e.status, "already at newest change");
+
+        drive(&mut e, &[ESC, b'[', b'B', ESC, b'[', b'C']);
+        assert_eq!((e.cy, e.cx), (1, 1));
+        drive(&mut e, &[ESC, b'[', b'H', ESC, b'[', b'F']);
+        assert_eq!(e.cx, e.cur_len());
+        drive(&mut e, b"/target\nNn");
+        assert_eq!(e.cy, 1);
+        e.last_search = "absent".into();
+        e.search_repeat(true);
+        assert!(e.status.contains("not found"));
+    }
+
+    #[test]
+    fn command_mode_handles_cancel_backspace_unknown_and_unsaved_quit() {
+        let mut e = ed(&["dirty"]);
+        e.dirty = true;
+        drive(&mut e, b":q\n");
+        assert!(!e.quit);
+        assert!(e.status.contains("unsaved"));
+        drive(&mut e, b":wat\x7f\x7f\x7f\x7f");
+        assert!(e.mode == Mode::Normal);
+        drive(&mut e, b":nope\n");
+        assert!(e.status.contains("unknown command"));
+        drive(&mut e, b":");
+        drive(&mut e, &[ESC]);
+        assert!(e.mode == Mode::Normal);
+        drive(&mut e, b":q!\n");
+        assert!(e.quit);
+    }
+
+    #[test]
+    fn modeless_exit_requires_confirmation_and_no_filename_save_reports_error() {
+        let mut e = Editor::new(None, 4, 20, true);
+        drive(&mut e, b"x");
+        drive(&mut e, &[0x13]);
+        assert!(e.status.contains("no filename"));
+        drive(&mut e, &[0x11]);
+        assert!(!e.quit);
+        drive(&mut e, &[0x11]);
+        assert!(e.quit);
+    }
+
+    #[test]
+    fn syntax_profiles_and_unicode_offsets_cover_supported_extensions() {
+        for name in [
+            "a.rs", "a.pyw", "a.tsx", "a.swift", "a.go", "a.bashrc", "a.toml",
+        ] {
+            assert!(detect_ft(std::path::Path::new(name)).is_some(), "{name}");
+        }
+        assert!(detect_ft(std::path::Path::new("README")).is_none());
+        assert_eq!(char_to_byte("a世界", 0), 0);
+        assert_eq!(char_to_byte("a世界", 2), 4);
+        assert_eq!(char_to_byte("a世界", 99), "a世界".len());
+
+        let js = Editor::new(Some(PathBuf::from("a.js")), 4, 40, false);
+        let painted = js.highlight_line("const s = `x\\`y`; // note");
+        assert!(painted.contains("\x1b[38;5;114m"));
+        assert!(painted.contains("\x1b[38;5;245m"));
     }
 }
