@@ -21,8 +21,31 @@ const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
 const Module = require('module');
+const crypto = require('crypto');
 
 const PORT_FILE = process.env.YS_NODE_PORT_FILE;
+
+// --- connection authentication -------------------------------------------
+// iOS does NOT isolate loopback between apps: any other app on the device can
+// connect to this port. Since a request is "run this argv in Node", an
+// unauthenticated listener is remote code execution inside our sandbox. Every
+// request must carry the per-launch secret the host puts in YS_NODE_TOKEN.
+//
+// Fail CLOSED: no token in the environment means we serve nobody. (A unix
+// socket would avoid the shared namespace entirely, but sockaddr_un.sun_path
+// is 104 bytes and the simulator's container path alone exceeds that; the
+// long-term fix is a socketpair fd handed over at node_start.)
+const AUTH_TOKEN = process.env.YS_NODE_TOKEN || '';
+const AUTH_TOKEN_BUF = Buffer.from(AUTH_TOKEN, 'utf8');
+
+function tokenOk(tok) {
+  if (!AUTH_TOKEN || typeof tok !== 'string') return false;
+  const given = Buffer.from(tok, 'utf8');
+  // timingSafeEqual throws on length mismatch, so check length first — the
+  // length of a rejected guess is not a useful oracle here.
+  if (given.length !== AUTH_TOKEN_BUF.length) return false;
+  return crypto.timingSafeEqual(given, AUTH_TOKEN_BUF);
+}
 
 // libuv's uv_set_process_title crashes on iOS (it pokes argv/sysctl memory),
 // and npm/yarn set process.title. Make it an inert property up front.
@@ -194,7 +217,15 @@ const server = net.createServer((sock) => {
       handled = true;
       const line = buf.slice(0, nl);
       try {
-        runRequest(JSON.parse(line), sock);
+        const req = JSON.parse(line);
+        // Unauthenticated peer (another app on the device, or our own core
+        // running without the token): drop it silently. No error frame — an
+        // unauthenticated caller learns nothing, not even that it parsed.
+        if (!tokenOk(req.tok)) {
+          sock.destroy();
+          return;
+        }
+        runRequest(req, sock);
       } catch (e) {
         sock.write(JSON.stringify({ e: b64('dispatch error: ' + e + '\n') }) + '\n');
         sock.write(JSON.stringify({ exit: 1 }) + '\n');

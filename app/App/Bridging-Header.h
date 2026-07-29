@@ -33,4 +33,11 @@ void ashell_capture_free(ashell_capture_result *result);
 
 void ys_node_start_resident(const char *main_js_path);
 
+typedef int32_t (*ashell_ios_copy_cb)(const uint8_t *bytes, size_t len);
+typedef void (*ashell_ios_paste_output_cb)(void *ctx, const uint8_t *bytes, size_t len);
+typedef int32_t (*ashell_ios_paste_cb)(void *ctx, ashell_ios_paste_output_cb output);
+typedef int32_t (*ashell_ios_open_cb)(const uint8_t *bytes, size_t len);
+int32_t ashell_ios_host_install(ashell_ios_copy_cb copy, ashell_ios_paste_cb paste,
+                                ashell_ios_open_cb open);
+
 #endif

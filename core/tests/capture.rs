@@ -29,8 +29,12 @@ fn capture(session: *mut Session, cmd: &str, timeout_ms: u64) -> (i32, String, S
     let res = ashell_run_capture(session, c.as_ptr(), timeout_ms);
     assert!(!res.is_null(), "capture returned null for `{cmd}`");
     let r: &CaptureResult = unsafe { &*res };
-    let stdout = unsafe { CStr::from_ptr(r.stdout) }.to_string_lossy().into_owned();
-    let stderr = unsafe { CStr::from_ptr(r.stderr) }.to_string_lossy().into_owned();
+    let stdout = unsafe { CStr::from_ptr(r.stdout) }
+        .to_string_lossy()
+        .into_owned();
+    let stderr = unsafe { CStr::from_ptr(r.stderr) }
+        .to_string_lossy()
+        .into_owned();
     let code = r.exit_code;
     ashell_capture_free(res);
     (code, stdout, stderr)
@@ -47,7 +51,11 @@ fn capture_and_cancel_ffi() {
     assert_eq!(stderr.trim(), "err");
 
     // 2. Large output (>a pipe buffer) is fully captured — no deadlock.
-    let (code, stdout, _) = capture(s, "for i in $(seq 4000); do echo LINE-$i-0123456789; done", 20000);
+    let (code, stdout, _) = capture(
+        s,
+        "for i in $(seq 4000); do echo LINE-$i-0123456789; done",
+        20000,
+    );
     assert_eq!(code, 0);
     assert_eq!(stdout.lines().count(), 4000);
     assert!(stdout.contains("LINE-4000-"));

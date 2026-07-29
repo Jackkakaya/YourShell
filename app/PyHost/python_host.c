@@ -52,13 +52,18 @@ static const char *YS_DRIVER =
     "    _ys_os.makedirs(_ys_site, exist_ok=True)\n"
     "    if _ys_site not in sys.path:\n"
     "        sys.path.insert(0, _ys_site)\n"
+    "_ys_legacy = _ys_os.environ.get('YOURSHELL_PY_LEGACY_SITE')\n"
+    "if _ys_legacy and _ys_os.path.isdir(_ys_legacy) and _ys_legacy not in sys.path:\n"
+    "    sys.path.append(_ys_legacy)\n"
     // Read-only prebundled site shipped inside the app (cross-compiled iOS
     // wheels: lxml/Pillow + pure-Python office libs). No makedirs (bundle is
     // read-only); appended after the writable site so a user pip-installed copy
     // wins over the bundled one.
     "_ys_pre = _ys_os.environ.get('YOURSHELL_PY_PREBUNDLED')\n"
-    "if _ys_pre and _ys_os.path.isdir(_ys_pre) and _ys_pre not in sys.path:\n"
-    "    sys.path.append(_ys_pre)\n"
+    "if _ys_pre:\n"
+    "    for _ys_pre_dir in _ys_pre.split(_ys_os.pathsep):\n"
+    "        if _ys_os.path.isdir(_ys_pre_dir) and _ys_pre_dir not in sys.path:\n"
+    "            sys.path.append(_ys_pre_dir)\n"
     // sys.executable: iOS has no python binary. pip builds spawn commands as
     // [sys.executable, ...]; point it at a stub (created so os.path.exists passes)
     // so the in-process subprocess shim recognizes 'run our python' and diverts
@@ -108,7 +113,20 @@ static const char *YS_DRIVER =
     "            return 2\n"
     "        import runpy\n"
     "        sys.argv = [args[1]] + args[2:]\n"
-    "        runpy.run_module(args[1], run_name='__main__', alter_sys=True)\n"
+    // pip 26 installs a sys audit hook during `install` which cannot be
+    // removed afterwards. In embedded CPython that hook survives into later
+    // commands and emits a warning for every third-party import. A standalone
+    // pip process would exit immediately, so suppress hook registration only
+    // for the process-emulated pip invocation.
+    "        if args[1] == 'pip':\n"
+    "            _ys_addaudit = sys.addaudithook\n"
+    "            sys.addaudithook = lambda _hook: None\n"
+    "            try:\n"
+    "                runpy.run_module(args[1], run_name='__main__', alter_sys=True)\n"
+    "            finally:\n"
+    "                sys.addaudithook = _ys_addaudit\n"
+    "        else:\n"
+    "            runpy.run_module(args[1], run_name='__main__', alter_sys=True)\n"
     "        return 0\n"
     "    import runpy\n"
     "    sys.argv = args\n"
@@ -133,7 +151,10 @@ static int ys_python_ensure_init(void) {
     PyPreConfig preconfig;
     PyConfig config;
 
-    PyPreConfig_InitIsolatedConfig(&preconfig);
+    // User-site must be enabled at pre-initialization time too. Combining an
+    // isolated preconfig with a non-isolated PyConfig leaves
+    // sys.flags.no_user_site set, making pip --user reject a writable sandbox.
+    PyPreConfig_InitPythonConfig(&preconfig);
     preconfig.utf8_mode = 1;
     status = Py_PreInitialize(&preconfig);
     if (PyStatus_Exception(status)) {

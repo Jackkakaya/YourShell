@@ -46,7 +46,11 @@ impl builtins::Command for EditorCommand {
         let modeless = matches!(context.command_name.as_str(), "edit" | "nano");
         let path = self.file.as_ref().map(|f| {
             let p = PathBuf::from(f);
-            if p.is_absolute() { p } else { cwd.join(p) }
+            if p.is_absolute() {
+                p
+            } else {
+                cwd.join(p)
+            }
         });
 
         // Terminal size from COLUMNS/LINES (the session sets them); default 24x80.
@@ -120,7 +124,11 @@ impl Editor {
             .map_or_else(|| "[new]".to_string(), |p| p.display().to_string());
         let filetype = path.as_ref().and_then(|p| detect_ft(p));
         Self {
-            lines: if lines.is_empty() { vec![String::new()] } else { lines },
+            lines: if lines.is_empty() {
+                vec![String::new()]
+            } else {
+                lines
+            },
             cx: 0,
             cy: 0,
             row_off: 0,
@@ -152,12 +160,7 @@ impl Editor {
         // Bound memory by a budget, not a fixed snapshot count: each snapshot is
         // a full clone of the buffer, so a large file needs far fewer snapshots
         // to stay within ~8 MiB. (A count-only cap could reach hundreds of MB.)
-        let file_bytes = self
-            .lines
-            .iter()
-            .map(|l| l.len() + 1)
-            .sum::<usize>()
-            .max(1);
+        let file_bytes = self.lines.iter().map(|l| l.len() + 1).sum::<usize>().max(1);
         let max_snapshots = (8 * 1024 * 1024 / file_bytes).clamp(16, 500);
         while self.undo.len() > max_snapshots {
             self.undo.remove(0);
@@ -687,7 +690,10 @@ impl Editor {
                 bytes.push(b[0]);
             }
         }
-        Ok(String::from_utf8_lossy(&bytes).chars().next().unwrap_or('?'))
+        Ok(String::from_utf8_lossy(&bytes)
+            .chars()
+            .next()
+            .unwrap_or('?'))
     }
 
     fn handle_escape(&mut self, stdin: &mut impl Read) -> std::io::Result<()> {
@@ -942,30 +948,129 @@ const KW_PY: &[&str] = &[
     "with", "yield",
 ];
 const KW_JS: &[&str] = &[
-    "async", "await", "break", "case", "catch", "class", "const", "continue", "default", "delete",
-    "do", "else", "export", "extends", "false", "finally", "for", "function", "if", "import", "in",
-    "instanceof", "let", "new", "null", "of", "return", "super", "switch", "this", "throw", "true",
-    "try", "typeof", "var", "void", "while", "yield",
+    "async",
+    "await",
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "default",
+    "delete",
+    "do",
+    "else",
+    "export",
+    "extends",
+    "false",
+    "finally",
+    "for",
+    "function",
+    "if",
+    "import",
+    "in",
+    "instanceof",
+    "let",
+    "new",
+    "null",
+    "of",
+    "return",
+    "super",
+    "switch",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "typeof",
+    "var",
+    "void",
+    "while",
+    "yield",
 ];
 const KW_C: &[&str] = &[
-    "auto", "break", "case", "char", "const", "continue", "default", "do", "double", "else", "enum",
-    "extern", "float", "for", "goto", "if", "int", "long", "register", "return", "short", "signed",
-    "sizeof", "static", "struct", "switch", "typedef", "union", "unsigned", "void", "volatile",
-    "while", "bool", "class", "namespace", "new", "delete", "public", "private", "template",
+    "auto",
+    "break",
+    "case",
+    "char",
+    "const",
+    "continue",
+    "default",
+    "do",
+    "double",
+    "else",
+    "enum",
+    "extern",
+    "float",
+    "for",
+    "goto",
+    "if",
+    "int",
+    "long",
+    "register",
+    "return",
+    "short",
+    "signed",
+    "sizeof",
+    "static",
+    "struct",
+    "switch",
+    "typedef",
+    "union",
+    "unsigned",
+    "void",
+    "volatile",
+    "while",
+    "bool",
+    "class",
+    "namespace",
+    "new",
+    "delete",
+    "public",
+    "private",
+    "template",
 ];
 const KW_GO: &[&str] = &[
-    "break", "case", "chan", "const", "continue", "default", "defer", "else", "fallthrough", "for",
-    "func", "go", "goto", "if", "import", "interface", "map", "package", "range", "return", "select",
-    "struct", "switch", "type", "var", "nil", "true", "false",
+    "break",
+    "case",
+    "chan",
+    "const",
+    "continue",
+    "default",
+    "defer",
+    "else",
+    "fallthrough",
+    "for",
+    "func",
+    "go",
+    "goto",
+    "if",
+    "import",
+    "interface",
+    "map",
+    "package",
+    "range",
+    "return",
+    "select",
+    "struct",
+    "switch",
+    "type",
+    "var",
+    "nil",
+    "true",
+    "false",
 ];
 const KW_SH: &[&str] = &[
-    "if", "then", "else", "elif", "fi", "case", "esac", "for", "while", "until", "do", "done", "in",
-    "function", "select", "return", "export", "local", "readonly", "declare", "echo", "cd", "exit",
+    "if", "then", "else", "elif", "fi", "case", "esac", "for", "while", "until", "do", "done",
+    "in", "function", "select", "return", "export", "local", "readonly", "declare", "echo", "cd",
+    "exit",
 ];
 
 /// Pick a syntax profile from the file extension.
 fn detect_ft(path: &std::path::Path) -> Option<Ft> {
-    let ext = path.extension().and_then(|e| e.to_str())?.to_ascii_lowercase();
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())?
+        .to_ascii_lowercase();
     let (line_comment, keywords, backtick): (&str, &[&str], bool) = match ext.as_str() {
         "rs" => ("//", KW_RUST, false),
         "py" | "pyw" => ("#", KW_PY, false),

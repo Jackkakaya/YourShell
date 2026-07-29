@@ -1,5 +1,5 @@
 //! Interactive `ssh` client, backed by the pure-Rust russh library (Apache-2.0,
-//! `ring` crypto backend so it cross-compiles to iOS like ureq/rustls).
+//! `ring` crypto backend so it cross-compiles cleanly to iOS).
 //!
 //! Unlike the uutils/awk/python adapters this does NOT touch process-global
 //! stdio or the `process_state_lock`: russh reads and writes the session's fds
@@ -336,7 +336,12 @@ pub(crate) async fn key_and_env_auth(
         let Ok(key) = load_secret_key(&path, None) else {
             continue; // encrypted or unreadable — skip
         };
-        let hash = session.best_supported_rsa_hash().await.ok().flatten().flatten();
+        let hash = session
+            .best_supported_rsa_hash()
+            .await
+            .ok()
+            .flatten()
+            .flatten();
         if let Ok(res) = session
             .authenticate_publickey(user, PrivateKeyWithHashAlg::new(Arc::new(key), hash))
             .await
@@ -365,7 +370,10 @@ async fn run_session(opts: Opts, fd0: OwnedFd, fd1: OwnedFd, fd2: OwnedFd) -> u8
     // path once it's armed, so an error after entering the alt screen (e.g. a
     // PTY/shell request rejected by the server) can never strand the local
     // terminal in raw + alt-screen mode.
-    let mut term = TermRestore { raw1, active: false };
+    let mut term = TermRestore {
+        raw1,
+        active: false,
+    };
 
     let (res, hostkey) = connect_session(&opts.host, opts.port, &opts.home).await;
     let mut session = match res {
@@ -382,7 +390,10 @@ async fn run_session(opts: Opts, fd0: OwnedFd, fd1: OwnedFd, fd2: OwnedFd) -> u8
                     ),
                 );
             } else {
-                eprint_fd(raw2, &format!("ssh: connect {}:{} failed: {e}\n", opts.host, opts.port));
+                eprint_fd(
+                    raw2,
+                    &format!("ssh: connect {}:{} failed: {e}\n", opts.host, opts.port),
+                );
             }
             return 255;
         }
@@ -390,7 +401,10 @@ async fn run_session(opts: Opts, fd0: OwnedFd, fd1: OwnedFd, fd2: OwnedFd) -> u8
     if hostkey == HostKeyOutcome::Added {
         eprint_fd(
             raw2,
-            &format!("ssh: warning — permanently added '{}' to ~/.ssh/known_hosts.\n", opts.host),
+            &format!(
+                "ssh: warning — permanently added '{}' to ~/.ssh/known_hosts.\n",
+                opts.host
+            ),
         );
     }
 
@@ -436,7 +450,13 @@ async fn run_session(opts: Opts, fd0: OwnedFd, fd1: OwnedFd, fd2: OwnedFd) -> u8
     }
 
     if !authed {
-        eprint_fd(raw2, &format!("ssh: authentication failed for {}@{}\n", opts.user, opts.host));
+        eprint_fd(
+            raw2,
+            &format!(
+                "ssh: authentication failed for {}@{}\n",
+                opts.user, opts.host
+            ),
+        );
         return 255; // `term` drop leaves the alt screen if we entered it.
     }
 
@@ -621,7 +641,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(o.port, 2222);
-        assert_eq!(o.identity.as_deref(), Some(std::path::Path::new("/h/.ssh/k")));
+        assert_eq!(
+            o.identity.as_deref(),
+            Some(std::path::Path::new("/h/.ssh/k"))
+        );
         assert_eq!(o.command.as_deref(), Some("uname -a"));
     }
 

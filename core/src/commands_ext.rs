@@ -17,120 +17,9 @@ fn abs(cwd: &Path, p: &str) -> PathBuf {
     }
 }
 
-// ---------------------------------------------------------------- which
-
-/// Locate a command: reports shell builtins and PATH executables.
-#[derive(Parser)]
-pub struct WhichCommand {
-    names: Vec<String>,
-}
-
-impl builtins::Command for WhichCommand {
-    type Error = brush_core::Error;
-    async fn execute<SE: ShellExtensions>(
-        &self,
-        context: ExecutionContext<'_, SE>,
-    ) -> Result<ExecutionResult, Self::Error> {
-        let mut out = context.stdout();
-        let mut exit = 0u8;
-        for name in &self.names {
-            if context.shell.builtins().contains_key(name)
-                || context.shell.funcs().get(name.as_str()).is_some()
-            {
-                writeln!(out, "{name}: shell builtin")?;
-            } else if let Some(path) = context
-                .shell
-                .find_first_executable_in_path_using_cache(name)
-            {
-                writeln!(out, "{}", path.display())?;
-            } else {
-                writeln!(context.stderr(), "{name} not found")?;
-                exit = 1;
-            }
-        }
-        out.flush()?;
-        Ok(ExecutionResult::new(exit))
-    }
-}
-
-// ---------------------------------------------------------------- find
-
-/// Walk a directory tree, printing paths matching simple predicates.
-#[derive(Parser)]
-pub struct FindCommand {
-    /// Roots to search (default: current directory).
-    paths: Vec<String>,
-    /// Match entries whose name matches this glob (`-name`).
-    #[arg(long = "name")]
-    name: Option<String>,
-    /// Match type: f (file), d (dir), l (symlink) (`-type`).
-    #[arg(long = "type")]
-    typ: Option<char>,
-    /// Descend at most this many directory levels (`-maxdepth`).
-    #[arg(long = "maxdepth")]
-    maxdepth: Option<usize>,
-}
-
-impl builtins::Command for FindCommand {
-    type Error = brush_core::Error;
-    async fn execute<SE: ShellExtensions>(
-        &self,
-        context: ExecutionContext<'_, SE>,
-    ) -> Result<ExecutionResult, Self::Error> {
-        let cwd = context.shell.working_dir().to_path_buf();
-        let roots = if self.paths.is_empty() {
-            vec![".".to_string()]
-        } else {
-            self.paths.clone()
-        };
-        let mut out = context.stdout();
-        let pattern = self.name.as_ref().map(|g| glob_to_regex(g));
-
-        for root_str in &roots {
-            let root = abs(&cwd, root_str);
-            let mut walker = walkdir::WalkDir::new(&root);
-            if let Some(d) = self.maxdepth {
-                walker = walker.max_depth(d);
-            }
-            for entry in walker.into_iter().flatten() {
-                let ft = entry.file_type();
-                if let Some(t) = self.typ {
-                    let ok = match t {
-                        'f' => ft.is_file(),
-                        'd' => ft.is_dir(),
-                        'l' => ft.is_symlink(),
-                        _ => true,
-                    };
-                    if !ok {
-                        continue;
-                    }
-                }
-                if let Some(re) = &pattern {
-                    let fname = entry.file_name().to_string_lossy();
-                    if !re.is_match(&fname) {
-                        continue;
-                    }
-                }
-                // Print relative to the given root string when possible.
-                let disp = entry
-                    .path()
-                    .strip_prefix(&cwd)
-                    .map(|p| {
-                        if p.as_os_str().is_empty() {
-                            root_str.clone()
-                        } else {
-                            p.display().to_string()
-                        }
-                    })
-                    .unwrap_or_else(|_| entry.path().display().to_string());
-                writeln!(out, "{disp}")?;
-            }
-        }
-        out.flush()?;
-        Ok(ExecutionResult::success())
-    }
-}
-
+/// Shell-style glob (`*`, `?`) as an anchored regex. Used by the flags that
+/// take a name pattern rather than a path — `tar --exclude`, `zip -x`,
+/// `unzip -x`, `tree -P/-I`.
 fn glob_to_regex(glob: &str) -> regex_lite::Regex {
     let mut re = String::from("^");
     for ch in glob.chars() {
@@ -148,6 +37,88 @@ fn glob_to_regex(glob: &str) -> regex_lite::Regex {
     regex_lite::Regex::new(&re).unwrap_or_else(|_| regex_lite::Regex::new("^$").unwrap())
 }
 
+// ---------------------------------------------------------------- which
+
+/// Locate a command: reports shell builtins and PATH executables.
+#[derive(Parser)]
+pub struct WhichCommand {
+    /// Print every match on PATH, not just the first.
+    #[arg(short = 'a', long = "all")]
+    all: bool,
+    /// Print nothing; the exit status alone reports whether all names resolved.
+    #[arg(short = 's', long = "silent")]
+    silent: bool,
+    /// Ignore shell builtins and functions; only look on PATH.
+    #[arg(long = "skip-functions")]
+    skip_functions: bool,
+    names: Vec<String>,
+}
+
+impl WhichCommand {
+    /// Every executable named `name` on PATH, in order. brush's lookup cache
+    /// only answers "the first one", which is not enough for `-a`.
+    fn all_on_path<SE: ShellExtensions>(
+        context: &ExecutionContext<'_, SE>,
+        name: &str,
+    ) -> Vec<PathBuf> {
+        let Some(path_var) = context.shell.env().get("PATH") else {
+            return Vec::new();
+        };
+        path_var
+            .1
+            .value()
+            .to_cow_str(context.shell)
+            .split(':')
+            .filter(|d| !d.is_empty())
+            .map(|d| PathBuf::from(d).join(name))
+            .filter(|p| p.is_file())
+            .collect()
+    }
+}
+
+impl builtins::Command for WhichCommand {
+    type Error = brush_core::Error;
+    async fn execute<SE: ShellExtensions>(
+        &self,
+        context: ExecutionContext<'_, SE>,
+    ) -> Result<ExecutionResult, Self::Error> {
+        let mut out = context.stdout();
+        let mut exit = 0u8;
+        for name in &self.names {
+            let is_shell_word = !self.skip_functions
+                && (context.shell.builtins().contains_key(name)
+                    || context.shell.funcs().get(name.as_str()).is_some());
+            if is_shell_word {
+                if !self.silent {
+                    writeln!(out, "{name}: shell builtin")?;
+                }
+                continue;
+            }
+            let hits: Vec<PathBuf> = if self.all {
+                Self::all_on_path(&context, name)
+            } else {
+                context
+                    .shell
+                    .find_first_executable_in_path_using_cache(name)
+                    .into_iter()
+                    .collect()
+            };
+            if hits.is_empty() {
+                if !self.silent {
+                    writeln!(context.stderr(), "{name} not found")?;
+                }
+                exit = 1;
+            } else if !self.silent {
+                for p in hits {
+                    writeln!(out, "{}", p.display())?;
+                }
+            }
+        }
+        out.flush()?;
+        Ok(ExecutionResult::new(exit))
+    }
+}
+
 // ---------------------------------------------------------------- tree
 
 /// Print a directory tree.
@@ -156,11 +127,39 @@ pub struct TreeCommand {
     /// Root directory (default: current).
     path: Option<String>,
     /// Show hidden entries.
-    #[arg(short = 'a')]
+    #[arg(short = 'a', long = "all")]
     all: bool,
     /// Descend at most this many levels.
-    #[arg(short = 'L')]
+    #[arg(short = 'L', value_name = "LEVEL")]
     level: Option<usize>,
+    /// List directories only.
+    #[arg(short = 'd')]
+    dirs_only: bool,
+    /// Print the full path prefix for each entry.
+    #[arg(short = 'f')]
+    full_path: bool,
+    /// Do not indent; useful with -f.
+    #[arg(short = 'i')]
+    no_indent: bool,
+    /// List only entries matching this glob.
+    #[arg(short = 'P', value_name = "PATTERN")]
+    pattern: Option<String>,
+    /// Skip entries matching this glob.
+    #[arg(short = 'I', value_name = "PATTERN")]
+    ignore: Option<String>,
+}
+
+/// Display options threaded through the recursion, kept in a struct so adding
+/// one does not mean touching every call site.
+#[derive(Clone)]
+struct TreeOpts {
+    all: bool,
+    max: Option<usize>,
+    dirs_only: bool,
+    full_path: bool,
+    no_indent: bool,
+    pattern: Option<regex_lite::Regex>,
+    ignore: Option<regex_lite::Regex>,
 }
 
 impl builtins::Command for TreeCommand {
@@ -172,17 +171,20 @@ impl builtins::Command for TreeCommand {
         let cwd = context.shell.working_dir().to_path_buf();
         let root = abs(&cwd, self.path.as_deref().unwrap_or("."));
         let mut out = context.stdout();
-        writeln!(out, "{}", self.path.as_deref().unwrap_or("."))?;
+        let root_label = self.path.as_deref().unwrap_or(".");
+        writeln!(out, "{root_label}")?;
         let (mut dirs, mut files) = (0usize, 0usize);
+        let opts = TreeOpts {
+            all: self.all,
+            max: self.level,
+            dirs_only: self.dirs_only,
+            full_path: self.full_path,
+            no_indent: self.no_indent,
+            pattern: self.pattern.as_ref().map(|g| glob_to_regex(g)),
+            ignore: self.ignore.as_ref().map(|g| glob_to_regex(g)),
+        };
         tree_walk(
-            &root,
-            "",
-            self.all,
-            self.level,
-            1,
-            &mut out,
-            &mut dirs,
-            &mut files,
+            &root, "", root_label, &opts, 1, &mut out, &mut dirs, &mut files,
         )?;
         writeln!(out, "\n{dirs} directories, {files} files")?;
         out.flush()?;
@@ -194,14 +196,14 @@ impl builtins::Command for TreeCommand {
 fn tree_walk(
     dir: &Path,
     prefix: &str,
-    all: bool,
-    max: Option<usize>,
+    path_prefix: &str,
+    opts: &TreeOpts,
     depth: usize,
     out: &mut impl Write,
     dirs: &mut usize,
     files: &mut usize,
 ) -> std::io::Result<()> {
-    if let Some(m) = max {
+    if let Some(m) = opts.max {
         if depth > m {
             return Ok(());
         }
@@ -210,680 +212,55 @@ fn tree_walk(
         Ok(rd) => rd.flatten().collect(),
         Err(_) => return Ok(()),
     };
-    entries.retain(|e| all || !e.file_name().to_string_lossy().starts_with('.'));
+    entries.retain(|e| opts.all || !e.file_name().to_string_lossy().starts_with('.'));
     entries.sort_by_key(std::fs::DirEntry::file_name);
     let n = entries.len();
     for (i, entry) in entries.iter().enumerate() {
         let last = i + 1 == n;
-        let connector = if last { "└── " } else { "├── " };
         let name = entry.file_name().to_string_lossy().into_owned();
-        writeln!(out, "{prefix}{connector}{name}")?;
-        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        // -I always prunes; -P and -d only filter what is PRINTED, since a
+        // directory still has to be descended to reach matching entries.
+        let ignored = opts.ignore.as_ref().is_some_and(|re| re.is_match(&name));
+        if ignored {
+            continue;
+        }
+        let printable = !(opts.dirs_only && !is_dir)
+            && (is_dir || opts.pattern.as_ref().is_none_or(|re| re.is_match(&name)));
+        let full = if path_prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{path_prefix}/{name}")
+        };
+        if printable {
+            let label = if opts.full_path { &full } else { &name };
+            if opts.no_indent {
+                writeln!(out, "{label}")?;
+            } else {
+                let connector = if last { "└── " } else { "├── " };
+                writeln!(out, "{prefix}{connector}{label}")?;
+            }
+        }
+        if is_dir {
             *dirs += 1;
-            let child_prefix = format!("{prefix}{}", if last { "    " } else { "│   " });
+            let child_prefix = if opts.no_indent {
+                String::new()
+            } else {
+                format!("{prefix}{}", if last { "    " } else { "│   " })
+            };
             tree_walk(
                 &entry.path(),
                 &child_prefix,
-                all,
-                max,
+                &full,
+                opts,
                 depth + 1,
                 out,
                 dirs,
                 files,
             )?;
-        } else {
+        } else if printable {
             *files += 1;
         }
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------- diff
-
-/// Compare two files, producing a unified diff.
-#[derive(Parser)]
-pub struct DiffCommand {
-    a: String,
-    b: String,
-    /// Number of context lines.
-    #[arg(short = 'U', default_value = "3")]
-    context: usize,
-}
-
-impl builtins::Command for DiffCommand {
-    type Error = brush_core::Error;
-    async fn execute<SE: ShellExtensions>(
-        &self,
-        context: ExecutionContext<'_, SE>,
-    ) -> Result<ExecutionResult, Self::Error> {
-        let cwd = context.shell.working_dir().to_path_buf();
-        // A missing/non-UTF-8 file is an error (exit 2), not "an empty file" —
-        // otherwise a typo'd path silently diffs against nothing.
-        let read = |name: &str| match std::fs::read_to_string(abs(&cwd, name)) {
-            Ok(s) => Ok(s),
-            Err(e) => {
-                let _ = writeln!(context.stderr(), "diff: {name}: {e}");
-                Err(())
-            }
-        };
-        let (Ok(ta), Ok(tb)) = (read(&self.a), read(&self.b)) else {
-            return Ok(ExecutionResult::new(2));
-        };
-        let diff = similar::TextDiff::from_lines(&ta, &tb);
-        let mut out = context.stdout();
-        if diff.ratio() == 1.0 {
-            return Ok(ExecutionResult::success());
-        }
-        let ud = diff
-            .unified_diff()
-            .context_radius(self.context)
-            .header(&self.a, &self.b)
-            .to_string();
-        write!(out, "{ud}")?;
-        out.flush()?;
-        Ok(ExecutionResult::new(1)) // differences found
-    }
-}
-
-// ---------------------------------------------------------------- gzip / gunzip
-
-/// Compress a file with gzip.
-#[derive(Parser)]
-pub struct GzipCommand {
-    /// Write to stdout, keep input.
-    #[arg(short = 'c')]
-    stdout: bool,
-    /// Decompress (same as gunzip).
-    #[arg(short = 'd')]
-    decompress: bool,
-    /// Keep the input file.
-    #[arg(short = 'k')]
-    keep: bool,
-    files: Vec<String>,
-}
-
-impl builtins::Command for GzipCommand {
-    type Error = brush_core::Error;
-    async fn execute<SE: ShellExtensions>(
-        &self,
-        context: ExecutionContext<'_, SE>,
-    ) -> Result<ExecutionResult, Self::Error> {
-        gzip_run(self.decompress, self.stdout, self.keep, &self.files, &context)
-    }
-}
-
-/// Decompress a gzip file.
-#[derive(Parser)]
-pub struct GunzipCommand {
-    #[arg(short = 'c')]
-    stdout: bool,
-    #[arg(short = 'k')]
-    keep: bool,
-    files: Vec<String>,
-}
-
-impl builtins::Command for GunzipCommand {
-    type Error = brush_core::Error;
-    async fn execute<SE: ShellExtensions>(
-        &self,
-        context: ExecutionContext<'_, SE>,
-    ) -> Result<ExecutionResult, Self::Error> {
-        gzip_run(true, self.stdout, self.keep, &self.files, &context)
-    }
-}
-
-fn gzip_run<SE: ShellExtensions>(
-    decompress: bool,
-    to_stdout: bool,
-    keep: bool,
-    files: &[String],
-    context: &ExecutionContext<'_, SE>,
-) -> Result<ExecutionResult, brush_core::Error> {
-    use flate2::read::GzDecoder;
-    use flate2::write::GzEncoder;
-    use flate2::Compression;
-    let cwd = context.shell.working_dir().to_path_buf();
-    let mut stdout = context.stdout();
-
-    // stdin -> stdout streaming when no files.
-    if files.is_empty() {
-        let mut input = Vec::new();
-        context.stdin().read_to_end(&mut input)?;
-        let output = if decompress {
-            let mut d = GzDecoder::new(&input[..]);
-            let mut buf = Vec::new();
-            d.read_to_end(&mut buf)?;
-            buf
-        } else {
-            let mut e = GzEncoder::new(Vec::new(), Compression::default());
-            e.write_all(&input)?;
-            e.finish()?
-        };
-        stdout.write_all(&output)?;
-        stdout.flush()?;
-        return Ok(ExecutionResult::success());
-    }
-
-    let mut stderr = context.stderr();
-    let mut had_error = false;
-    for f in files {
-        let path = abs(&cwd, f);
-        // Read the input; a read failure must NOT be treated as empty data (that
-        // would write an empty output and then delete the original).
-        let data = match std::fs::read(&path) {
-            Ok(d) => d,
-            Err(e) => {
-                let _ = writeln!(stderr, "gzip: {}: {e}", path.display());
-                had_error = true;
-                continue;
-            }
-        };
-        let (output, out_path) = if decompress {
-            // Only decompress files that actually end in `.gz`; otherwise the
-            // output path would equal the input path and we'd overwrite then
-            // delete the source.
-            let Some(stripped) = path.to_string_lossy().strip_suffix(".gz").map(str::to_string)
-            else {
-                let _ = writeln!(stderr, "gzip: {}: unknown suffix -- ignored", path.display());
-                had_error = true;
-                continue;
-            };
-            let mut d = GzDecoder::new(&data[..]);
-            let mut buf = Vec::new();
-            if let Err(e) = d.read_to_end(&mut buf) {
-                let _ = writeln!(stderr, "gzip: {}: not in gzip format: {e}", path.display());
-                had_error = true;
-                continue;
-            }
-            (buf, stripped)
-        } else {
-            let mut e = GzEncoder::new(Vec::new(), Compression::default());
-            e.write_all(&data)?;
-            (e.finish()?, format!("{}.gz", path.to_string_lossy()))
-        };
-        if to_stdout {
-            stdout.write_all(&output)?;
-        } else if let Err(e) = std::fs::write(&out_path, &output) {
-            let _ = writeln!(stderr, "gzip: {out_path}: {e}");
-            had_error = true;
-        } else if !keep {
-            // Only remove the source after a confirmed successful write.
-            let _ = std::fs::remove_file(&path);
-        }
-    }
-    stdout.flush()?;
-    Ok(ExecutionResult::new(u8::from(had_error)))
-}
-
-// ---------------------------------------------------------------- sed
-
-/// Stream editor: applies `s/re/rep/flags` (and multiple `-e`) via sedregex.
-#[derive(Parser)]
-pub struct SedCommand {
-    /// Suppress automatic printing (only relevant with p flag).
-    #[arg(short = 'n')]
-    quiet: bool,
-    /// A sed expression (repeatable).
-    #[arg(short = 'e')]
-    exprs: Vec<String>,
-    /// Positional: first non-option is the script if no -e given, rest are files.
-    rest: Vec<String>,
-}
-
-impl builtins::Command for SedCommand {
-    type Error = brush_core::Error;
-    async fn execute<SE: ShellExtensions>(
-        &self,
-        context: ExecutionContext<'_, SE>,
-    ) -> Result<ExecutionResult, Self::Error> {
-        let cwd = context.shell.working_dir().to_path_buf();
-        let mut cmds = self.exprs.clone();
-        let mut files = self.rest.clone();
-        if cmds.is_empty() && !files.is_empty() {
-            cmds.push(files.remove(0));
-        }
-        let input = if files.is_empty() {
-            let mut s = String::new();
-            context.stdin().read_to_string(&mut s)?;
-            s
-        } else {
-            files
-                .iter()
-                .filter_map(|f| std::fs::read_to_string(abs(&cwd, f)).ok())
-                .collect::<Vec<_>>()
-                .join("")
-        };
-
-        // GNU sed is line-oriented: each s/// (without a global flag) affects
-        // the first match on each line. sedregex operates on a whole string,
-        // so apply it per line and preserve the trailing newline layout.
-        let had_trailing_nl = input.ends_with('\n');
-        let mut out = context.stdout();
-        let mut result = String::new();
-        let parts: Vec<&str> = input.split('\n').collect();
-        let n = parts.len();
-        for (i, line) in parts.iter().enumerate() {
-            if i > 0 {
-                result.push('\n');
-            }
-            // Only the FINAL split item is the trailing-newline artifact (empty
-            // iff the input ended in \n); the '\n' pushed above already preserved
-            // that trailing newline. A *real* interior empty line must still be
-            // run through the expression (e.g. `sed 's/^/X/'` outputs `X`).
-            if i + 1 == n && had_trailing_nl && line.is_empty() {
-                continue;
-            }
-            match sedregex::find_and_replace(line, &cmds) {
-                Ok(r) => result.push_str(&r),
-                Err(e) => {
-                    writeln!(context.stderr(), "sed: {e:?}")?;
-                    return Ok(ExecutionResult::new(1));
-                }
-            }
-        }
-        if !self.quiet {
-            write!(out, "{result}")?;
-        }
-        out.flush()?;
-        Ok(ExecutionResult::success())
-    }
-}
-
-// ---------------------------------------------------------------- curl / wget
-
-/// Transfer a URL over HTTP/HTTPS. Supports the common real-`curl` flags so the
-/// agent's reflexes work instead of tripping a "this isn't standard curl" error:
-/// method (`-X`), headers (`-H`, repeatable), request body (`-d`/`--data`/
-/// `--data-raw`/`--data-binary`, implies POST; `@file` reads a file), `--json`,
-/// basic auth (`-u`), user-agent (`-A`), include response headers (`-i`),
-/// fail-on-error (`-f`), and output (`-o`/`-O`). Backed by `ureq`.
-#[derive(Parser)]
-pub struct CurlCommand {
-    url: String,
-    /// HTTP method (GET, POST, PUT, PATCH, DELETE, HEAD, ...).
-    #[arg(short = 'X', long = "request")]
-    method: Option<String>,
-    /// Extra header "Name: value" (repeatable).
-    #[arg(short = 'H', long = "header")]
-    header: Vec<String>,
-    /// Request body; implies POST unless -X is given. `@file` reads from a file.
-    #[arg(short = 'd', long = "data", visible_aliases = ["data-raw", "data-binary", "data-ascii"])]
-    data: Option<String>,
-    /// JSON body: sets Content-Type/Accept: application/json and implies POST.
-    #[arg(long = "json")]
-    json: Option<String>,
-    /// Basic auth "user:password".
-    #[arg(short = 'u', long = "user")]
-    user: Option<String>,
-    /// User-Agent header.
-    #[arg(short = 'A', long = "user-agent")]
-    user_agent: Option<String>,
-    /// Write output to this file instead of stdout.
-    #[arg(short = 'o', long = "output")]
-    output: Option<String>,
-    /// Save as the URL's basename.
-    #[arg(short = 'O', long = "remote-name")]
-    remote_name: bool,
-    /// Include response headers in the output.
-    #[arg(short = 'i', long = "include")]
-    include: bool,
-    /// Fail (exit 22) on HTTP >= 400, with no body.
-    #[arg(short = 'f', long = "fail")]
-    fail: bool,
-    /// Silent: suppress progress/error text.
-    #[arg(short = 's', long = "silent")]
-    silent: bool,
-    /// Show errors even with -s (accepted; errors already print unless -s).
-    #[arg(short = 'S', long = "show-error")]
-    _show_error: bool,
-    /// Follow redirects (accepted; ureq follows by default).
-    #[arg(short = 'L', long = "location")]
-    _location: bool,
-    /// Allow insecure TLS (accepted; no-op).
-    #[arg(short = 'k', long = "insecure")]
-    _insecure: bool,
-}
-
-impl builtins::Command for CurlCommand {
-    type Error = brush_core::Error;
-    async fn execute<SE: ShellExtensions>(
-        &self,
-        context: ExecutionContext<'_, SE>,
-    ) -> Result<ExecutionResult, Self::Error> {
-        let cwd = context.shell.working_dir().to_path_buf();
-        let dest = if self.remote_name {
-            Some(url_basename(&self.url))
-        } else {
-            self.output.clone()
-        };
-
-        // Assemble headers: -H first, then --json content negotiation, then auth.
-        let mut headers = self.header.clone();
-        let mut body: Option<String> = None;
-        if let Some(j) = &self.json {
-            headers.push("Content-Type: application/json".into());
-            headers.push("Accept: application/json".into());
-            body = Some(j.clone());
-        } else if let Some(d) = &self.data {
-            body = Some(read_data_arg(d, &cwd));
-        }
-        if let Some(u) = &self.user {
-            use base64::Engine as _;
-            let enc = base64::engine::general_purpose::STANDARD.encode(u.as_bytes());
-            headers.push(format!("Authorization: Basic {enc}"));
-        }
-        // Method: explicit -X wins; else -d/--json implies POST; else GET.
-        let method = self
-            .method
-            .as_deref()
-            .map(|m| m.to_ascii_uppercase())
-            .unwrap_or_else(|| if body.is_some() { "POST".into() } else { "GET".into() });
-
-        http_request(
-            &method,
-            &self.url,
-            &headers,
-            body.as_deref(),
-            self.user_agent.as_deref(),
-            dest.as_deref(),
-            self.silent,
-            self.include,
-            self.fail,
-            &cwd,
-            &context,
-        )
-    }
-}
-
-/// `-d @path` reads the body from a file; otherwise the value is the literal body.
-fn read_data_arg(data: &str, cwd: &Path) -> String {
-    if let Some(rest) = data.strip_prefix('@') {
-        std::fs::read_to_string(abs(cwd, rest)).unwrap_or_default()
-    } else {
-        data.to_string()
-    }
-}
-
-/// Split a "Name: value" header line; trims surrounding whitespace.
-fn parse_header(h: &str) -> Option<(String, String)> {
-    let (k, v) = h.split_once(':')?;
-    let k = k.trim();
-    if k.is_empty() {
-        return None;
-    }
-    Some((k.to_string(), v.trim().to_string()))
-}
-
-/// Retrieve a URL, saving to a local file (like wget).
-#[derive(Parser)]
-pub struct WgetCommand {
-    url: String,
-    /// Output file (default: URL basename).
-    #[arg(short = 'O')]
-    output: Option<String>,
-    /// Write to stdout.
-    #[arg(short = 'q')]
-    quiet: bool,
-    /// Print to stdout instead of saving.
-    #[arg(long = "stdout")]
-    to_stdout: bool,
-}
-
-impl builtins::Command for WgetCommand {
-    type Error = brush_core::Error;
-    async fn execute<SE: ShellExtensions>(
-        &self,
-        context: ExecutionContext<'_, SE>,
-    ) -> Result<ExecutionResult, Self::Error> {
-        let cwd = context.shell.working_dir().to_path_buf();
-        let dest = if self.to_stdout {
-            None
-        } else {
-            Some(self.output.clone().unwrap_or_else(|| url_basename(&self.url)))
-        };
-        http_get(&self.url, dest.as_deref(), self.quiet, &cwd, &context)
-    }
-}
-
-fn url_basename(url: &str) -> String {
-    let no_query = url.split('?').next().unwrap_or(url);
-    let base = no_query.rsplit('/').next().unwrap_or("index.html");
-    if base.is_empty() {
-        "index.html".to_string()
-    } else {
-        base.to_string()
-    }
-}
-
-/// GET wrapper used by `wget` (and the simple curl path).
-fn http_get<SE: ShellExtensions>(
-    url: &str,
-    dest: Option<&str>,
-    silent: bool,
-    cwd: &Path,
-    context: &ExecutionContext<'_, SE>,
-) -> Result<ExecutionResult, brush_core::Error> {
-    http_request("GET", url, &[], None, None, dest, silent, false, false, cwd, context)
-}
-
-/// Perform an HTTP request with an arbitrary method, headers and optional body,
-/// streaming the response body to `dest` (a file) or stdout. Powers `curl`.
-#[allow(clippy::too_many_arguments)]
-fn http_request<SE: ShellExtensions>(
-    method: &str,
-    url: &str,
-    headers: &[String],
-    body: Option<&str>,
-    user_agent: Option<&str>,
-    dest: Option<&str>,
-    silent: bool,
-    include_headers: bool,
-    fail: bool,
-    cwd: &Path,
-    context: &ExecutionContext<'_, SE>,
-) -> Result<ExecutionResult, brush_core::Error> {
-    let parsed: Vec<(String, String)> = headers.iter().filter_map(|h| parse_header(h)).collect();
-    let has_ua = parsed.iter().any(|(k, _)| k.eq_ignore_ascii_case("user-agent"));
-
-    // POST/PUT/PATCH carry a body (ureq's WithBody builder); everything else
-    // uses the WithoutBody builder. An unknown custom method falls back to GET.
-    let with_body = matches!(method, "POST" | "PUT" | "PATCH");
-    let resp_result: Result<ureq::http::Response<ureq::Body>, ureq::Error> = if with_body {
-        let mut b = match method {
-            "PUT" => ureq::put(url),
-            "PATCH" => ureq::patch(url),
-            _ => ureq::post(url),
-        };
-        for (k, v) in &parsed {
-            b = b.header(k, v);
-        }
-        if let (Some(ua), false) = (user_agent, has_ua) {
-            b = b.header("User-Agent", ua);
-        }
-        match body {
-            Some(d) => b.send(d),
-            None => b.send_empty(),
-        }
-    } else {
-        let mut b = match method {
-            "DELETE" => ureq::delete(url),
-            "HEAD" => ureq::head(url),
-            "OPTIONS" => ureq::options(url),
-            _ => ureq::get(url),
-        };
-        for (k, v) in &parsed {
-            b = b.header(k, v);
-        }
-        if let (Some(ua), false) = (user_agent, has_ua) {
-            b = b.header("User-Agent", ua);
-        }
-        b.call()
-    };
-
-    match resp_result {
-        Ok(mut resp) => {
-            let status = resp.status().as_u16();
-            // -i/--include: emit the status line and response headers first.
-            if include_headers {
-                let mut out = context.stdout();
-                let _ = writeln!(out, "HTTP/1.1 {status}");
-                for (k, v) in resp.headers() {
-                    let _ = writeln!(out, "{}: {}", k.as_str(), v.to_str().unwrap_or(""));
-                }
-                let _ = writeln!(out);
-                let _ = out.flush();
-            }
-            // -f/--fail: HTTP >= 400 → no body, exit 22 (curl's convention).
-            if fail && status >= 400 {
-                if !silent {
-                    let _ = writeln!(
-                        context.stderr(),
-                        "curl: The requested URL returned error: {status}"
-                    );
-                }
-                return Ok(ExecutionResult::new(22));
-            }
-            // Stream the body straight to the destination so a large download
-            // doesn't buffer the whole response in memory (OOM on iOS).
-            let mut reader = resp.body_mut().as_reader();
-            let copy_result = if let Some(d) = dest {
-                let path = abs(cwd, d);
-                match std::fs::File::create(&path) {
-                    Ok(mut f) => std::io::copy(&mut reader, &mut f).map(|_| ()),
-                    Err(e) => {
-                        if !silent {
-                            let _ = writeln!(context.stderr(), "curl: {}: {e}", path.display());
-                        }
-                        return Ok(ExecutionResult::new(1));
-                    }
-                }
-            } else {
-                let mut out = context.stdout();
-                let r = std::io::copy(&mut reader, &mut out).map(|_| ());
-                let _ = out.flush();
-                r
-            };
-            match copy_result {
-                Ok(()) => Ok(ExecutionResult::success()),
-                Err(e) => {
-                    if !silent {
-                        let _ = writeln!(context.stderr(), "curl: read error: {e}");
-                    }
-                    Ok(ExecutionResult::new(1))
-                }
-            }
-        }
-        Err(e) => {
-            if !silent {
-                let _ = writeln!(context.stderr(), "curl: {e}");
-            }
-            Ok(ExecutionResult::new(1))
-        }
-    }
-}
-
-// ---------------------------------------------------------------- tar
-
-/// Create or extract tar archives (optionally gzip-compressed with -z).
-#[derive(Parser)]
-pub struct TarCommand {
-    /// Create an archive.
-    #[arg(short = 'c')]
-    create: bool,
-    /// Extract an archive.
-    #[arg(short = 'x')]
-    extract: bool,
-    /// List archive contents.
-    #[arg(short = 't')]
-    list: bool,
-    /// Filter through gzip.
-    #[arg(short = 'z')]
-    gzip: bool,
-    /// Verbose.
-    #[arg(short = 'v')]
-    verbose: bool,
-    /// Archive file.
-    #[arg(short = 'f')]
-    file: String,
-    /// Files/dirs (for create).
-    paths: Vec<String>,
-}
-
-impl builtins::Command for TarCommand {
-    type Error = brush_core::Error;
-    async fn execute<SE: ShellExtensions>(
-        &self,
-        context: ExecutionContext<'_, SE>,
-    ) -> Result<ExecutionResult, Self::Error> {
-        use flate2::read::GzDecoder;
-        use flate2::write::GzEncoder;
-        use flate2::Compression;
-        let cwd = context.shell.working_dir().to_path_buf();
-        let archive = abs(&cwd, &self.file);
-        let mut out = context.stdout();
-
-        if self.create {
-            let f = std::fs::File::create(&archive)?;
-            if self.gzip {
-                let enc = GzEncoder::new(f, Compression::default());
-                let mut builder = tar::Builder::new(enc);
-                for p in &self.paths {
-                    add_to_tar(&mut builder, &cwd, p, self.verbose, &mut out)?;
-                }
-                builder.into_inner()?.finish()?;
-            } else {
-                let mut builder = tar::Builder::new(f);
-                for p in &self.paths {
-                    add_to_tar(&mut builder, &cwd, p, self.verbose, &mut out)?;
-                }
-                builder.finish()?;
-            }
-        } else if self.extract || self.list {
-            let f = std::fs::File::open(&archive)?;
-            let reader: Box<dyn Read> = if self.gzip {
-                Box::new(GzDecoder::new(f))
-            } else {
-                Box::new(f)
-            };
-            let mut ar = tar::Archive::new(reader);
-            if self.list {
-                for entry in ar.entries()? {
-                    let e = entry?;
-                    writeln!(out, "{}", e.path()?.display())?;
-                }
-            } else {
-                for entry in ar.entries()? {
-                    let mut e = entry?;
-                    if self.verbose {
-                        writeln!(out, "{}", e.path()?.display())?;
-                    }
-                    e.unpack_in(&cwd)?;
-                }
-            }
-        } else {
-            writeln!(context.stderr(), "tar: specify -c, -x or -t")?;
-            return Ok(ExecutionResult::new(2));
-        }
-        out.flush()?;
-        Ok(ExecutionResult::success())
-    }
-}
-
-fn add_to_tar<W: Write>(
-    builder: &mut tar::Builder<W>,
-    cwd: &Path,
-    p: &str,
-    verbose: bool,
-    out: &mut impl Write,
-) -> std::io::Result<()> {
-    let full = abs(cwd, p);
-    if verbose {
-        let _ = writeln!(out, "{p}");
-    }
-    if full.is_dir() {
-        builder.append_dir_all(p, &full)?;
-    } else {
-        builder.append_path_with_name(&full, p)?;
     }
     Ok(())
 }
@@ -894,12 +271,43 @@ fn add_to_tar<W: Write>(
 #[derive(Parser)]
 pub struct ZipCommand {
     /// Recurse into directories.
-    #[arg(short = 'r')]
+    #[arg(short = 'r', long = "recurse-paths")]
     recurse: bool,
+    /// Quiet: do not list each file as it is added.
+    #[arg(short = 'q', long = "quiet")]
+    quiet: bool,
+    /// Store without compressing.
+    #[arg(short = '0')]
+    store: bool,
+    /// Maximum compression. Accepted; deflate is already the strongest method
+    /// the `zip` crate exposes here.
+    #[arg(short = '9')]
+    _best: bool,
+    /// Junk paths: store only the basename of each entry.
+    #[arg(short = 'j', long = "junk-paths")]
+    junk_paths: bool,
+    /// Delete the named entries from an existing archive.
+    #[arg(short = 'd', long = "delete")]
+    delete: bool,
+    /// Update: keep existing entries and add/replace the named ones.
+    #[arg(short = 'u', long = "update")]
+    update: bool,
+    /// Exclude entries matching this glob; repeatable.
+    #[arg(short = 'x', long = "exclude", value_name = "PATTERN")]
+    exclude: Vec<String>,
+    /// Read file names from standard input.
+    #[arg(short = '@', long = "names-stdin")]
+    names_stdin: bool,
     /// Archive name.
     archive: String,
-    /// Files/dirs to add.
+    /// Files/dirs to add (with -d, entry names to remove).
     paths: Vec<String>,
+}
+
+impl ZipCommand {
+    fn excluded(&self, name: &str) -> bool {
+        !self.exclude.is_empty() && self.exclude.iter().any(|g| glob_to_regex(g).is_match(name))
+    }
 }
 
 impl builtins::Command for ZipCommand {
@@ -910,28 +318,104 @@ impl builtins::Command for ZipCommand {
     ) -> Result<ExecutionResult, Self::Error> {
         let cwd = context.shell.working_dir().to_path_buf();
         let archive = abs(&cwd, &self.archive);
+        let mut out = context.stdout();
+        let mut paths = self.paths.clone();
+        if self.names_stdin {
+            let mut input = Vec::new();
+            context.stdin().read_to_end(&mut input)?;
+            paths.extend(
+                String::from_utf8_lossy(&input)
+                    .lines()
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_owned),
+            );
+        }
+
+        // -d and -u both need the existing entries. The `zip` crate has no
+        // in-place edit, so read the old archive into memory and write a fresh
+        // one — correct, and archives here are small enough for it.
+        let mut carried: Vec<(String, Vec<u8>)> = Vec::new();
+        if (self.delete || self.update) && archive.exists() {
+            let f = std::fs::File::open(&archive)?;
+            let mut zr = zip::ZipArchive::new(f).map_err(std::io::Error::other)?;
+            for i in 0..zr.len() {
+                let mut e = zr.by_index(i).map_err(std::io::Error::other)?;
+                let name = e.name().to_string();
+                // -d drops the named entries; -u drops the ones about to be
+                // re-added, so the new copy wins.
+                let dropped = if self.delete {
+                    paths
+                        .iter()
+                        .any(|p| glob_to_regex(p).is_match(&name) || *p == name)
+                } else {
+                    paths.iter().any(|p| *p == name)
+                };
+                if dropped {
+                    if self.delete && !self.quiet {
+                        writeln!(out, "deleting: {name}")?;
+                    }
+                    continue;
+                }
+                let mut buf = Vec::new();
+                e.read_to_end(&mut buf)?;
+                carried.push((name, buf));
+            }
+        }
+
         let f = std::fs::File::create(&archive)?;
         let mut zw = zip::ZipWriter::new(f);
+        let method = if self.store {
+            zip::CompressionMethod::Stored
+        } else {
+            zip::CompressionMethod::Deflated
+        };
         let opts: zip::write::FileOptions<()> =
-            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-        let mut out = context.stdout();
-        for p in &self.paths {
-            let full = abs(&cwd, p);
-            if full.is_dir() && self.recurse {
-                for entry in walkdir::WalkDir::new(&full).into_iter().flatten() {
-                    let rel = entry.path().strip_prefix(&cwd).unwrap_or(entry.path());
-                    let name = rel.to_string_lossy().into_owned();
-                    if entry.file_type().is_file() {
+            zip::write::FileOptions::default().compression_method(method);
+
+        for (name, data) in &carried {
+            zw.start_file(name, opts).map_err(std::io::Error::other)?;
+            zw.write_all(data)?;
+        }
+
+        if !self.delete {
+            for p in &paths {
+                let full = abs(&cwd, p);
+                if full.is_dir() && self.recurse {
+                    for entry in walkdir::WalkDir::new(&full).into_iter().flatten() {
+                        if !entry.file_type().is_file() {
+                            continue;
+                        }
+                        let rel = entry.path().strip_prefix(&cwd).unwrap_or(entry.path());
+                        let name = if self.junk_paths {
+                            entry.file_name().to_string_lossy().into_owned()
+                        } else {
+                            rel.to_string_lossy().into_owned()
+                        };
+                        if self.excluded(&name) {
+                            continue;
+                        }
                         zw.start_file(&name, opts).map_err(std::io::Error::other)?;
-                        let data = std::fs::read(entry.path())?;
-                        zw.write_all(&data)?;
+                        zw.write_all(&std::fs::read(entry.path())?)?;
+                        if !self.quiet {
+                            writeln!(out, "  adding: {name}")?;
+                        }
+                    }
+                } else if full.is_file() {
+                    let name = if self.junk_paths {
+                        full.file_name()
+                            .map_or_else(|| p.clone(), |n| n.to_string_lossy().into_owned())
+                    } else {
+                        p.clone()
+                    };
+                    if self.excluded(&name) {
+                        continue;
+                    }
+                    zw.start_file(&name, opts).map_err(std::io::Error::other)?;
+                    zw.write_all(&std::fs::read(&full)?)?;
+                    if !self.quiet {
                         writeln!(out, "  adding: {name}")?;
                     }
                 }
-            } else if full.is_file() {
-                zw.start_file(p, opts).map_err(std::io::Error::other)?;
-                zw.write_all(&std::fs::read(&full)?)?;
-                writeln!(out, "  adding: {p}")?;
             }
         }
         zw.finish().map_err(std::io::Error::other)?;
@@ -940,446 +424,4 @@ impl builtins::Command for ZipCommand {
     }
 }
 
-/// Extract a zip archive.
-#[derive(Parser)]
-pub struct UnzipCommand {
-    archive: String,
-    /// List contents only.
-    #[arg(short = 'l')]
-    list: bool,
-    /// Extract into this directory.
-    #[arg(short = 'd')]
-    dir: Option<String>,
-}
-
-impl builtins::Command for UnzipCommand {
-    type Error = brush_core::Error;
-    async fn execute<SE: ShellExtensions>(
-        &self,
-        context: ExecutionContext<'_, SE>,
-    ) -> Result<ExecutionResult, Self::Error> {
-        let cwd = context.shell.working_dir().to_path_buf();
-        let archive = abs(&cwd, &self.archive);
-        let dest = self.dir.as_ref().map(|d| abs(&cwd, d)).unwrap_or(cwd);
-        let f = std::fs::File::open(&archive)?;
-        let mut zip = match zip::ZipArchive::new(f) {
-            Ok(z) => z,
-            Err(e) => {
-                writeln!(context.stderr(), "unzip: {e}")?;
-                return Ok(ExecutionResult::new(1));
-            }
-        };
-        let mut out = context.stdout();
-        if self.list {
-            writeln!(out, "  Length      Name")?;
-            for i in 0..zip.len() {
-                let file = zip.by_index(i).map_err(std::io::Error::other)?;
-                writeln!(out, "{:>9}  {}", file.size(), file.name())?;
-            }
-            out.flush()?;
-            return Ok(ExecutionResult::success());
-        }
-        for i in 0..zip.len() {
-            let mut file = zip.by_index(i).map_err(std::io::Error::other)?;
-            let outpath = dest.join(file.mangled_name());
-            if file.is_dir() {
-                std::fs::create_dir_all(&outpath)?;
-            } else {
-                if let Some(parent) = outpath.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                let mut w = std::fs::File::create(&outpath)?;
-                std::io::copy(&mut file, &mut w)?;
-                writeln!(out, " extracting: {}", file.name())?;
-            }
-        }
-        out.flush()?;
-        Ok(ExecutionResult::success())
-    }
-}
-
-// ---------------------------------------------------------------- sqlite3
-
-/// Minimal sqlite3 CLI: opens a database and runs SQL from an argument or
-/// stdin, printing query results (pipe-separated, one row per line).
-#[derive(Parser)]
-pub struct SqliteCommand {
-    /// Database file (`:memory:` for an in-memory db).
-    database: Option<String>,
-    /// SQL to execute; if omitted, read from stdin.
-    sql: Option<String>,
-    /// Print a header row of column names.
-    #[arg(long = "header")]
-    header: bool,
-    /// Column separator (default: `|`).
-    #[arg(long = "separator", default_value = "|")]
-    separator: String,
-}
-
-impl builtins::Command for SqliteCommand {
-    type Error = brush_core::Error;
-    async fn execute<SE: ShellExtensions>(
-        &self,
-        context: ExecutionContext<'_, SE>,
-    ) -> Result<ExecutionResult, Self::Error> {
-        let cwd = context.shell.working_dir().to_path_buf();
-        let db_path = self.database.clone().unwrap_or_else(|| ":memory:".to_string());
-        let conn = if db_path == ":memory:" {
-            rusqlite::Connection::open_in_memory()
-        } else {
-            rusqlite::Connection::open(abs(&cwd, &db_path))
-        };
-        let conn = match conn {
-            Ok(c) => c,
-            Err(e) => {
-                writeln!(context.stderr(), "sqlite3: {e}")?;
-                return Ok(ExecutionResult::new(1));
-            }
-        };
-
-        let sql = if let Some(s) = &self.sql {
-            s.clone()
-        } else {
-            let mut s = String::new();
-            context.stdin().read_to_string(&mut s)?;
-            s
-        };
-        if sql.trim().is_empty() {
-            return Ok(ExecutionResult::success());
-        }
-
-        let mut out = context.stdout();
-        let mut exit = 0u8;
-        // Execute each statement; SELECTs print rows, others just run. Split on
-        // `;` but not inside string literals (naive split(';') would break
-        // `INSERT INTO t VALUES('a;b')`).
-        for stmt_sql in split_sql_statements(&sql) {
-            let trimmed = stmt_sql.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            match run_sqlite_stmt(&conn, trimmed, self.header, &self.separator, &mut out) {
-                Ok(()) => {}
-                Err(e) => {
-                    writeln!(context.stderr(), "sqlite3: {e}")?;
-                    exit = 1;
-                    break;
-                }
-            }
-        }
-        out.flush()?;
-        Ok(ExecutionResult::new(exit))
-    }
-}
-
-/// Splits a SQL script on `;`, but not inside single/double-quoted string
-/// literals (where `''`/`""` are literal-quote escapes). Comments are not
-/// specially handled — good enough for the common case a naive split breaks.
-fn split_sql_statements(sql: &str) -> Vec<String> {
-    let mut stmts = Vec::new();
-    let mut cur = String::new();
-    let mut chars = sql.chars().peekable();
-    let mut in_single = false;
-    let mut in_double = false;
-    while let Some(c) = chars.next() {
-        match c {
-            '\'' if !in_double => {
-                cur.push(c);
-                if in_single {
-                    if chars.peek() == Some(&'\'') {
-                        cur.push(chars.next().unwrap()); // '' escape
-                    } else {
-                        in_single = false;
-                    }
-                } else {
-                    in_single = true;
-                }
-            }
-            '"' if !in_single => {
-                cur.push(c);
-                if in_double {
-                    if chars.peek() == Some(&'"') {
-                        cur.push(chars.next().unwrap()); // "" escape
-                    } else {
-                        in_double = false;
-                    }
-                } else {
-                    in_double = true;
-                }
-            }
-            ';' if !in_single && !in_double => {
-                if !cur.trim().is_empty() {
-                    stmts.push(std::mem::take(&mut cur));
-                } else {
-                    cur.clear();
-                }
-            }
-            _ => cur.push(c),
-        }
-    }
-    if !cur.trim().is_empty() {
-        stmts.push(cur);
-    }
-    stmts
-}
-
-fn run_sqlite_stmt(
-    conn: &rusqlite::Connection,
-    sql: &str,
-    header: bool,
-    sep: &str,
-    out: &mut impl Write,
-) -> rusqlite::Result<()> {
-    let mut stmt = conn.prepare(sql)?;
-    let ncols = stmt.column_count();
-    if ncols == 0 {
-        // Non-query (INSERT/CREATE/…).
-        conn.execute(sql, [])?;
-        return Ok(());
-    }
-    let col_names: Vec<String> = stmt
-        .column_names()
-        .into_iter()
-        .map(str::to_string)
-        .collect();
-    if header {
-        let _ = writeln!(out, "{}", col_names.join(sep));
-    }
-    let mut rows = stmt.query([])?;
-    while let Some(row) = rows.next()? {
-        let mut cells = Vec::with_capacity(ncols);
-        for i in 0..ncols {
-            let v: rusqlite::types::Value = row.get(i)?;
-            cells.push(match v {
-                rusqlite::types::Value::Null => String::new(),
-                rusqlite::types::Value::Integer(n) => n.to_string(),
-                rusqlite::types::Value::Real(f) => f.to_string(),
-                rusqlite::types::Value::Text(t) => t,
-                rusqlite::types::Value::Blob(b) => format!("<{} bytes>", b.len()),
-            });
-        }
-        let _ = writeln!(out, "{}", cells.join(sep));
-    }
-    Ok(())
-}
-
 // ---------------------------------------------------------------- jq
-
-/// Process JSON with a jq filter, powered by jaq (pure-Rust jq).
-#[derive(Parser)]
-pub struct JqCommand {
-    /// The jq filter program.
-    filter: String,
-    /// Input files (default: stdin).
-    files: Vec<String>,
-    /// Compact output (no pretty-printing — jaq is compact by default).
-    #[arg(short = 'c')]
-    _compact: bool,
-    /// Raw output: strings without quotes.
-    #[arg(short = 'r')]
-    raw: bool,
-    /// Read each line as a string instead of JSON.
-    #[arg(short = 'R')]
-    raw_input: bool,
-    /// Don't read input; run the filter once with null input.
-    #[arg(short = 'n')]
-    null_input: bool,
-}
-
-impl builtins::Command for JqCommand {
-    type Error = brush_core::Error;
-    async fn execute<SE: ShellExtensions>(
-        &self,
-        context: ExecutionContext<'_, SE>,
-    ) -> Result<ExecutionResult, Self::Error> {
-        use jaq_core::load::{Arena, File, Loader};
-        use jaq_core::{Compiler, Ctx, Vars};
-        use jaq_json::Val;
-
-        // Compile the filter.
-        let program = File {
-            code: self.filter.as_str(),
-            path: (),
-        };
-        let defs = jaq_core::defs().chain(jaq_std::defs()).chain(jaq_json::defs());
-        let funs = jaq_core::funs().chain(jaq_std::funs()).chain(jaq_json::funs());
-        let loader = Loader::new(defs);
-        let arena = Arena::default();
-        let modules = match loader.load(&arena, program) {
-            Ok(m) => m,
-            Err(_) => {
-                writeln!(context.stderr(), "jq: compile error in filter")?;
-                return Ok(ExecutionResult::new(2));
-            }
-        };
-        let filter = match Compiler::default().with_funs(funs).compile(modules) {
-            Ok(f) => f,
-            Err(_) => {
-                writeln!(context.stderr(), "jq: compile error")?;
-                return Ok(ExecutionResult::new(3));
-            }
-        };
-
-        let cwd = context.shell.working_dir().to_path_buf();
-        let mut out = context.stdout();
-
-        // Gather input bytes.
-        let raw = if self.null_input {
-            Vec::new()
-        } else if self.files.is_empty() {
-            let mut b = Vec::new();
-            context.stdin().read_to_end(&mut b)?;
-            b
-        } else {
-            let mut b = Vec::new();
-            for f in &self.files {
-                b.extend(std::fs::read(abs(&cwd, f)).unwrap_or_default());
-            }
-            b
-        };
-
-        // Build the input value stream.
-        let inputs: Vec<Val> = if self.null_input {
-            vec![Val::Null]
-        } else if self.raw_input {
-            String::from_utf8_lossy(&raw)
-                .lines()
-                .map(|l| Val::from(l.to_string()))
-                .collect()
-        } else {
-            // Report malformed JSON instead of silently dropping it (exit 0).
-            let mut vals = Vec::new();
-            for r in jaq_json::read::parse_many(&raw) {
-                match r {
-                    Ok(v) => vals.push(v),
-                    Err(e) => {
-                        let _ = writeln!(context.stderr(), "jq: parse error: {e:?}");
-                        return Ok(ExecutionResult::new(2));
-                    }
-                }
-            }
-            vals
-        };
-
-        let mut exit = 0u8;
-        for input in inputs {
-            let ctx = Ctx::<jaq_core::data::JustLut<Val>>::new(&filter.lut, Vars::new([]));
-            for result in filter.id.run((ctx, input)) {
-                match result {
-                    Ok(v) => {
-                        if self.raw {
-                            match &v {
-                                Val::TStr(b) | Val::BStr(b) => {
-                                    writeln!(out, "{}", String::from_utf8_lossy(b.as_ref()))?;
-                                    continue;
-                                }
-                                _ => {}
-                            }
-                        }
-                        writeln!(out, "{v}")?;
-                    }
-                    Err(e) => {
-                        writeln!(context.stderr(), "jq: error: {e:?}")?;
-                        exit = 5;
-                    }
-                }
-            }
-        }
-        out.flush()?;
-        Ok(ExecutionResult::new(exit))
-    }
-}
-
-// ----------------------------------------------------- find / tar arg shims
-//
-// `find` and `tar` have historical CLI syntaxes that clap can't parse directly:
-// find uses single-dash long predicates (`-name`/`-type`/`-maxdepth`) and tar
-// accepts a dashless leading mode bundle (`tar czf …`). Both are what agents
-// reflexively type. These custom registrations rewrite argv into the clap form,
-// then reuse the existing FindCommand/TarCommand logic.
-
-fn find_content(
-    _n: &str,
-    _t: builtins::ContentType,
-    _o: &builtins::ContentOptions,
-) -> Result<String, brush_core::Error> {
-    Ok("find: walk the file hierarchy".to_string())
-}
-
-fn exec_find(
-    context: ExecutionContext<'_, brush_core::extensions::DefaultShellExtensions>,
-    args: Vec<brush_core::CommandArg>,
-) -> futures::future::BoxFuture<'_, Result<ExecutionResult, brush_core::Error>> {
-    Box::pin(async move {
-        let argv = args.iter().skip(1).map(ToString::to_string).map(|a| {
-            match a.as_str() {
-                "-name" | "-iname" => "--name".to_string(),
-                "-type" => "--type".to_string(),
-                "-maxdepth" => "--maxdepth".to_string(),
-                other => other.to_string(),
-            }
-        });
-        match FindCommand::try_parse_from(std::iter::once("find".to_string()).chain(argv)) {
-            Ok(cmd) => builtins::Command::execute(&cmd, context).await,
-            Err(e) => {
-                let _ = write!(context.stderr(), "{e}");
-                Ok(ExecutionResult::new(2))
-            }
-        }
-    })
-}
-
-pub fn find_registration() -> builtins::Registration<brush_core::extensions::DefaultShellExtensions> {
-    builtins::Registration {
-        execute_func: exec_find,
-        content_func: find_content,
-        disabled: false,
-        special_builtin: false,
-        declaration_builtin: false,
-    }
-}
-
-fn tar_content(
-    _n: &str,
-    _t: builtins::ContentType,
-    _o: &builtins::ContentOptions,
-) -> Result<String, brush_core::Error> {
-    Ok("tar: create/extract archives (optionally gzip)".to_string())
-}
-
-fn exec_tar(
-    context: ExecutionContext<'_, brush_core::extensions::DefaultShellExtensions>,
-    args: Vec<brush_core::CommandArg>,
-) -> futures::future::BoxFuture<'_, Result<ExecutionResult, brush_core::Error>> {
-    Box::pin(async move {
-        let mut argv: Vec<String> = args.iter().skip(1).map(ToString::to_string).collect();
-        // Old-style `tar czf f.tgz …` (no leading dash): if the first token is a
-        // bare mode bundle, dash it so clap sees `-czf`.
-        if let Some(first) = argv.first_mut() {
-            if !first.starts_with('-')
-                && !first.is_empty()
-                && first.chars().all(|c| "cxtruzjJvfhO".contains(c))
-                && first.chars().any(|c| "cxtru".contains(c))
-            {
-                *first = format!("-{first}");
-            }
-        }
-        match TarCommand::try_parse_from(std::iter::once("tar".to_string()).chain(argv)) {
-            Ok(cmd) => builtins::Command::execute(&cmd, context).await,
-            Err(e) => {
-                let _ = write!(context.stderr(), "{e}");
-                Ok(ExecutionResult::new(2))
-            }
-        }
-    })
-}
-
-pub fn tar_registration() -> builtins::Registration<brush_core::extensions::DefaultShellExtensions> {
-    builtins::Registration {
-        execute_func: exec_tar,
-        content_func: tar_content,
-        disabled: false,
-        special_builtin: false,
-        declaration_builtin: false,
-    }
-}

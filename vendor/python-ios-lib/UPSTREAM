@@ -1,0 +1,3 @@
+repository=https://github.com/yu314-coder/python-ios-lib
+revision=a8c166b210d38bf09864a1ea16689315ecf5fc54
+vendored_subset=NumPy,SciPy,Pandas,Pillow,Matplotlib,Plotly,Dateutil,FontTools,Pyparsing

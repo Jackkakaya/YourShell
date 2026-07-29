@@ -9,6 +9,10 @@
 //! its own instance, this needs neither the process-state lock nor fd dup2 —
 //! output is written directly to the session's OpenFile.
 //!
+//! The request carries a shared secret (`YS_NODE_TOKEN`): iOS does not isolate
+//! loopback between apps, so an unauthenticated dispatcher would let any other
+//! app on the device execute Node code inside our sandbox.
+//!
 //! Compiled only with the `node` cargo feature.
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -79,7 +83,9 @@ fn content(
     _content_type: ContentType,
     _options: &ContentOptions,
 ) -> Result<String, brush_core::Error> {
-    Ok(format!("{name}: Node.js 18 (nodejs-mobile, resident instance)"))
+    Ok(format!(
+        "{name}: Node.js 18 (nodejs-mobile, resident instance)"
+    ))
 }
 
 fn exec_node(
@@ -129,9 +135,11 @@ fn exec_node(
         // live keyboard would block forever on an EOF that never comes; a
         // dev+inode fd comparison is unreliable for pipes.
         let stdin_is_interactive = !context.params.is_fd_specified(0.into());
-        let cmd_stdin = context
-            .try_fd(0.into())
-            .and_then(|f| f.try_borrow_as_fd().ok().and_then(|b| b.try_clone_to_owned().ok()));
+        let cmd_stdin = context.try_fd(0.into()).and_then(|f| {
+            f.try_borrow_as_fd()
+                .ok()
+                .and_then(|b| b.try_clone_to_owned().ok())
+        });
         let mut stdin_data = Vec::new();
         if !stdin_is_interactive {
             if let Some(fd) = cmd_stdin {
@@ -143,9 +151,10 @@ fn exec_node(
 
         let mut out = context.stdout();
         let mut err = context.stderr();
-        let code = tokio::task::spawn_blocking(move || run_via_resident(&request, &mut out, &mut err))
-            .await
-            .unwrap_or(126);
+        let code =
+            tokio::task::spawn_blocking(move || run_via_resident(&request, &mut out, &mut err))
+                .await
+                .unwrap_or(126);
 
         #[expect(clippy::cast_sign_loss)]
         Ok(ExecutionResult::new((code & 0xff) as u8))
@@ -169,8 +178,14 @@ fn build_request(argv: &[String], cwd: &str, env: &[(String, String)], stdin: &[
         .iter()
         .map(|(k, v)| format!("\"{}\":\"{}\"", esc(k), esc(v)))
         .collect();
+    // Shared secret proving we are the host that launched this Node instance.
+    // iOS loopback is not isolated between apps, so the dispatcher refuses any
+    // request without it (see the auth block in main.js). The host sets it once
+    // per launch, before either the core or Node starts.
+    let token = std::env::var("YS_NODE_TOKEN").unwrap_or_default();
     format!(
-        "{{\"argv\":[{}],\"cwd\":\"{}\",\"env\":{{{}}},\"stdin\":\"{}\"}}\n",
+        "{{\"tok\":\"{}\",\"argv\":[{}],\"cwd\":\"{}\",\"env\":{{{}}},\"stdin\":\"{}\"}}\n",
+        esc(&token),
         argv_json.join(","),
         esc(cwd),
         env_json.join(","),
@@ -178,11 +193,7 @@ fn build_request(argv: &[String], cwd: &str, env: &[(String, String)], stdin: &[
     )
 }
 
-fn run_via_resident(
-    request: &str,
-    out: &mut impl Write,
-    err: &mut impl Write,
-) -> i32 {
+fn run_via_resident(request: &str, out: &mut impl Write, err: &mut impl Write) -> i32 {
     let Some(port) = resident_port() else {
         let _ = writeln!(err, "node: resident instance not available");
         return 125;
@@ -194,7 +205,10 @@ fn run_via_resident(
             return 125;
         }
     };
-    if stream.set_read_timeout(Some(Duration::from_secs(600))).is_err() {
+    if stream
+        .set_read_timeout(Some(Duration::from_secs(600)))
+        .is_err()
+    {
         // best effort
     }
     let mut writer = match stream.try_clone() {
@@ -246,6 +260,8 @@ fn frame_str<'a>(line: &'a str, key: &str) -> Option<&'a str> {
 fn frame_int(line: &str, key: &str) -> Option<i32> {
     let start = line.find(key)? + key.len();
     let rest = &line[start..];
-    let end = rest.find(|c: char| !c.is_ascii_digit() && c != '-').unwrap_or(rest.len());
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit() && c != '-')
+        .unwrap_or(rest.len());
     rest[..end].parse().ok()
 }

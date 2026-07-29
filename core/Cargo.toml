@@ -16,22 +16,40 @@ futures = { version = "0.3.33", default-features = false, features = ["std"] }
 libc = "0.2.189"
 brush-coreutils-builtins = { version = "0.1.0", path = "../vendor/brush/brush-coreutils-builtins", features = ["coreutils.all"] }
 uucore = "0.8"
-grep-searcher = "0.1"
-grep-regex = "0.1"
-grep-matcher = "0.1"
+# Official ripgrep CLI core with argv injection; no flags are mirrored here.
+ripgrep-cli = { path = "../vendor/ripgrep-cli" }
+# uutils/findutils — real GNU `find` (~75 predicates) and `xargs`. Vendored and
+# patched with a pluggable exec seam because iOS forbids fork/exec; see
+# vendor/patches/findutils/src/exec_hook.rs.
+findutils = { path = "../vendor/patches/findutils" }
+# uutils sed — real GNU sed (-i/-E/-n/-f/-s/-z…) replacing a 2-flag hand-written
+# adapter over sedregex. Same `uumain(args)` entry shape as coreutils.
+sed = "0.1"
+# uutils grep — real GNU grep, replacing a hand-written CLI over ripgrep's
+# engine. Same `uumain(args)` shape as coreutils. Pulls in oniguruma (C, MIT,
+# built with cc like our vendored awk) for BRE/ERE/-P semantics that Rust's
+# `regex` cannot express — backreferences and lookaround.
+uu_grep = "0.1"
+# uutils stat is not included in Brush's curated bundle; use the official
+# crate directly so its complete parser/format semantics remain upstream-owned.
+uu_stat = "0.8"
+# uutils/diffutils — real `diff` (unified/context/ed/side-by-side) and `cmp`,
+# replacing a 1-flag hand-written diff. Vendored: upstream exits the process on
+# a bad flag and returns an opaque ExitCode. See vendor/patches/diffutils.
+diffutils = { path = "../vendor/patches/diffutils" }
 base64 = "0.23.0"
 walkdir = "2.5.0"
-similar = "3.1.1"
-jaq-core = "3.1.0"
-jaq-std = "3.0.1"
-jaq-json = "2.0.1"
-sedregex = "0.2.5"
-ureq = "3.3.0"
 flate2 = "1.1.9"
-tar = "0.4.46"
 zip = "8.6.0"
+# Supplies SQLite 3.46.0 itself. Its official CLI is compiled separately from
+# vendor/sqlite-shell/shell.c and links to this same engine.
 rusqlite = { version = "0.32", features = ["bundled"] }
-git2 = { version = "0.21.0", default-features = false, features = ["https", "vendored-libgit2", "vendored-openssl"] }
+# libgit2 supplies both smart HTTPS and SSH transports in-process. The SSH
+# feature was explicitly cross-compiled for aarch64-apple-ios-sim before being
+# enabled; authentication/known_hosts policy is implemented by our callbacks.
+git2 = { version = "0.21.0", default-features = false, features = ["https", "ssh", "vendored-libgit2", "vendored-openssl"] }
+# Upstream Rust multi-connection downloader. Pinned because the repository has
+# no stable crate release workflow; its own Clap parser remains authoritative.
 russh = { version = "0.62", default-features = false, features = ["ring", "flate2", "rsa"] }
 russh-sftp = "2.3"
 tokio-fd = "0.3"
@@ -67,6 +85,10 @@ harness = false
 name = "concurrency"
 harness = false
 
+[[test]]
+name = "concurrency_safe"
+harness = false
+
 [features]
 python = []
 vision = []
@@ -74,3 +96,11 @@ node = []
 
 [build-dependencies]
 cc = "1.3.0"
+
+[[test]]
+name = "flag_coverage"
+harness = false
+
+[[test]]
+name = "git_compat"
+harness = false

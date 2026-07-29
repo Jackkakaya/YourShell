@@ -8,21 +8,36 @@
 
 mod awk_adapter;
 mod builtins_extra;
+mod command_host;
 mod commands_ext;
+mod curl_adapter;
+mod diffutils_adapter;
 mod editor;
 mod ffi_util;
+mod findutils_adapter;
 mod git_adapter;
+mod grep_adapter;
+mod gzip_adapter;
+mod ios_commands;
+mod ios_host;
+mod jq_adapter;
 mod mosh_adapter;
-mod sftp_adapter;
-mod ssh_adapter;
-mod uutils_adapter;
-#[cfg(feature = "python")]
-mod python_adapter;
-#[cfg(feature = "vision")]
-mod ocr_adapter;
 #[cfg(feature = "node")]
 mod node_adapter;
+#[cfg(feature = "vision")]
+mod ocr_adapter;
+#[cfg(feature = "python")]
+mod python_adapter;
+mod ripgrep_adapter;
+mod sed_adapter;
 pub mod selftest;
+mod sftp_adapter;
+mod sqlite_adapter;
+mod ssh_adapter;
+mod tar_adapter;
+mod unzip_adapter;
+mod uutils_adapter;
+mod wget_adapter;
 
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr, CString};
@@ -108,31 +123,65 @@ pub(crate) async fn build_shell(
 ) -> Result<brush_core::Shell, brush_core::Error> {
     let mut builder = brush_core::Shell::builder()
         .default_builtins(BuiltinSet::BashMode)
-        .builtin("grep", core_builtins::builtin::<builtins_extra::GrepCommand, DefaultShellExtensions>())
-        .builtin("clear", core_builtins::builtin::<builtins_extra::ClearCommand, DefaultShellExtensions>())
-        .builtin("which", core_builtins::builtin::<commands_ext::WhichCommand, DefaultShellExtensions>())
-        .builtin("find", commands_ext::find_registration())
-        .builtin("tree", core_builtins::builtin::<commands_ext::TreeCommand, DefaultShellExtensions>())
-        .builtin("diff", core_builtins::builtin::<commands_ext::DiffCommand, DefaultShellExtensions>())
-        .builtin("gzip", core_builtins::builtin::<commands_ext::GzipCommand, DefaultShellExtensions>())
-        .builtin("gunzip", core_builtins::builtin::<commands_ext::GunzipCommand, DefaultShellExtensions>())
-        .builtin("sed", core_builtins::builtin::<commands_ext::SedCommand, DefaultShellExtensions>())
-        .builtin("curl", core_builtins::builtin::<commands_ext::CurlCommand, DefaultShellExtensions>())
-        .builtin("wget", core_builtins::builtin::<commands_ext::WgetCommand, DefaultShellExtensions>())
-        .builtin("tar", commands_ext::tar_registration())
-        .builtin("zip", core_builtins::builtin::<commands_ext::ZipCommand, DefaultShellExtensions>())
-        .builtin("unzip", core_builtins::builtin::<commands_ext::UnzipCommand, DefaultShellExtensions>())
-        .builtin("sqlite3", core_builtins::builtin::<commands_ext::SqliteCommand, DefaultShellExtensions>())
-        .builtin("jq", core_builtins::builtin::<commands_ext::JqCommand, DefaultShellExtensions>())
+        .builtin("grep", grep_adapter::registration())
+        .builtin("egrep", grep_adapter::registration())
+        .builtin("fgrep", grep_adapter::registration())
+        .builtin("stat", uutils_adapter::stat_registration())
+        .builtin("pbcopy", ios_commands::copy_registration())
+        .builtin("pbpaste", ios_commands::paste_registration())
+        .builtin("open", ios_commands::open_registration())
+        .builtin("openurl", ios_commands::open_registration())
+        // `rg` ships next to `grep`, never as an alias for it: rg recurses by
+        // default and honours .gitignore, so aliasing would silently drop
+        // matches. Both share ripgrep's engine; only the CLI semantics differ.
+        .builtin("rg", ripgrep_adapter::registration())
+        .builtin(
+            "clear",
+            core_builtins::builtin::<builtins_extra::ClearCommand, DefaultShellExtensions>(),
+        )
+        .builtin(
+            "which",
+            core_builtins::builtin::<commands_ext::WhichCommand, DefaultShellExtensions>(),
+        )
+        .builtin("find", findutils_adapter::find_registration())
+        .builtin("xargs", findutils_adapter::xargs_registration())
+        .builtin(
+            "tree",
+            core_builtins::builtin::<commands_ext::TreeCommand, DefaultShellExtensions>(),
+        )
+        .builtin("diff", diffutils_adapter::diff_registration())
+        .builtin("cmp", diffutils_adapter::cmp_registration())
+        .builtin("gzip", gzip_adapter::registration())
+        .builtin("gunzip", gzip_adapter::registration())
+        .builtin("sed", sed_adapter::registration())
+        .builtin("curl", curl_adapter::registration())
+        .builtin("wget", wget_adapter::registration())
+        .builtin("tar", tar_adapter::registration())
+        .builtin(
+            "zip",
+            core_builtins::builtin::<commands_ext::ZipCommand, DefaultShellExtensions>(),
+        )
+        .builtin("unzip", unzip_adapter::registration())
+        .builtin("sqlite3", sqlite_adapter::registration())
+        .builtin("jq", jq_adapter::registration())
         .builtin("git", git_adapter::registration())
         .builtin("awk", awk_adapter::registration())
         .builtin("ssh", ssh_adapter::registration())
         .builtin("scp", sftp_adapter::registration_scp())
         .builtin("sftp", sftp_adapter::registration_sftp())
         .builtin("mosh", mosh_adapter::registration())
-        .builtin("edit", core_builtins::builtin::<editor::EditorCommand, DefaultShellExtensions>())
-        .builtin("vi", core_builtins::builtin::<editor::EditorCommand, DefaultShellExtensions>())
-        .builtin("nano", core_builtins::builtin::<editor::EditorCommand, DefaultShellExtensions>());
+        .builtin(
+            "edit",
+            core_builtins::builtin::<editor::EditorCommand, DefaultShellExtensions>(),
+        )
+        .builtin(
+            "vi",
+            core_builtins::builtin::<editor::EditorCommand, DefaultShellExtensions>(),
+        )
+        .builtin(
+            "nano",
+            core_builtins::builtin::<editor::EditorCommand, DefaultShellExtensions>(),
+        );
     for name in uutils_adapter::command_names() {
         builder = builder.builtin(name, uutils_adapter::registration());
     }
@@ -161,6 +210,17 @@ pub(crate) async fn build_shell(
         .shell_name("ashell".to_string())
         .build()
         .await
+}
+
+/// Installs app-owned capabilities for iOS Host commands. Each callback is
+/// optional so the core remains usable in tests and non-UIKit hosts.
+#[unsafe(no_mangle)]
+pub extern "C" fn ashell_ios_host_install(
+    copy: Option<ios_host::CopyFn>,
+    paste: Option<ios_host::PasteFn>,
+    open: Option<ios_host::OpenFn>,
+) -> i32 {
+    ios_host::install(copy, paste, open) as i32
 }
 
 /// Builds the standard shell with no preset fds; used by the integration
@@ -209,8 +269,12 @@ async fn run_capture(
     // so this temporary redirection is race-free.
     let nul = brush_core::openfiles::null().ok();
     let old0 = nul.map(|n| shell.open_files_mut().set_fd(0.into(), n));
-    let old1 = shell.open_files_mut().set_fd(1.into(), OpenFile::from(out_w));
-    let old2 = shell.open_files_mut().set_fd(2.into(), OpenFile::from(err_w));
+    let old1 = shell
+        .open_files_mut()
+        .set_fd(1.into(), OpenFile::from(out_w));
+    let old2 = shell
+        .open_files_mut()
+        .set_fd(2.into(), OpenFile::from(err_w));
 
     let params = shell.default_exec_params();
     let source_info = brush_core::SourceInfo::from("agent");
@@ -246,7 +310,11 @@ async fn run_capture(
         // spawn_blocking command may still hold a pipe write end — joining the
         // drain threads could block forever. Leave them to finish in the
         // background and return without the (now-moot) output.
-        let reason = if exit_code == 124 { "timed out" } else { "cancelled" };
+        let reason = if exit_code == 124 {
+            "timed out"
+        } else {
+            "cancelled"
+        };
         CaptureReply {
             exit_code,
             stdout: String::new(),
@@ -344,8 +412,8 @@ pub extern "C" fn ashell_session_new(
                 let mut shell = match build_shell(fds, std::path::Path::new(&working_dir)).await {
                     Ok(s) => s,
                     Err(e) => {
-                        let msg = CString::new(format!("shell init failed: {e}"))
-                            .unwrap_or_default();
+                        let msg =
+                            CString::new(format!("shell init failed: {e}")).unwrap_or_default();
                         if shell_alive.load(Ordering::Acquire) {
                             done_cb(shell_ctx.0, 127, msg.as_ptr());
                         }
@@ -372,10 +440,9 @@ pub extern "C" fn ashell_session_new(
                                 // aborting async awaits (ssh/curl/…). 130 = SIGINT.
                                 () = shell_cancel.notified() => 130,
                             };
-                            let cwd = CString::new(
-                                shell.working_dir().to_string_lossy().into_owned(),
-                            )
-                            .unwrap_or_default();
+                            let cwd =
+                                CString::new(shell.working_dir().to_string_lossy().into_owned())
+                                    .unwrap_or_default();
                             if shell_alive.load(Ordering::Acquire) {
                                 done_cb(shell_ctx.0, exit_code, cwd.as_ptr());
                             }
@@ -428,7 +495,9 @@ pub extern "C" fn ashell_exec(session: *mut Session, cmd: *const c_char) {
         // SAFETY: both pointers null-checked above; `session` is a live handle
         // from ashell_session_new and `cmd` a valid C string, per the contract.
         let session = unsafe { &*session };
-        let cmd = unsafe { CStr::from_ptr(cmd) }.to_string_lossy().into_owned();
+        let cmd = unsafe { CStr::from_ptr(cmd) }
+            .to_string_lossy()
+            .into_owned();
         let _ = session.cmd_tx.send(SessionMsg::Exec(cmd));
     });
 }
@@ -459,7 +528,9 @@ pub extern "C" fn ashell_run_capture(
     ffi_guard(std::ptr::null_mut(), || {
         // SAFETY: both pointers null-checked above; valid per the FFI contract.
         let session = unsafe { &*session };
-        let cmd = unsafe { CStr::from_ptr(cmd) }.to_string_lossy().into_owned();
+        let cmd = unsafe { CStr::from_ptr(cmd) }
+            .to_string_lossy()
+            .into_owned();
         let (tx, rx) = mpsc::sync_channel::<CaptureReply>(1);
         let timeout = (timeout_ms != 0).then_some(timeout_ms);
         if session
@@ -474,7 +545,11 @@ pub extern "C" fn ashell_run_capture(
         };
         // A C string can't carry interior NULs; strip them (agent output is
         // text — binary handling is the caller's policy).
-        let to_c = |s: String| CString::new(s.replace('\0', "")).unwrap_or_default().into_raw();
+        let to_c = |s: String| {
+            CString::new(s.replace('\0', ""))
+                .unwrap_or_default()
+                .into_raw()
+        };
         Box::into_raw(Box::new(CaptureResult {
             exit_code: reply.exit_code,
             stdout: to_c(reply.stdout),
@@ -536,7 +611,9 @@ pub extern "C" fn ashell_complete(
     ffi_guard(empty(), || {
         // SAFETY: both pointers null-checked above; valid per the FFI contract.
         let session = unsafe { &*session };
-        let line = unsafe { CStr::from_ptr(line) }.to_string_lossy().into_owned();
+        let line = unsafe { CStr::from_ptr(line) }
+            .to_string_lossy()
+            .into_owned();
         let (reply_tx, reply_rx) = mpsc::sync_channel::<CompletionReply>(1);
         if session
             .cmd_tx

@@ -115,39 +115,364 @@ pub static CASES: &[Case] = &[
     case!("interactive-builtins-exist", "type bg fg jobs suspend disown bind enable fc caller compgen complete compopt kill ulimit set unset return break continue exit read > /dev/null; echo all-exist=$?", Eq("all-exist=0")),
     // ---- custom in-process commands ----
     case!("grep-basic", "grep fork poem.txt", Eq("no fork, no exec — and yet")),
+    case!("egrep-alias", "printf 'ab\nac\n' | egrep 'a[bc]'", Eq("ab\nac")),
+    case!("fgrep-alias", "printf 'a+b\nab\n' | fgrep 'a+b'", Eq("a+b")),
     case!("grep-stdin-pipe", "cat poem.txt | grep -c o", Eq("3")),
     case!("grep-i", "printf 'Hello\\nworld\\n' | grep -i hello", Eq("Hello")),
     case!("grep-v", "printf 'a\\nb\\na\\n' | grep -v a", Eq("b")),
     case!("grep-n", "printf 'x\\ny\\n' | grep -n y", Eq("2:y")),
-    case!("grep-o-regex", "echo abc123def | grep -o '[0-9]+'", Eq("123")),
+    // `-o` with each of grep's three pattern syntaxes. The BRE cases are here
+    // because the previous grep was a hand-written CLI over Rust's `regex`,
+    // which is always ERE-shaped: it had no way to express BRE, so it matched
+    // `[0-9]+` where real grep does not, and this case was written to assert
+    // that wrong answer. Keep all three so a future engine swap cannot quietly
+    // collapse the distinction again.
+    case!("grep-o-ere", "echo abc123def | grep -oE '[0-9]+'", Eq("123")),
+    case!("grep-o-bre-escaped", r"echo abc123def | grep -o '[0-9]\+'", Eq("123")),
+    // Default syntax is BRE, where `+` is a literal — so this must NOT match.
+    case!(
+        "grep-o-bre-literal-plus",
+        "echo abc123def | grep -o '[0-9]+'; echo rc=$?",
+        Eq("rc=1")
+    ),
     case!("grep-nomatch-exit", "grep zzz poem.txt; echo rc=$?", Eq("rc=1")),
+    // Capabilities Rust's `regex` cannot express at all, so these could not have
+    // passed before the switch to uutils/grep (oniguruma-backed): a
+    // backreference, and a PCRE lookahead.
+    case!("grep-backreference", r"printf 'abab\nabcd\n' | grep '\(ab\)\1'", Eq("abab")),
+    case!("grep-P-lookahead", "printf 'foo1\\nfoo2\\n' | grep -P 'foo(?=1)'", Eq("foo1")),
+    case!(
+        "grep-L-files-without-match",
+        "printf 'x\\n' > gl1.txt; printf 'y\\n' > gl2.txt; grep -L x gl1.txt gl2.txt",
+        Eq("gl2.txt")
+    ),
+    // GNU flag surface. These exist because a *partial* grep is worse than no
+    // grep: the caller (an agent) writes the flags every other Unix accepts, and
+    // a rejected flag makes it retry variations instead of changing approach.
+    // `grep -iE` silently failing this way killed a whole selftest run once —
+    // it exited at once, leaving its upstream writing to a reader-less pipe.
+    case!("grep-E", "printf 'a\\nb\\n' | grep -E 'a|b' | wc -l", Has("2")),
+    case!("grep-F-meta", "printf 'a.c\\nabc\\n' | grep -F 'a.c'", Eq("a.c")),
+    case!("grep-q-exit", "printf 'x\\n' | grep -q x; echo rc=$?", Eq("rc=0")),
+    case!("grep-q-silent", "printf 'x\\n' | grep -q x | wc -c", Has("0")),
+    case!("grep-e-multi", "printf 'a\\nb\\nc\\n' | grep -e a -e c | wc -l", Has("2")),
+    case!("grep-x", "printf 'ab\\nabc\\n' | grep -x ab", Eq("ab")),
+    case!("grep-m", "printf 'a\\na\\na\\n' | grep -m1 a | wc -l", Has("1")),
+    case!("grep-w", "printf 'cat\\nconcat\\n' | grep -w cat", Eq("cat")),
+    case!(
+        "grep-context",
+        "printf '1\\n2\\nHIT\\n4\\n5\\n' | grep -C1 HIT | wc -l",
+        Has("3")
+    ),
+    case!(
+        "grep-A-B",
+        "printf '1\\nHIT\\n3\\n' | grep -A1 HIT | tail -1",
+        Eq("3")
+    ),
+    case!(
+        "grep-recursive",
+        "rm -rf gtree && mkdir -p gtree/sub && echo needle > gtree/sub/a.txt && grep -r needle gtree | wc -l",
+        Has("1")
+    ),
+    case!(
+        "grep-include",
+        "rm -rf gi && mkdir gi && echo needle > gi/a.rs && echo needle > gi/b.txt && grep -r --include='*.rs' needle gi | wc -l",
+        Has("1")
+    ),
+    case!(
+        "grep-exclude",
+        "rm -rf ge && mkdir ge && echo needle > ge/a.rs && echo needle > ge/b.txt && grep -r --exclude='*.txt' needle ge | wc -l",
+        Has("1")
+    ),
+    case!(
+        "grep-l-L",
+        "rm -rf gl && mkdir gl && echo yes > gl/hit.txt && echo no > gl/miss.txt && grep -rl yes gl",
+        Has("hit.txt")
+    ),
+    case!(
+        "grep-long-opts",
+        "printf 'A\\n' | grep --ignore-case --line-number a",
+        Eq("1:A")
+    ),
+    // `-h` must stay `--no-filename` (clap would otherwise claim it for help).
+    case!(
+        "grep-h-is-no-filename",
+        "rm -rf gh && mkdir gh && echo hit > gh/a.txt && echo hit > gh/b.txt && grep -rh hit gh | wc -l",
+        Has("2")
+    ),
+    // --- rg (ripgrep proper) --------------------------------------------
+    // Registered next to `grep`, not instead of it: rg recurses by default and
+    // honours .gitignore/hidden-file rules, so the two must not be aliased.
+    // These cases pin exactly those differences.
+    case!(
+        "rg-recursive-by-default",
+        "rm -rf rgt && mkdir -p rgt/sub && echo needle > rgt/sub/a.txt && (cd rgt && rg --no-heading needle | wc -l)",
+        Has("1")
+    ),
+    case!(
+        "rg-relative-paths",
+        "rm -rf rgp && mkdir -p rgp/sub && echo needle > rgp/sub/a.txt && (cd rgp && rg --no-heading -l needle)",
+        Eq("sub/a.txt")
+    ),
+    case!(
+        "rg-respects-gitignore",
+        "rm -rf rgi && mkdir rgi && (cd rgi && git init -q . && echo skip.txt > .gitignore && echo needle > skip.txt && echo needle > keep.txt && rg --no-heading -l needle)",
+        Eq("keep.txt")
+    ),
+    case!(
+        "rg-no-ignore-sees-it",
+        "(cd rgi && rg --no-ignore --no-heading -l needle | wc -l)",
+        Has("2")
+    ),
+    case!(
+        "rg-skips-hidden",
+        "rm -rf rgh && mkdir rgh && (cd rgh && echo needle > .secret && echo needle > plain.txt && rg --no-heading -l needle)",
+        Eq("plain.txt")
+    ),
+    case!(
+        "rg-hidden-flag",
+        "(cd rgh && rg --hidden --no-heading -l needle | wc -l)",
+        Has("2")
+    ),
+    case!(
+        "rg-glob",
+        "rm -rf rgg && mkdir rgg && (cd rgg && echo needle > a.rs && echo needle > b.txt && rg -g '*.rs' --no-heading -l needle)",
+        Eq("a.rs")
+    ),
+    case!(
+        "rg-glob-negated",
+        "(cd rgg && rg -g '!*.txt' --no-heading -l needle)",
+        Eq("a.rs")
+    ),
+    case!(
+        "rg-type",
+        "(cd rgg && rg -t rust --no-heading -l needle)",
+        Eq("a.rs")
+    ),
+    case!("rg-stdin", "printf 'a\\nb\\n' | rg b", Eq("b")),
+    case!("rg-count", "(cd rgg && rg -c needle | wc -l)", Has("2")),
+    case!("rg-quiet-exit", "printf 'x\\n' | rg -q x; echo rc=$?", Eq("rc=0")),
+    case!(
+        "rg-nomatch-exit",
+        "printf 'x\\n' | rg zzz; echo rc=$?",
+        Eq("rc=1")
+    ),
+    case!("rg-fixed-strings", "printf 'a.c\\nabc\\n' | rg -F 'a.c'", Eq("a.c")),
+    case!(
+        "rg-smart-case",
+        "printf 'Hello\\n' | rg -S hello",
+        Eq("Hello")
+    ),
+    case!(
+        "rg-smart-case-respects-upper",
+        "printf 'hello\\n' | rg -S Hello; echo rc=$?",
+        Has("rc=1")
+    ),
+    case!(
+        "rg-replace",
+        "printf 'foo bar\\n' | rg -r baz foo",
+        Eq("baz bar")
+    ),
+    case!(
+        "rg-context",
+        "printf '1\\nHIT\\n3\\n' | rg -A1 HIT | wc -l",
+        Has("2")
+    ),
+    case!(
+        "rg-files",
+        "(cd rgg && rg --files | wc -l)",
+        Has("2")
+    ),
+    case!(
+        "rg-max-depth",
+        "rm -rf rgd && mkdir -p rgd/a/b && echo needle > rgd/a/b/deep.txt && (cd rgd && rg --max-depth 1 --no-heading -l needle | wc -l)",
+        Has("0")
+    ),
     case!("uname", "uname", Has("Darwin")),
     case!("clear", "clear -x | wc -c", Has("7")),
     case!("clear-scrollback", "clear | od -c | head -1", Has("033")),
     // ---- ext commands (crate-backed) ----
     case!("which-builtin", "which cd", Has("builtin")),
     case!("which-cmd", "which grep 2>&1 | head -1", Has("grep")),
-    case!("find-name", "mkdir -p ft/sub; touch ft/a.txt ft/sub/b.txt ft/c.log; find ft --name '*.txt' | sort | tr '\\n' ' '", Has("a.txt"), Has("b.txt"), Not("c.log")),
-    case!("find-type-d", "mkdir -p fd/x fd/y; find fd --type d | wc -l", Has("3")),
-    case!("find-maxdepth", "mkdir -p md/1/2/3; find md --type d --maxdepth 1 | wc -l", Has("2")),
+    case!("stat-format", "printf x > st.txt; stat -c '%n %s' st.txt", Eq("st.txt 1")),
+    // --- find / xargs (uutils/findutils, real GNU syntax) ----------------
+    // NOTE: these used to be written as `find ft --name '*.txt'` — a
+    // double-dash spelling the old 3-flag shim invented, which no real find
+    // accepts. The tests had been bent to fit the broken CLI. Single-dash GNU
+    // predicates are what an agent actually types, so that is what is pinned.
+    case!(
+        "find-name",
+        "rm -rf ft; mkdir -p ft/sub; touch ft/a.txt ft/sub/b.txt ft/c.log; find ft -name '*.txt' | sort | tr '\\n' ' '",
+        Has("a.txt"), Has("b.txt"), Not("c.log")
+    ),
+    case!("find-type-d", "rm -rf fd; mkdir -p fd/x fd/y; find fd -type d | wc -l", Has("3")),
+    case!("find-type-f", "rm -rf ff; mkdir -p ff; touch ff/a ff/b; find ff -type f | wc -l", Has("2")),
+    case!("find-maxdepth", "rm -rf md; mkdir -p md/1/2/3; find md -type d -maxdepth 1 | wc -l", Has("2")),
+    case!(
+        "find-iname",
+        "rm -rf fi; mkdir fi; touch fi/README.md; find fi -iname 'readme*' | wc -l",
+        Has("1")
+    ),
+    case!(
+        "find-not",
+        "rm -rf fn; mkdir fn; touch fn/a.txt fn/b.log; find fn -type f ! -name '*.log' | wc -l",
+        Has("1")
+    ),
+    case!(
+        "find-or",
+        "rm -rf fo; mkdir fo; touch fo/a.rs fo/b.py fo/c.txt; find fo \\( -name '*.rs' -o -name '*.py' \\) | wc -l",
+        Has("2")
+    ),
+    // GNU `-size` rounds UP to whole units, so a 10-byte file is already 1k and
+    // only the empty file is "< 1k". Pinning the real semantics, not the
+    // intuitive-but-wrong one.
+    case!(
+        "find-size",
+        "rm -rf fs; mkdir fs; printf '0123456789' > fs/big; touch fs/empty; find fs -type f -size -1k | wc -l",
+        Has("1")
+    ),
+    case!(
+        "find-print0-null",
+        "rm -rf fp; mkdir fp; touch fp/a; find fp -type f -print0 | tr '\\0' 'Z'",
+        Has("Z")
+    ),
+    case!(
+        "find-newer-mtime",
+        "rm -rf fm; mkdir fm; touch fm/a; find fm -type f -mtime -1 | wc -l",
+        Has("1")
+    ),
+    // -exec has no fork/exec on iOS; the vendored crate routes it through the
+    // exec hook, which runs the argv in an in-process subshell.
+    case!(
+        "find-exec",
+        "rm -rf fe; mkdir fe; touch fe/a.txt; find fe -name '*.txt' -exec echo FOUND {} \\;",
+        Has("FOUND"), Has("a.txt")
+    ),
+    case!(
+        "find-exec-plus",
+        "rm -rf fep; mkdir fep; touch fep/a fep/b; find fep -type f -exec echo BATCH {} +",
+        Has("BATCH")
+    ),
+    // xargs is 100% about running commands, so it only exists at all thanks to
+    // the exec hook.
+    case!("xargs-basic", "echo one two | xargs echo GOT", Has("GOT one two")),
+    case!("xargs-n1", "printf 'a\\nb\\n' | xargs -n1 echo X | wc -l", Has("2")),
+    case!("xargs-null", "printf 'a\\0b\\0' | xargs -0 echo | tr '\\n' ' '", Has("a b")),
+    case!("xargs-replace", "echo hi | xargs -I{} echo '[{}]'", Has("[hi]")),
+    case!(
+        "xargs-no-run-if-empty",
+        "printf '' | xargs -r echo SHOULD-NOT-APPEAR; echo done",
+        Has("done"), Not("SHOULD-NOT-APPEAR")
+    ),
+    case!(
+        "find-xargs-pipeline",
+        "rm -rf fx; mkdir fx; touch fx/a.txt fx/b.txt; find fx -name '*.txt' -print0 | xargs -0 -n1 echo ITEM | wc -l",
+        Has("2")
+    ),
     case!("tree-basic", "mkdir -p tr/a tr/b; touch tr/a/f.txt; tree tr", Has("a"), Has("f.txt"), Has("directories")),
-    case!("diff-changed", "printf 'a\\nb\\nc\\n' > d1.txt; printf 'a\\nX\\nc\\n' > d2.txt; diff d1.txt d2.txt; echo rc=$?", Has("-b"), Has("+X"), Has("rc=1")),
-    case!("diff-same", "printf 'a\\nb\\n' > s1.txt; cp s1.txt s2.txt; diff s1.txt s2.txt; echo rc=$?", Eq("rc=0")),
-    case!("gzip-roundtrip", "echo 'compress me please' > gz.txt; gzip gz.txt; [ -f gz.txt.gz ] && gunzip gz.txt.gz && cat gz.txt", Eq("compress me please")),
+    // --- diff / cmp (uutils/diffutils) -----------------------------------
+    // The old 1-flag hand-written diff emitted unified output by DEFAULT, and
+    // this test was written to match it. Real diff defaults to normal format
+    // (`2c2` / `< b` / `> X`) and only produces `-b`/`+X` under `-u`. Another
+    // case of the test having been bent to fit a wrong implementation.
+    case!(
+        "diff-normal-default",
+        "printf 'a\\nb\\nc\\n' > d1.txt; printf 'a\\nX\\nc\\n' > d2.txt; diff d1.txt d2.txt; echo rc=$?",
+        Has("2c2"), Has("< b"), Has("> X"), Has("rc=1")
+    ),
+    case!(
+        "diff-same",
+        "printf 'a\\nb\\n' > s1.txt; cp s1.txt s2.txt; diff s1.txt s2.txt; echo rc=$?",
+        Eq("rc=0")
+    ),
+    // Flags the previous implementation rejected outright. `-u` is the one
+    // every downstream tool (patch, git apply, review UIs) expects.
+    case!(
+        "diff-unified",
+        "diff -u d1.txt d2.txt",
+        Has("---"), Has("+++"), Has("@@"), Has("-b"), Has("+X")
+    ),
+    case!("diff-context", "diff -c d1.txt d2.txt", Has("***"), Has("---")),
+    case!("diff-brief", "diff -q d1.txt d2.txt", Has("differ")),
+    case!("diff-report-identical", "diff -s s1.txt s2.txt", Has("identical")),
+    case!("diff-ed-format", "diff -e d1.txt d2.txt", Has("2c")),
+    // GNU renders a substituted line as one `|` row; uutils splits it into `<`
+    // and `>` rows. Assert on the column markers, not GNU's exact rendering.
+    case!("diff-side-by-side", "diff -y d1.txt d2.txt", Has("<"), Has(">")),
+    case!("diff-unified-lines", "diff -U1 d1.txt d2.txt", Has("@@")),
+    // KNOWN GAP: uutils/diffutils 0.5.0 implements the output formats and
+    // -q/-s/-t/-U/-C, but NOT the comparison-tuning flags GNU has: -i
+    // (ignore-case), -w/-b (whitespace), -B (blank lines), -r (recursive),
+    // -N (treat absent as empty). `diff -i a b` currently fails with
+    // "Unknown option". Upstream is an early reimplementation; this is the sort
+    // of hole the flag-coverage audit is meant to keep visible rather than let
+    // it be discovered by an agent mid-task.
+    //
+    // cmp did not exist at all before.
+    case!("cmp-same", "cmp s1.txt s2.txt; echo rc=$?", Eq("rc=0")),
+    case!("cmp-differ", "cmp d1.txt d2.txt", Has("differ")),
+    case!("cmp-silent", "cmp -s d1.txt d2.txt; echo rc=$?", Eq("rc=1")),
+    case!("cmp-verbose", "cmp -l d1.txt d2.txt | head -1", Has("2")),
+    case!("gzip-roundtrip", "rm -f gz.txt gz.txt.gz; echo 'compress me please' > gz.txt; gzip gz.txt; [ -f gz.txt.gz ] && gunzip gz.txt.gz && cat gz.txt", Eq("compress me please")),
     case!("gzip-stdin-pipe", "echo hello | gzip -c | gunzip -c", Eq("hello")),
     case!("sed-substitute", "printf 'foo bar\\nfoo baz\\n' | sed 's/foo/XXX/'", Eq("XXX bar\nXXX baz")),
     case!("sed-global", "echo 'a a a' | sed 's/a/b/g'", Eq("b b b")),
     case!("sed-e-multi", "echo hello | sed -e 's/h/H/' -e 's/o/O/'", Eq("HellO")),
     case!("sed-empty-line", "printf 'a\\n\\nb\\n' | sed 's/^/X/'", Eq("Xa\nX\nXb")),
+    // Flags the previous 2-flag hand-written sed simply rejected. `-i` and `-n`
+    // in particular are what an agent reaches for first.
+    case!(
+        "sed-in-place",
+        "printf 'foo\\n' > si.txt && sed -i 's/foo/bar/' si.txt && cat si.txt",
+        Eq("bar")
+    ),
+    case!("sed-quiet-print", "printf 'a\\nb\\nc\\n' | sed -n '2p'", Eq("b")),
+    case!("sed-extended-regex", "echo abc123 | sed -E 's/[0-9]+/N/'", Eq("abcN")),
+    case!("sed-delete", "printf 'a\\nb\\nc\\n' | sed '2d' | tr '\\n' ' '", Has("a c")),
+    case!(
+        "sed-script-file",
+        "printf 's/x/Y/\\n' > sf.sed && echo x | sed -f sf.sed",
+        Eq("Y")
+    ),
+    case!("sed-line-range", "printf '1\\n2\\n3\\n4\\n' | sed -n '2,3p' | tr '\\n' ' '", Has("2 3")),
+    case!("sed-insert-text", "printf 'x\\n' | sed '1i\\\ntop'", Has("top"), Has("x")),
+    // ---- curl official upstream CLI ----
+    case!("curl-version", "curl --version | head -n 1", Has("curl 8.1.2")),
+    case!("curl-file", "printf upstream-curl > curl-local.txt; curl -s \"file://$PWD/curl-local.txt\"", Eq("upstream-curl")),
+    case!("curl-output", "curl -s -o curl-copy.txt \"file://$PWD/curl-local.txt\"; cat curl-copy.txt", Eq("upstream-curl")),
+    case!("curl-repeat", "curl -s \"file://$PWD/curl-local.txt\"; echo; curl -s \"file://$PWD/curl-local.txt\"", Eq("upstream-curl\nupstream-curl")),
+    case!("wget-version", "wget --version", Has("curl 8.1.2")),
+    case!("wget-default-output", "mkdir wget-src; printf upstream-wget > wget-src/payload.txt; wget -q \"file://$PWD/wget-src/payload.txt\"; cat payload.txt", Eq("upstream-wget")),
+    case!("wget-stdout", "wget -q -O - \"file://$PWD/wget-src/payload.txt\"", Eq("upstream-wget")),
+    case!("wget-directory-prefix", "wget -q -P downloads \"file://$PWD/wget-src/payload.txt\"; cat downloads/payload.txt", Eq("upstream-wget")),
+    case!("wget-output-equals", "wget -q --output-document=equals.txt \"file://$PWD/wget-src/payload.txt\"; cat equals.txt", Eq("upstream-wget")),
+    case!("wget-common-options", "wget -q -4 --connect-timeout=2 --max-redirect=3 --user-agent=YourShell --referer=https://example.invalid/ -O common.txt \"file://$PWD/wget-src/payload.txt\"; cat common.txt", Eq("upstream-wget")),
     case!("tar-roundtrip", "mkdir -p td/x; echo content > td/x/f.txt; tar -czf t.tgz td; rm -rf td; tar -xzf t.tgz; cat td/x/f.txt", Eq("content")),
     case!("tar-list", "mkdir -p tl; echo a > tl/a.txt; tar -cf tl.tar tl; tar -tf tl.tar | grep -c txt", Has("1")),
+    case!("tar-bzip2", "mkdir tj; echo bz > tj/f; tar -cjf tj.tar.bz2 tj; rm -rf tj; tar -xjf tj.tar.bz2; cat tj/f", Eq("bz")),
+    case!("tar-xz", "mkdir tx; echo xz > tx/f; tar -cJf tx.tar.xz tx; rm -rf tx; tar -xJf tx.tar.xz; cat tx/f", Eq("xz")),
+    case!("tar-stdin-stdout", "mkdir ts; echo stream > ts/f; tar -cf - ts | tar -tf - | grep -c 'ts/f'", Eq("1")),
+    case!("tar-exclude-strip", "mkdir -p te/root; echo yes > te/root/a; echo no > te/root/b; tar -cf te.tar --exclude='*/b' te/root; mkdir tout; tar -xf te.tar -C tout --strip-components 2; cat tout/a; test ! -e tout/b", Eq("yes")),
+    case!("tar-repeat-after-error", "tar --definitely-invalid >/dev/null 2>&1 || :; rm -rf tr tr.tar; mkdir tr; echo again > tr/f; tar -cf tr.tar tr; tar -tf tr.tar | grep -c tr/f", Eq("1")),
     case!("zip-unzip-roundtrip", "mkdir -p zt; echo zipped > zt/z.txt; zip -r z.zip zt > /dev/null; rm -rf zt; unzip z.zip > /dev/null; cat zt/z.txt", Eq("zipped")),
     case!("unzip-list", "echo hi > u.txt; zip u.zip u.txt > /dev/null; unzip -l u.zip | grep -c u.txt", Has("1")),
+    case!("zip-junk-exclude", "rm -rf zj; mkdir -p zj/a zj/b; echo a > zj/a/a.txt; echo b > zj/b/b.tmp; zip -q -r -j -x '*.tmp' zj.zip zj; unzip -p zj.zip a.txt", Eq("a")),
+    case!("zip-update", "echo old > zu.txt; zip -q zu.zip zu.txt; echo new > zu.txt; zip -q -u zu.zip zu.txt; unzip -p zu.zip zu.txt", Eq("new")),
+    case!("zip-delete", "echo keep > zd1; echo drop > zd2; zip -q zd.zip zd1 zd2; zip -q -d zd.zip zd2; unzip -l zd.zip | grep -c zd2", Eq("0")),
+    case!("zip-store", "echo stored > zs.txt; zip -q -0 zs.zip zs.txt; unzip -p zs.zip zs.txt", Eq("stored")),
+    case!("zip-names-stdin", "echo stdin > zi.txt; printf 'zi.txt\n' | zip -q zi.zip -@; unzip -p zi.zip zi.txt", Eq("stdin")),
     case!("sqlite-memory", "sqlite3 :memory: 'create table t(a,b); insert into t values(1,2),(3,4); select sum(a),sum(b) from t'", Eq("4|6")),
     case!("sqlite-file", "sqlite3 test.db 'create table u(name text)'; sqlite3 test.db \"insert into u values('alice')\"; sqlite3 test.db 'select name from u'", Eq("alice")),
     case!("sqlite-stdin", "echo 'select 6*7' | sqlite3 :memory:", Eq("42")),
     case!("sqlite-header", "sqlite3 --header :memory: 'select 1 as x, 2 as y'", Eq("x|y\n1|2")),
     case!("sqlite-semicolon-in-string", "sqlite3 :memory: \"create table t(x); insert into t values('a;b'); select x from t\"", Eq("a;b")),
+    // These exercise SQLite's real shell rather than just the database engine.
+    // The previous rusqlite wrapper had no dot commands or output modes.
+    case!("sqlite-dot-mode", "sqlite3 :memory: '.headers on' '.mode csv' 'select 1 as x, 2 as y'", Eq("x,y\r\n1,2")),
+    case!("sqlite-dot-schema", "sqlite3 schema.db 'create table items(id integer, name text)'; sqlite3 schema.db '.schema items'", Has("CREATE TABLE items")),
+    case!("sqlite-json-mode", "sqlite3 :memory: '.mode json' 'select 7 as n, \"ok\" as s'", Eq("[{\"n\":7,\"s\":\"ok\"}]")),
+    case!("sqlite-invalid-option-contained", "sqlite3 --definitely-invalid 2>/dev/null; echo rc=$?; echo still-alive", Has("rc=1"), Has("still-alive")),
+    case!("sqlite-repeat-after-exit", "sqlite3 :memory: '.exit 7'; echo first=$?; sqlite3 :memory: 'select 9'; echo second=$?", Eq("first=7\n9\nsecond=0")),
     case!("jq-field", "echo '{\"name\":\"alice\",\"age\":30}' | jq '.name'", Eq("\"alice\"")),
     case!("jq-raw", "echo '{\"name\":\"alice\"}' | jq -r '.name'", Eq("alice")),
     case!("jq-array-map", "echo '[1,2,3]' | jq 'map(. * 2)'", Has("2"), Has("4"), Has("6")),
@@ -160,8 +485,13 @@ pub static CASES: &[Case] = &[
     case!("git-config-commit-log", "(cd gr && git config user.name Tester && git config user.email t@e.com && echo hello > f.txt && git add f.txt && git commit -m 'first commit' 2>&1 | head -1 && git log -n 1 | grep -c 'first commit')", Has("1")),
     case!("git-status-clean", "(cd gr && git status | tail -1)", Has("clean")),
     case!("git-status-dirty", "(cd gr && echo more > f2.txt && git status | grep -c f2.txt)", Has("1")),
+    case!("git-status-porcelain", "(cd gr && printf untracked > new.txt && git status --porcelain=v1 -b)", Has("## master"), Has("?? new.txt")),
     case!("git-branch", "(cd gr && git branch newbr && git branch | grep -c newbr)", Has("1")),
     case!("git-diff", "(cd gr && echo changed >> f.txt && git diff | grep -c changed)", Has("1")),
+    case!("git-global-C", "git -C gr --version", Has("libgit2")),
+    case!("git-init-branch", "mkdir git-main; git -C git-main init -q -b main; git -C git-main status", Has("On branch main")),
+    case!("git-git-dir-work-tree", "mkdir git-split; git -C git-split init -q; printf split > git-split/a; git --git-dir=git-split/.git --work-tree=git-split add a; git --git-dir=git-split/.git --work-tree=git-split status", Has("new: a")),
+    case!("git-init-bare", "git init -q --bare bare.git; test -f bare.git/HEAD", Eq("")),
     // ---- uutils adapter: session-state sync ----
     case!("uu-env-sync", "export UUV=fromshell; printenv UUV", Eq("fromshell")),
     case!("uu-cwd-sync", "mkdir -p cwt && cd cwt && touch inner.txt && ls && cd ..", Has("inner.txt")),
@@ -311,6 +641,8 @@ pub static PY_CASES: &[Case] = &[
     case!("py-pdf-generate", "printf 'from fpdf import FPDF\\npdf = FPDF()\\npdf.add_page()\\npdf.set_font(\"Helvetica\", size=20)\\npdf.cell(text=\"YourShell PDF\")\\npdf.image(\"blue.png\", x=10, y=30, w=40)\\npdf.output(\"gen.pdf\")\\nprint(\"pdf-generated\")\\n' > genpdf.py; python3 genpdf.py; head -c 5 gen.pdf; echo", Has("pdf-generated"), Has("%PDF-")),
     case!("py-pdf-readback", "python3 -c 'from pypdf import PdfReader; r = PdfReader(\"gen.pdf\"); print(\"pages\", len(r.pages))'", Eq("pages 1")),
     case!("py-requests-https", "python3 -c 'import requests; r = requests.get(\"https://pypi.org/simple/\", timeout=15); print(\"http\", r.status_code)'", Eq("http 200")),
+    case!("py-hot-search", "python3 -c 'import requests; r = requests.get(\"https://top.baidu.com/board?tab=realtime\", headers={\"User-Agent\":\"Mozilla/5.0\"}, timeout=15); print(\"hot-search\", r.status_code, len(r.text) > 1000)'", Has("hot-search 200 True")),
+    case!("py-data-analysis", "python3 -m pip install -q --no-input --only-binary :all: --target \"$YOURSHELL_PY_SITE\" numpy pandas > /dev/null 2>&1; python3 -c 'import numpy as np, pandas as pd; x=np.array([1,2,3]); df=pd.DataFrame({\"x\":x}); print(\"data-analysis\", int(df.x.mean()), len(df))'", Has("data-analysis 2 3")),
     case!("py-sqlite-roundtrip", "python3 -c 'import sqlite3; c = sqlite3.connect(\"t.db\"); c.execute(\"create table if not exists kv(k, v)\"); c.execute(\"insert into kv values(?, ?)\", (\"a\", 42)); c.commit(); print(c.execute(\"select sum(v) from kv\").fetchone()[0] >= 42)'", Eq("True")),
     // python-pptx blocked upstream: lxml has no iOS wheel yet. A minimal
     // valid .pptx is assembled with stdlib zipfile+xml instead, proving the
@@ -453,10 +785,7 @@ async fn run_case_group(
     }
 }
 
-async fn run_case(
-    shell: &mut brush_core::Shell,
-    script: &str,
-) -> (i32, String) {
+async fn run_case(shell: &mut brush_core::Shell, script: &str) -> (i32, String) {
     let (mut reader, writer) = std::io::pipe().expect("pipe");
     let out = OpenFile::from(writer);
     shell.open_files_mut().set_fd(1.into(), out.clone());
@@ -485,4 +814,359 @@ async fn run_case(
         output = String::from_utf8_lossy(&buf).into_owned();
     }
     (exit_code, output)
+}
+
+// ---------------------------------------------------------------- flag audit
+
+/// Reference flag sets, per command, taken from the GNU/upstream man pages.
+///
+/// This exists because a *partial* CLI is worse than a missing command: an
+/// agent writes the flags every other Unix accepts, and a rejected one reads as
+/// "I got the syntax wrong", so it retries variations that also fail. Today
+/// that gap was only ever found by accident — `grep -iE` rejecting `-E` killed
+/// a whole selftest run before anyone noticed grep had 9 flags. This audit
+/// makes the gap a number that CI can watch instead.
+///
+/// A flag counts as supported when the command does not reject it as unknown.
+/// It is deliberately a coverage signal, not a correctness test — behaviour is
+/// pinned by the battery above.
+const FLAG_REFERENCE: &[(&str, &[&str])] = &[
+    // Taken from the GNU grep man page, NOT from what we happen to implement.
+    // The earlier version of this list was written alongside a hand-written
+    // grep, so it scored 36/36 while omitting the flags that grep had no
+    // implementation for — a reference set derived from the implementation
+    // cannot report a gap, which is the one thing this audit exists to do.
+    (
+        "grep",
+        &[
+            "-E",
+            "-F",
+            "-G",
+            "-P",
+            "-i",
+            "-y",
+            "-v",
+            "-w",
+            "-x",
+            "-c",
+            "-l",
+            "-L",
+            "-o",
+            "-q",
+            "-s",
+            "-b",
+            "-H",
+            "-h",
+            "-r",
+            "-R",
+            "-a",
+            "-I",
+            "-U",
+            "-z",
+            "-Z",
+            "-T",
+            "-m",
+            "-A",
+            "-B",
+            "-C",
+            "-e",
+            "-f",
+            "-d",
+            "-D",
+            "--include",
+            "--exclude",
+            "--exclude-dir",
+            "--exclude-from",
+            "--color",
+            "--label",
+            "--line-buffered",
+            "--binary-files",
+            "--group-separator",
+            "--no-group-separator",
+            "--no-ignore-case",
+            "--null-data",
+        ],
+    ),
+    (
+        "rg",
+        &[
+            "-e",
+            "-f",
+            "-F",
+            "-P",
+            "-i",
+            "-S",
+            "-s",
+            "-w",
+            "-x",
+            "-v",
+            "-U",
+            "-m",
+            "-c",
+            "-l",
+            "-o",
+            "-q",
+            "-n",
+            "-N",
+            "-b",
+            "-H",
+            "-I",
+            "-M",
+            "-r",
+            "-A",
+            "-B",
+            "-C",
+            "-g",
+            "-t",
+            "-T",
+            "-L",
+            "-j",
+            "-p",
+            "-a",
+            "--hidden",
+            "--no-ignore",
+            "--files",
+            "--type-list",
+            "--max-depth",
+            "--column",
+            "--heading",
+            "--no-heading",
+            "--stats",
+            "--trim",
+            "--null",
+        ],
+    ),
+    (
+        "sed",
+        &[
+            "-n",
+            "-e",
+            "-f",
+            "-i",
+            "-E",
+            "-s",
+            "-z",
+            "-u",
+            "--posix",
+            "--debug",
+            "--sandbox",
+        ],
+    ),
+    (
+        "find",
+        &[
+            "-name",
+            "-iname",
+            "-type",
+            "-maxdepth",
+            "-mindepth",
+            "-size",
+            "-mtime",
+            "-newer",
+            "-print",
+            "-print0",
+            "-delete",
+            "-exec",
+            "-empty",
+            "-perm",
+            "-user",
+            "-path",
+            "-prune",
+            "-depth",
+            "-follow",
+            "-not",
+            "-o",
+            "-a",
+        ],
+    ),
+    (
+        "xargs",
+        &[
+            "-0", "-n", "-I", "-i", "-L", "-P", "-r", "-t", "-a", "-d", "-E", "-s", "-x",
+        ],
+    ),
+    (
+        "diff",
+        &[
+            "-u", "-c", "-e", "-y", "-q", "-s", "-t", "-U", "-C", "--normal", "--brief",
+        ],
+    ),
+    (
+        "cmp",
+        &["-l", "-s", "-b", "-n", "-i", "--print-bytes", "--verbose"],
+    ),
+    (
+        "tar",
+        &[
+            "-c",
+            "-x",
+            "-t",
+            "-f",
+            "-z",
+            "-j",
+            "-J",
+            "-v",
+            "-C",
+            "--exclude",
+            "-r",
+            "-u",
+        ],
+    ),
+    (
+        "jq",
+        &[
+            "-r",
+            "-c",
+            "-n",
+            "-e",
+            "-s",
+            "-j",
+            "-a",
+            "--arg",
+            "--argjson",
+            "--slurpfile",
+            "--tab",
+        ],
+    ),
+    ("egrep", &[]),
+    ("fgrep", &[]),
+    (
+        "stat",
+        &["-c", "--format", "-f", "--file-system", "-L", "-t"],
+    ),
+    ("zip", &["-r", "-q", "-9", "-j", "-d", "-u", "-x", "-@"]),
+    ("unzip", &["-l", "-o", "-d", "-q", "-j", "-n", "-p", "-t"]),
+    ("which", &["-a", "-s"]),
+    ("tree", &["-a", "-d", "-L", "-f", "-i", "-P", "-I"]),
+    ("gzip", &["-d", "-k", "-f", "-9", "-c", "-r", "-t"]),
+    (
+        "curl",
+        &[
+            "-X",
+            "-H",
+            "-d",
+            "-o",
+            "-O",
+            "-L",
+            "-s",
+            "-i",
+            "-I",
+            "-u",
+            "-A",
+            "-f",
+            "-k",
+            "--json",
+            "--data-raw",
+            "--connect-timeout",
+            "--max-time",
+            "--retry",
+            "--retry-delay",
+            "--retry-all-errors",
+        ],
+    ),
+    (
+        "wget",
+        &[
+            "-O",
+            "-q",
+            "-c",
+            "-P",
+            "-n",
+            "-4",
+            "-6",
+            "-U",
+            "-e",
+            "--no-check-certificate",
+            "--timeout",
+            "--connect-timeout",
+            "--max-redirect",
+            "--header",
+            "--waitretry",
+            "--referer",
+            "--user-agent",
+            "--load-cookies",
+            "--save-cookies",
+            "--user",
+            "--password",
+            "--proxy-user",
+            "--proxy-password",
+            "--method",
+            "--body-data",
+            "--body-file",
+            "--post-data",
+            "--post-file",
+            "--retry-connrefused",
+            "--no-proxy",
+            "--ignore-length",
+            "--no-cache",
+        ],
+    ),
+];
+
+/// Markers a CLI emits when it does not recognise an option. Anything else —
+/// a missing operand, a bad value, a nonexistent file — means the flag itself
+/// was accepted.
+const UNKNOWN_MARKERS: &[&str] = &[
+    "unexpected argument",
+    "unknown option",
+    "unknown argument",
+    "unrecognized option",
+    "unsupported option",
+    "invalid option",
+    "unknown flag",
+];
+
+/// Probes every flag in [`FLAG_REFERENCE`] and reports per-command coverage.
+pub fn run_flag_coverage(workdir: &std::path::Path) -> String {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    runtime.block_on(run_flag_coverage_async(workdir))
+}
+
+async fn run_flag_coverage_async(workdir: &std::path::Path) -> String {
+    let scratch = workdir.join(format!("flagaudit_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir_all(&scratch).expect("create scratch dir");
+    let mut shell = match crate::build_shell(std::collections::HashMap::new(), &scratch).await {
+        Ok(s) => s,
+        Err(e) => return format!("FATAL: shell init failed: {e}\n"),
+    };
+
+    let mut report = String::new();
+    for (cmd, flags) in FLAG_REFERENCE {
+        // Skip commands not built into this configuration rather than reporting
+        // them as 0% — that would be a false alarm, and a false alarm is how a
+        // real one gets ignored.
+        let (_c, probe) = run_case(&mut shell, &format!("type {cmd} 2>/dev/null")).await;
+        if !probe.contains("builtin") {
+            report.push_str(&format!("SKIP {cmd} (not built in)\n"));
+            continue;
+        }
+        let mut missing: Vec<&str> = Vec::new();
+        for flag in *flags {
+            // stdin from /dev/null so a flag that makes the command read input
+            // cannot hang the audit.
+            let script = format!("{cmd} {flag} </dev/null 2>&1 | head -5");
+            let (_code, out) = run_case(&mut shell, &script).await;
+            let lower = out.to_lowercase();
+            if UNKNOWN_MARKERS.iter().any(|m| lower.contains(m)) {
+                missing.push(flag);
+            }
+        }
+        let have = flags.len() - missing.len();
+        let pct = if flags.is_empty() {
+            100
+        } else {
+            have * 100 / flags.len()
+        };
+        report.push_str(&format!("{cmd}: {have}/{} ({pct}%)", flags.len()));
+        if missing.is_empty() {
+            report.push('\n');
+        } else {
+            report.push_str(&format!("  MISSING {}\n", missing.join(" ")));
+        }
+    }
+    report
 }

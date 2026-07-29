@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 /// One shell session backed by a `brush_core::Shell` instance on a dedicated
 /// Rust thread. Output bytes stream to `onOutput` (fed into SwiftTerm);
@@ -6,6 +7,11 @@ import Foundation
 /// line discipline: line editing + local echo while idle, raw forwarding to
 /// the command's stdin while a command runs (enabling `read`, python REPL…).
 final class ShellSession: ObservableObject {
+    /// Keep SciPy's auxiliary dylibs resident for the process lifetime.
+    /// Several upstream Fortran extensions use flat-namespace symbols rather
+    /// than declaring libfortran_io_stubs as an LC_LOAD_DYLIB dependency.
+    private static var pythonRuntimeHandles: [UnsafeMutableRawPointer] = []
+
     /// Terminal feed: raw output bytes (LF already mapped to CRLF).
     var onOutput: ((ArraySlice<UInt8>) -> Void)?
 
@@ -28,19 +34,71 @@ final class ShellSession: ObservableObject {
     private var pendingEscape: [UInt8] = []
 
     init() {
+        _ = ashell_ios_host_install(iosClipboardCopy, iosClipboardPaste, iosOpen)
         // Point the embedded CPython at the bundled stdlib before the Rust
         // core spins up any session. xcodegen folder resources land under
         // Resources/PythonResources/python.
         if let res = Bundle.main.resourcePath {
             setenv("YOURSHELL_PYTHON_HOME", res + "/PythonResources/python", 1)
         }
-        // Writable site-packages for pip (the bundle is read-only and iOS
-        // disables the user site); the python driver puts it on sys.path.
+        // Writable standard user-site for pip. Keeping PYTHONUSERBASE and the
+        // path injected by the Python host aligned lets bare `pip install`
+        // use --user while still seeing prebundled packages as satisfied.
         let library = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
-        let pySite = library.appendingPathComponent("python/site-packages").path
+        let pyUserBase = library.appendingPathComponent("python").path
+        let pySite = library.appendingPathComponent(
+            "python/lib/python3.14/site-packages").path
         try? FileManager.default.createDirectory(
             atPath: pySite, withIntermediateDirectories: true)
+        setenv("PYTHONUSERBASE", pyUserBase, 1)
         setenv("YOURSHELL_PY_SITE", pySite, 1)
+        // Releases before the standard user-site migration installed here.
+        // Keep it readable so existing packages satisfy pip dependencies.
+        setenv("YOURSHELL_PY_LEGACY_SITE",
+               library.appendingPathComponent("python/site-packages").path, 1)
+        if let res = Bundle.main.resourcePath {
+            setenv("YOURSHELL_PY_WHEELS", res + "/PythonResources/wheels", 1)
+            // Let normal `pip install numpy pandas` discover the bundled
+            // simulator-native wheels before consulting PyPI for pure Python
+            // packages such as requests and python-pptx.
+            setenv("PIP_FIND_LINKS", res + "/PythonResources/wheels", 1)
+
+            // SwiftPM places selected python-ios-lib products in sibling
+            // resource bundles. Add every such bundle root to PYTHONPATH so
+            // CPython and importlib.metadata see both packages and dist-info.
+            if let entries = try? FileManager.default.contentsOfDirectory(atPath: res) {
+                let packageBundles = entries
+                    .filter {
+                        // SwiftPM derives resource-bundle names from the
+                        // package's declared name, preserving its hyphens.
+                        // Keep the underscore spelling as a compatibility
+                        // fallback for older package revisions.
+                        ($0.hasPrefix("python-ios-lib_")
+                            || $0.hasPrefix("python_ios_lib_"))
+                            && $0.hasSuffix(".bundle")
+                    }
+                    .map { res + "/" + $0 }
+                if !packageBundles.isEmpty {
+                    setenv("PYTHONPATH", packageBundles.joined(separator: ":"), 1)
+                    setenv("YOURSHELL_PY_PREBUNDLED",
+                           packageBundles.joined(separator: ":"), 1)
+                }
+            }
+
+            // SciPy's BLAS and Fortran extensions expect these symbols to be
+            // globally visible before their first dlopen. The post-build
+            // phase places the dylibs in the app's Frameworks directory.
+            for library in [
+                "libfortran_io_stubs.dylib",
+                "libscipy_blas_stubs.dylib",
+                "libsf_error_state.dylib",
+            ] {
+                let path = res + "/Frameworks/" + library
+                if let handle = dlopen(path, RTLD_NOW | RTLD_GLOBAL) {
+                    Self.pythonRuntimeHandles.append(handle)
+                }
+            }
+        }
         // Per-command env is handed to the persistent interpreter through this
         // file (its os.environ snapshot is frozen at init); the Rust adapter
         // writes it and the driver applies it each command.
@@ -106,6 +164,15 @@ final class ShellSession: ObservableObject {
         let portFile = library.appendingPathComponent("node_port.txt").path
         try? FileManager.default.removeItem(atPath: portFile)
         setenv("YS_NODE_PORT_FILE", portFile, 1)
+        // Per-launch shared secret for the Node dispatcher. iOS does NOT
+        // isolate loopback between apps, so an unauthenticated listener would
+        // let any other app on the device execute Node code inside our sandbox.
+        // Set once per process: several sessions run this path, and the
+        // resident Node captures the value at ITS startup — they must agree.
+        if getenv("YS_NODE_TOKEN") == nil {
+            let token = (0..<32).map { _ in String(format: "%02x", UInt8.random(in: 0...255)) }.joined()
+            setenv("YS_NODE_TOKEN", token, 1)
+        }
         // npm/npx CLIs bundled alongside main.js.
         setenv("YS_NODE_NPM_CLI", res + "/NodeResources/node/npm/bin/npm-cli.js", 1)
         setenv("YS_NODE_NPX_CLI", res + "/NodeResources/node/npm/bin/npx-cli.js", 1)

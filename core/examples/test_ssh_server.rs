@@ -49,11 +49,7 @@ impl server::Handler for Handler {
         }
     }
 
-    async fn auth_publickey(
-        &mut self,
-        _user: &str,
-        _key: &PublicKey,
-    ) -> Result<Auth, Self::Error> {
+    async fn auth_publickey(&mut self, _user: &str, _key: &PublicKey) -> Result<Auth, Self::Error> {
         // Reject keys so the client falls through to password auth.
         Ok(Auth::Reject {
             proceed_with_methods: None,
@@ -100,7 +96,9 @@ impl server::Handler for Handler {
 
 #[tokio::main]
 async fn main() {
-    let addr = std::env::args().nth(1).unwrap_or_else(|| "127.0.0.1:2222".into());
+    let addr = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "127.0.0.1:2222".into());
     let config = server::Config {
         keys: vec![PrivateKey::from_openssh(HOST_KEY).unwrap()],
         ..Default::default()
@@ -108,5 +106,7 @@ async fn main() {
     let listener = TcpListener::bind(&addr).await.unwrap();
     eprintln!("test_ssh_server listening on {addr} (password: testpw)");
     let mut srv = Srv;
-    srv.run_on_socket(Arc::new(config), &listener).await.unwrap();
+    srv.run_on_socket(Arc::new(config), &listener)
+        .await
+        .unwrap();
 }

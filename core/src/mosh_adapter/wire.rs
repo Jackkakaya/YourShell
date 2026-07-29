@@ -374,12 +374,16 @@ pub fn parse_server_datagram(crypto: &Crypto, datagram: &[u8]) -> Option<(Opened
 fn for_each_field1<'a>(buf: &'a [u8], mut f: impl FnMut(&'a [u8])) {
     let mut pos = 0;
     while pos < buf.len() {
-        let Some(key) = get_varint(buf, &mut pos) else { return };
+        let Some(key) = get_varint(buf, &mut pos) else {
+            return;
+        };
         let field = key >> 3;
         let wire = key & 7;
         match wire {
             2 => {
-                let Some(slice) = read_len_delimited(buf, &mut pos) else { return };
+                let Some(slice) = read_len_delimited(buf, &mut pos) else {
+                    return;
+                };
                 if field == 1 {
                     f(slice);
                 }
@@ -640,7 +644,8 @@ mod tests {
 
         let sock = UdpSocket::bind("0.0.0.0:0").unwrap();
         sock.connect(format!("{host}:{port}")).unwrap();
-        sock.set_read_timeout(Some(Duration::from_millis(1500))).unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(1500)))
+            .unwrap();
 
         let now_ms = || {
             (SystemTime::now()
@@ -691,7 +696,10 @@ mod tests {
                 break;
             }
         }
-        assert!(got.is_some(), "no reply from mosh-server (crypto interop FAILED)");
+        assert!(
+            got.is_some(),
+            "no reply from mosh-server (crypto interop FAILED)"
+        );
         eprintln!("OCB3 interop with real mosh-server: OK");
     }
 

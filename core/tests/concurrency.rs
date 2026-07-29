@@ -36,7 +36,9 @@ fn run_session(id: usize, base: &std::path::Path) -> Result<(), String> {
             );
             let (exit, out) = run_capture(&mut shell, &script).await;
             if exit != 0 {
-                return Err(format!("session {id} round {round}: exit {exit}, out={out:?}"));
+                return Err(format!(
+                    "session {id} round {round}: exit {exit}, out={out:?}"
+                ));
             }
             // cwd isolation: pwd must point into THIS session's dir.
             if !out.contains(&format!("sess{id}/sub_{marker}")) {
@@ -44,16 +46,22 @@ fn run_session(id: usize, base: &std::path::Path) -> Result<(), String> {
             }
             // env + data isolation: our marker present, no other session's.
             if !out.contains(&marker) {
-                return Err(format!("session {id} round {round}: marker missing, out={out:?}"));
+                return Err(format!(
+                    "session {id} round {round}: marker missing, out={out:?}"
+                ));
             }
             for other in 0..4 {
                 if other != id && out.contains(&format!("s{other}r")) {
-                    return Err(format!("session {id} round {round}: cross-talk from {other}, out={out:?}"));
+                    return Err(format!(
+                        "session {id} round {round}: cross-talk from {other}, out={out:?}"
+                    ));
                 }
             }
             // uutils output sanity: "2 marker" from uniq -c.
             if !out.contains(&format!("2 {marker}")) {
-                return Err(format!("session {id} round {round}: uniq output wrong, out={out:?}"));
+                return Err(format!(
+                    "session {id} round {round}: uniq output wrong, out={out:?}"
+                ));
             }
         }
         Ok(())
@@ -68,7 +76,9 @@ async fn run_capture(shell: &mut brush_core::Shell, script: &str) -> (i32, Strin
 
     let params = shell.default_exec_params();
     let source_info = brush_core::SourceInfo::from("concurrency");
-    let result = shell.run_string(script.to_string(), &source_info, &params).await;
+    let result = shell
+        .run_string(script.to_string(), &source_info, &params)
+        .await;
     let exit = match result {
         Ok(r) => i32::from(u8::from(r.exit_code)),
         Err(_) => 127,

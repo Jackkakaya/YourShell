@@ -54,7 +54,10 @@ impl server::Handler for SshSession {
         if p == "testpw" {
             Ok(Auth::Accept)
         } else {
-            Ok(Auth::Reject { proceed_with_methods: None, partial_success: false })
+            Ok(Auth::Reject {
+                proceed_with_methods: None,
+                partial_success: false,
+            })
         }
     }
 
@@ -63,7 +66,10 @@ impl server::Handler for SshSession {
         _u: &str,
         _k: &russh::keys::ssh_key::PublicKey,
     ) -> Result<Auth, Self::Error> {
-        Ok(Auth::Reject { proceed_with_methods: None, partial_success: false })
+        Ok(Auth::Reject {
+            proceed_with_methods: None,
+            partial_success: false,
+        })
     }
 
     async fn channel_open_session(
@@ -104,7 +110,10 @@ struct Sftp {
 
 impl Sftp {
     fn new(root: PathBuf) -> Self {
-        Self { root, dir_done: HashSet::new() }
+        Self {
+            root,
+            dir_done: HashSet::new(),
+        }
     }
 
     /// Maps an SFTP path onto the served root, preventing escape via `..`.
@@ -125,7 +134,12 @@ impl Sftp {
 }
 
 fn ok_status(id: u32) -> Status {
-    Status { id, status_code: StatusCode::Ok, error_message: "Ok".into(), language_tag: "en-US".into() }
+    Status {
+        id,
+        status_code: StatusCode::Ok,
+        error_message: "Ok".into(),
+        language_tag: "en-US".into(),
+    }
 }
 
 impl russh_sftp::server::Handler for Sftp {
@@ -145,18 +159,31 @@ impl russh_sftp::server::Handler for Sftp {
 
     async fn realpath(&mut self, id: u32, path: String) -> Result<Name, Self::Error> {
         // Report a canonical absolute path under the virtual root.
-        let canon = if path == "." || path.is_empty() { "/".to_string() } else { path };
-        Ok(Name { id, files: vec![File::dummy(canon)] })
+        let canon = if path == "." || path.is_empty() {
+            "/".to_string()
+        } else {
+            path
+        };
+        Ok(Name {
+            id,
+            files: vec![File::dummy(canon)],
+        })
     }
 
     async fn stat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
         let md = std::fs::metadata(self.real(&path)).map_err(|_| StatusCode::NoSuchFile)?;
-        Ok(Attrs { id, attrs: FileAttributes::from(&md) })
+        Ok(Attrs {
+            id,
+            attrs: FileAttributes::from(&md),
+        })
     }
 
     async fn lstat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
         let md = std::fs::symlink_metadata(self.real(&path)).map_err(|_| StatusCode::NoSuchFile)?;
-        Ok(Attrs { id, attrs: FileAttributes::from(&md) })
+        Ok(Attrs {
+            id,
+            attrs: FileAttributes::from(&md),
+        })
     }
 
     async fn open(
@@ -174,13 +201,23 @@ impl russh_sftp::server::Handler for Sftp {
             return Err(StatusCode::NoSuchFile);
         }
         let _ = id;
-        Ok(SftpHandle { id, handle: filename })
+        Ok(SftpHandle {
+            id,
+            handle: filename,
+        })
     }
 
-    async fn read(&mut self, id: u32, handle: String, offset: u64, len: u32) -> Result<Data, Self::Error> {
+    async fn read(
+        &mut self,
+        id: u32,
+        handle: String,
+        offset: u64,
+        len: u32,
+    ) -> Result<Data, Self::Error> {
         use std::io::{Read, Seek, SeekFrom};
         let mut f = std::fs::File::open(self.real(&handle)).map_err(|_| StatusCode::NoSuchFile)?;
-        f.seek(SeekFrom::Start(offset)).map_err(|_| StatusCode::Failure)?;
+        f.seek(SeekFrom::Start(offset))
+            .map_err(|_| StatusCode::Failure)?;
         let mut buf = vec![0u8; len as usize];
         let n = f.read(&mut buf).map_err(|_| StatusCode::Failure)?;
         if n == 0 {
@@ -190,13 +227,20 @@ impl russh_sftp::server::Handler for Sftp {
         Ok(Data { id, data: buf })
     }
 
-    async fn write(&mut self, id: u32, handle: String, offset: u64, data: Vec<u8>) -> Result<Status, Self::Error> {
+    async fn write(
+        &mut self,
+        id: u32,
+        handle: String,
+        offset: u64,
+        data: Vec<u8>,
+    ) -> Result<Status, Self::Error> {
         use std::io::{Seek, SeekFrom, Write};
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .open(self.real(&handle))
             .map_err(|_| StatusCode::PermissionDenied)?;
-        f.seek(SeekFrom::Start(offset)).map_err(|_| StatusCode::Failure)?;
+        f.seek(SeekFrom::Start(offset))
+            .map_err(|_| StatusCode::Failure)?;
         f.write_all(&data).map_err(|_| StatusCode::Failure)?;
         Ok(ok_status(id))
     }
@@ -218,7 +262,10 @@ impl russh_sftp::server::Handler for Sftp {
         let rd = std::fs::read_dir(self.real(&handle)).map_err(|_| StatusCode::NoSuchFile)?;
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
-            let attrs = e.metadata().map(|m| FileAttributes::from(&m)).unwrap_or_default();
+            let attrs = e
+                .metadata()
+                .map(|m| FileAttributes::from(&m))
+                .unwrap_or_default();
             files.push(File::new(name, attrs));
         }
         Ok(Name { id, files })
@@ -228,7 +275,12 @@ impl russh_sftp::server::Handler for Sftp {
         Ok(ok_status(id))
     }
 
-    async fn mkdir(&mut self, id: u32, path: String, _attrs: FileAttributes) -> Result<Status, Self::Error> {
+    async fn mkdir(
+        &mut self,
+        id: u32,
+        path: String,
+        _attrs: FileAttributes,
+    ) -> Result<Status, Self::Error> {
         std::fs::create_dir_all(self.real(&path)).map_err(|_| StatusCode::Failure)?;
         Ok(ok_status(id))
     }
@@ -243,25 +295,39 @@ impl russh_sftp::server::Handler for Sftp {
         Ok(ok_status(id))
     }
 
-    async fn rename(&mut self, id: u32, oldpath: String, newpath: String) -> Result<Status, Self::Error> {
-        std::fs::rename(self.real(&oldpath), self.real(&newpath)).map_err(|_| StatusCode::Failure)?;
+    async fn rename(
+        &mut self,
+        id: u32,
+        oldpath: String,
+        newpath: String,
+    ) -> Result<Status, Self::Error> {
+        std::fs::rename(self.real(&oldpath), self.real(&newpath))
+            .map_err(|_| StatusCode::Failure)?;
         Ok(ok_status(id))
     }
 }
 
 #[tokio::main]
 async fn main() {
-    let addr = std::env::args().nth(1).unwrap_or_else(|| "127.0.0.1:2223".into());
-    let root = std::env::args()
-        .nth(2)
-        .map_or_else(|| std::env::temp_dir().join("yourshell_sftp_root"), PathBuf::from);
+    let addr = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "127.0.0.1:2223".into());
+    let root = std::env::args().nth(2).map_or_else(
+        || std::env::temp_dir().join("yourshell_sftp_root"),
+        PathBuf::from,
+    );
     std::fs::create_dir_all(&root).unwrap();
     let config = server::Config {
         keys: vec![PrivateKey::from_openssh(HOST_KEY).unwrap()],
         ..Default::default()
     };
     let listener = TcpListener::bind(&addr).await.unwrap();
-    eprintln!("test_sftp_server on {addr}, root={} (password: testpw)", root.display());
+    eprintln!(
+        "test_sftp_server on {addr}, root={} (password: testpw)",
+        root.display()
+    );
     let mut srv = Srv { root };
-    srv.run_on_socket(Arc::new(config), &listener).await.unwrap();
+    srv.run_on_socket(Arc::new(config), &listener)
+        .await
+        .unwrap();
 }

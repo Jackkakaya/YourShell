@@ -16,11 +16,19 @@ pub(crate) mod wire;
 #[derive(Debug, PartialEq, Eq)]
 enum Mode {
     /// `mosh [user@]host` — ssh in, run `mosh-server new`, parse its output.
-    Bootstrap { user: String, host: String, ssh_port: u16 },
+    Bootstrap {
+        user: String,
+        host: String,
+        ssh_port: u16,
+    },
     /// `mosh --port <p> <host>` with `MOSH_KEY` in the env — connect directly
     /// to a running server (this is how the real `mosh-client` is invoked, and
     /// how we test against a locally started mosh-server).
-    Direct { host: String, udp_port: u16, key: String },
+    Direct {
+        host: String,
+        udp_port: u16,
+        key: String,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -65,10 +73,7 @@ fn mosh_server_command(locale: &str) -> String {
     format!("mosh-server new -s -c 256 -l LANG={locale}")
 }
 
-fn parse_opts(
-    argv: &[String],
-    getenv: &dyn Fn(&str) -> Option<String>,
-) -> Result<Opts, String> {
+fn parse_opts(argv: &[String], getenv: &dyn Fn(&str) -> Option<String>) -> Result<Opts, String> {
     let mut ssh_port = 22;
     let mut udp_port: Option<u16> = None;
     let mut identity = None;
@@ -111,9 +116,17 @@ fn parse_opts(
 
     // Direct mode when a UDP port + MOSH_KEY are supplied (mosh-client style).
     let mode = match (udp_port, getenv("MOSH_KEY")) {
-        (Some(udp_port), Some(key)) => Mode::Direct { host, udp_port, key },
+        (Some(udp_port), Some(key)) => Mode::Direct {
+            host,
+            udp_port,
+            key,
+        },
         (Some(_), None) => return Err("mosh: --port given but MOSH_KEY not set".to_string()),
-        (None, _) => Mode::Bootstrap { user, host, ssh_port },
+        (None, _) => Mode::Bootstrap {
+            user,
+            host,
+            ssh_port,
+        },
     };
 
     Ok(Opts {
@@ -181,7 +194,10 @@ fn exec_mosh(
         };
 
         let code = tokio::task::spawn_blocking(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
                 Ok(rt) => rt,
                 Err(_) => return 255u8,
             };
@@ -198,16 +214,22 @@ async fn run(opts: Opts, fd0: OwnedFd, fd1: OwnedFd, fd2: OwnedFd) -> u8 {
 
     // Resolve endpoint + key.
     let (host, udp_port, key_b64) = match &opts.mode {
-        Mode::Direct { host, udp_port, key } => (host.clone(), *udp_port, key.clone()),
-        Mode::Bootstrap { user, host, ssh_port } => {
-            match bootstrap_over_ssh(user, host, *ssh_port, &opts).await {
-                Ok((port, key)) => (host.clone(), port, key),
-                Err(e) => {
-                    eprint_fd(raw2, &format!("mosh: {e}\n"));
-                    return 255;
-                }
+        Mode::Direct {
+            host,
+            udp_port,
+            key,
+        } => (host.clone(), *udp_port, key.clone()),
+        Mode::Bootstrap {
+            user,
+            host,
+            ssh_port,
+        } => match bootstrap_over_ssh(user, host, *ssh_port, &opts).await {
+            Ok((port, key)) => (host.clone(), port, key),
+            Err(e) => {
+                eprint_fd(raw2, &format!("mosh: {e}\n"));
+                return 255;
             }
-        }
+        },
     };
 
     let key_bytes = match base64::engine::general_purpose::STANDARD_NO_PAD.decode(key_b64.trim()) {
@@ -400,8 +422,12 @@ async fn client_loop(
     send_state(crypto, &sock, &mut st).await;
 
     // Debug: bound the session length (seconds) / force a roam (seconds).
-    let max_secs = std::env::var("MOSH_MAX_SECS").ok().and_then(|v| v.parse::<u64>().ok());
-    let roam_after = std::env::var("MOSH_ROAM_AFTER").ok().and_then(|v| v.parse::<u64>().ok());
+    let max_secs = std::env::var("MOSH_MAX_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
+    let roam_after = std::env::var("MOSH_ROAM_AFTER")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
 
     let mut kbuf = [0u8; 4096];
     let mut dbuf = [0u8; 2048];
@@ -614,7 +640,9 @@ async fn bootstrap_over_ssh(
     }
     parse_mosh_connect(&String::from_utf8_lossy(&buf))
         .map(|c| (c.port, c.key))
-        .ok_or_else(|| "mosh-server did not print MOSH CONNECT (is mosh installed on the remote?)".to_string())
+        .ok_or_else(|| {
+            "mosh-server did not print MOSH CONNECT (is mosh installed on the remote?)".to_string()
+        })
 }
 
 #[cfg(test)]
@@ -695,7 +723,11 @@ mod tests {
         let o = parse(&["mosh", "example.com"], &env).unwrap();
         assert_eq!(
             o.mode,
-            Mode::Bootstrap { user: "me".into(), host: "example.com".into(), ssh_port: 22 }
+            Mode::Bootstrap {
+                user: "me".into(),
+                host: "example.com".into(),
+                ssh_port: 22
+            }
         );
     }
 
@@ -705,7 +737,11 @@ mod tests {
         let o = parse(&["mosh", "-p", "2222", "alice@h"], &env).unwrap();
         assert_eq!(
             o.mode,
-            Mode::Bootstrap { user: "alice".into(), host: "h".into(), ssh_port: 2222 }
+            Mode::Bootstrap {
+                user: "alice".into(),
+                host: "h".into(),
+                ssh_port: 2222
+            }
         );
     }
 

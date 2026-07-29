@@ -93,7 +93,11 @@ fn parse_remote(s: &str, default_user: &str) -> Option<(String, String, String)>
         Some((u, h)) => (u.to_string(), h.to_string()),
         None => (default_user.to_string(), hostpart.to_string()),
     };
-    let path = if path.is_empty() { ".".to_string() } else { path.to_string() };
+    let path = if path.is_empty() {
+        ".".to_string()
+    } else {
+        path.to_string()
+    };
     Some((user, host, path))
 }
 
@@ -220,7 +224,10 @@ fn exec_scp(
         };
 
         let code = tokio::task::spawn_blocking(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
                 Ok(rt) => rt,
                 Err(_) => return 255u8,
             };
@@ -256,7 +263,14 @@ async fn run_scp(
     let result = match (src_remote, dst_remote) {
         (Some((user, host, rpath)), None) => {
             // download: remote -> local
-            let conn = Conn { user, host, port: opts.port, identity: opts.identity.clone(), home: home.to_path_buf(), password_env };
+            let conn = Conn {
+                user,
+                host,
+                port: opts.port,
+                identity: opts.identity.clone(),
+                home: home.to_path_buf(),
+                password_env,
+            };
             let local = resolve_local(cwd, &opts.dst);
             match connect_and_open(&conn).await {
                 Ok(sftp) => download(&sftp, &rpath, &local, opts.recursive, fd1).await,
@@ -265,7 +279,14 @@ async fn run_scp(
         }
         (None, Some((user, host, rpath))) => {
             // upload: local -> remote
-            let conn = Conn { user, host, port: opts.port, identity: opts.identity.clone(), home: home.to_path_buf(), password_env };
+            let conn = Conn {
+                user,
+                host,
+                port: opts.port,
+                identity: opts.identity.clone(),
+                home: home.to_path_buf(),
+                password_env,
+            };
             let local = resolve_local(cwd, &opts.src);
             match connect_and_open(&conn).await {
                 Ok(sftp) => upload(&sftp, &local, &rpath, opts.recursive, fd1).await,
@@ -322,7 +343,10 @@ async fn download(
         local.to_path_buf()
     };
     let n = download_file(sftp, rpath, &dest).await?;
-    write_fd(fd1, format!("{rpath} -> {} ({n} bytes)\n", dest.display()).as_bytes());
+    write_fd(
+        fd1,
+        format!("{rpath} -> {} ({n} bytes)\n", dest.display()).as_bytes(),
+    );
     Ok(())
 }
 
@@ -339,7 +363,9 @@ async fn download_file(sftp: &SftpSession, rpath: &str, dest: &Path) -> Result<u
     let n = tokio::io::copy(&mut remote, &mut out)
         .await
         .map_err(|e| format!("download {rpath}: {e}"))?;
-    out.flush().await.map_err(|e| format!("flush {}: {e}", dest.display()))?;
+    out.flush()
+        .await
+        .map_err(|e| format!("flush {}: {e}", dest.display()))?;
     Ok(n)
 }
 
@@ -361,7 +387,9 @@ async fn upload_file(sftp: &SftpSession, local: &Path, dest: &str) -> Result<u64
         .await
         .map_err(|e| format!("upload {dest}: {e}"))?;
     f.flush().await.map_err(|e| format!("flush {dest}: {e}"))?;
-    f.shutdown().await.map_err(|e| format!("close {dest}: {e}"))?;
+    f.shutdown()
+        .await
+        .map_err(|e| format!("close {dest}: {e}"))?;
     Ok(n)
 }
 
@@ -388,7 +416,10 @@ fn download_dir<'a>(
                 download_dir(sftp, &child_r, &child_l, fd1).await?;
             } else {
                 download_file(sftp, &child_r, &child_l).await?;
-                write_fd(fd1, format!("{child_r} -> {}\n", child_l.display()).as_bytes());
+                write_fd(
+                    fd1,
+                    format!("{child_r} -> {}\n", child_l.display()).as_bytes(),
+                );
             }
         }
         Ok(())
@@ -424,7 +455,10 @@ async fn upload(
         rpath.to_string()
     };
     let n = upload_file(sftp, local, &dest).await?;
-    write_fd(fd1, format!("{} -> {dest} ({n} bytes)\n", local.display()).as_bytes());
+    write_fd(
+        fd1,
+        format!("{} -> {dest} ({n} bytes)\n", local.display()).as_bytes(),
+    );
     Ok(())
 }
 
@@ -436,7 +470,8 @@ fn upload_dir<'a>(
 ) -> BoxFuture<'a, Result<(), String>> {
     Box::pin(async move {
         let _ = sftp.create_dir(rdir.to_string()).await; // ignore "already exists"
-        let entries = std::fs::read_dir(local).map_err(|e| format!("read {}: {e}", local.display()))?;
+        let entries =
+            std::fs::read_dir(local).map_err(|e| format!("read {}: {e}", local.display()))?;
         for entry in entries {
             let entry = entry.map_err(|e| format!("dir entry: {e}"))?;
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -446,7 +481,10 @@ fn upload_dir<'a>(
                 upload_dir(sftp, &child_l, &child_r, fd1).await?;
             } else {
                 upload_file(sftp, &child_l, &child_r).await?;
-                write_fd(fd1, format!("{} -> {child_r}\n", child_l.display()).as_bytes());
+                write_fd(
+                    fd1,
+                    format!("{} -> {child_r}\n", child_l.display()).as_bytes(),
+                );
             }
         }
         Ok(())
@@ -517,7 +555,10 @@ fn exec_sftp(
         };
 
         let code = tokio::task::spawn_blocking(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
                 Ok(rt) => rt,
                 Err(_) => return 255u8,
             };
@@ -544,7 +585,10 @@ async fn run_sftp_repl(conn: Conn, cwd: PathBuf, fd0: RawFd, fd1: RawFd, fd2: Ra
             return 255;
         }
     };
-    let mut rdir = sftp.canonicalize(".".to_string()).await.unwrap_or_else(|_| "/".to_string());
+    let mut rdir = sftp
+        .canonicalize(".".to_string())
+        .await
+        .unwrap_or_else(|_| "/".to_string());
     let mut ldir = cwd;
 
     let mut stdin = match AsyncFd::try_from(fd0) {
@@ -554,7 +598,10 @@ async fn run_sftp_repl(conn: Conn, cwd: PathBuf, fd0: RawFd, fd1: RawFd, fd2: Ra
     // Restore blocking mode on exit (AsyncFd sets O_NONBLOCK on the shared fd).
     let saved = unsafe { libc::fcntl(fd0, libc::F_GETFL) };
 
-    write_fd(fd1, b"Connected. Type 'help' for commands, 'quit' to exit.\n");
+    write_fd(
+        fd1,
+        b"Connected. Type 'help' for commands, 'quit' to exit.\n",
+    );
     loop {
         write_fd(fd1, b"sftp> ");
         let Some(line) = read_line(&mut stdin).await else {
@@ -625,9 +672,16 @@ async fn run_sftp_repl(conn: Conn, cwd: PathBuf, fd0: RawFd, fd1: RawFd, fd2: Ra
                 match sftp.read(rpath.clone()).await {
                     Ok(data) => {
                         if let Err(e) = std::fs::write(&local, &data) {
-                            write_fd(fd2, format!("get: write {}: {e}\n", local.display()).as_bytes());
+                            write_fd(
+                                fd2,
+                                format!("get: write {}: {e}\n", local.display()).as_bytes(),
+                            );
                         } else {
-                            write_fd(fd1, format!("fetched {} ({} bytes)\n", local.display(), data.len()).as_bytes());
+                            write_fd(
+                                fd1,
+                                format!("fetched {} ({} bytes)\n", local.display(), data.len())
+                                    .as_bytes(),
+                            );
                         }
                     }
                     Err(e) => write_fd(fd2, format!("get: {e}\n").as_bytes()),
@@ -668,13 +722,19 @@ async fn run_sftp_repl(conn: Conn, cwd: PathBuf, fd0: RawFd, fd1: RawFd, fd2: Ra
             }
             "rename" => match (arg1, arg2) {
                 (Some(a), Some(b)) => {
-                    if let Err(e) = sftp.rename(join_remote(&rdir, a), join_remote(&rdir, b)).await {
+                    if let Err(e) = sftp
+                        .rename(join_remote(&rdir, a), join_remote(&rdir, b))
+                        .await
+                    {
                         write_fd(fd2, format!("rename: {e}\n").as_bytes());
                     }
                 }
                 _ => write_fd(fd2, b"usage: rename old new\n"),
             },
-            other => write_fd(fd2, format!("unknown command: {other} (try 'help')\n").as_bytes()),
+            other => write_fd(
+                fd2,
+                format!("unknown command: {other} (try 'help')\n").as_bytes(),
+            ),
         }
     }
     if saved >= 0 {

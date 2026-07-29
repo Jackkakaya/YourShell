@@ -5,11 +5,31 @@ packages:
   SwiftTerm:
     url: https://github.com/migueldeicaza/SwiftTerm
     from: 1.2.0
+  PythonIOSLib:
+    path: ../vendor/python-ios-lib
 targets:
   AShellRS:
     type: application
     platform: iOS
     deploymentTarget: "17.0"
+    preBuildScripts:
+      - name: Build Rust core
+        basedOnDependencyAnalysis: false
+        script: |
+          set -euo pipefail
+          export PATH="/Users/$USER/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+          case "$PLATFORM_NAME" in
+            iphonesimulator) RUST_TARGET="aarch64-apple-ios-sim" ;;
+            iphoneos) RUST_TARGET="aarch64-apple-ios" ;;
+            *) echo "Unsupported Apple platform: $PLATFORM_NAME" >&2; exit 1 ;;
+          esac
+          cd "$PROJECT_DIR/../core"
+          cargo build --target "$RUST_TARGET" --release --features python,node,vision
+    postBuildScripts:
+      - name: Prepare python-ios-lib native extensions
+        basedOnDependencyAnalysis: false
+        shell: /bin/bash
+        path: Scripts/prepare-python-ios-lib.sh
     sources:
       - App
       - PyHost
@@ -28,13 +48,30 @@ targets:
         embed: true
         codeSign: false
       - package: SwiftTerm
+      - package: PythonIOSLib
+        product: NumPy
+      - package: PythonIOSLib
+        product: SciPy
+      - package: PythonIOSLib
+        product: Pandas
+      - package: PythonIOSLib
+        product: Pillow
+      - package: PythonIOSLib
+        product: Matplotlib
+      # Matplotlib imports pyparsing while initializing its fontconfig
+      # parser, but the upstream Matplotlib product does not currently list
+      # that hard dependency.
+      - package: PythonIOSLib
+        product: Pyparsing
     settings:
       base:
         SWIFT_OBJC_BRIDGING_HEADER: App/Bridging-Header.h
         LIBRARY_SEARCH_PATHS: ["$(PROJECT_DIR)/../core/target/aarch64-apple-ios-sim/release"]
-        OTHER_LDFLAGS: ["-lashellcore", "-liconv"]
+        "LIBRARY_SEARCH_PATHS[sdk=iphoneos*]": ["$(PROJECT_DIR)/../core/target/aarch64-apple-ios/release"]
+        OTHER_LDFLAGS: ["-lashellcore", "-liconv", "-larchive"]
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         PRODUCT_BUNDLE_IDENTIFIER: dev.sumin.ashellrs
         TARGETED_DEVICE_FAMILY: "1,2"
         CODE_SIGNING_ALLOWED: NO
+        ENABLE_USER_SCRIPT_SANDBOXING: NO

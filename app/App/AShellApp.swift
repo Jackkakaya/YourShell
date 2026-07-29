@@ -14,29 +14,52 @@ struct AShellApp: App {
 
 struct TerminalScreen: View {
     @StateObject private var session = ShellSession()
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var automationStarted = false
 
     var body: some View {
         TerminalHostView(session: session)
             .onAppear {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    session.printPrompt()
-                    let env = ProcessInfo.processInfo.environment
-                    if env["ASHELL_SELFTEST"] == "1" {
-                        session.runSelftest()
-                    } else if let cmd = env["ASHELL_EXEC"] {
-                        session.runSingle(cmd)
-                        if let feed = env["ASHELL_STDIN_FEED"] {
-                            session.scheduleStdinFeed(feed, after: 4.0)
-                        }
-                    } else if let typed = env["ASHELL_TYPE"] {
-                        // Debug: feed keystrokes (incl. \t) into the line editor,
-                        // then mirror the transcript so the host can inspect it.
-                        session.typeForDebug(typed)
-                    } else {
-                        session.startDemo()
-                    }
-                }
+                startAutomationIfNeeded()
             }
+            .onChange(of: scenePhase) { _, phase in
+                if phase == .active { startAutomationIfNeeded() }
+            }
+    }
+
+    private func launchArgument(named name: String) -> String? {
+        let prefix = name + "="
+        return ProcessInfo.processInfo.arguments.first(where: { $0.hasPrefix(prefix) })
+            .map { String($0.dropFirst(prefix.count)) }
+    }
+
+    private func startAutomationIfNeeded() {
+        guard !automationStarted else { return }
+        automationStarted = true
+        let launchEnv = ProcessInfo.processInfo.environment
+        let launchInfo = "argv=\(ProcessInfo.processInfo.arguments)\\n"
+            + "selftest=" + (launchEnv["ASHELL_SELFTEST"] ?? "") + "\\n"
+            + "exec=" + (launchEnv["ASHELL_EXEC"] ?? "") + "\\n"
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        try? launchInfo.write(to: docs.appendingPathComponent("launch_debug.txt"), atomically: true, encoding: .utf8)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            session.printPrompt()
+            let env = ProcessInfo.processInfo.environment
+            let args = ProcessInfo.processInfo.arguments
+            let selftest = env["ASHELL_SELFTEST"] == "1" || args.contains("ASHELL_SELFTEST=1")
+            if selftest {
+                session.runSelftest()
+            } else if let cmd = env["ASHELL_EXEC"] ?? launchArgument(named: "ASHELL_EXEC") {
+                session.runSingle(cmd)
+                if let feed = env["ASHELL_STDIN_FEED"] ?? launchArgument(named: "ASHELL_STDIN_FEED") {
+                    session.scheduleStdinFeed(feed, after: 4.0)
+                }
+            } else if let typed = env["ASHELL_TYPE"] {
+                session.typeForDebug(typed)
+            } else {
+                session.startDemo()
+            }
+        }
     }
 }
 
@@ -83,4 +106,5 @@ struct TerminalHostView: UIViewRepresentable {
         func clipboardCopy(source: SwiftTerm.TerminalView, content: Data) {}
         func rangeChanged(source: SwiftTerm.TerminalView, startY: Int, endY: Int) {}
     }
+
 }
