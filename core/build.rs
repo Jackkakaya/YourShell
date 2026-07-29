@@ -221,6 +221,7 @@ fn build_bsd_gzip() {
         "unzstd.c",
         "zuncompress.c",
         "compat.h",
+        "sys/endian.h",
         "gzip_host.c",
     ] {
         println!("cargo:rerun-if-changed=../vendor/bsd-gzip/{file}");
