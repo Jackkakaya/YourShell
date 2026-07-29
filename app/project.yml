@@ -77,3 +77,8 @@ targets:
         TARGETED_DEVICE_FAMILY: "1,2"
         CODE_SIGNING_ALLOWED: NO
         ENABLE_USER_SCRIPT_SANDBOXING: NO
+        # Embedded Rust/Python runtime artifacts provide arm64 simulator
+        # slices. Keep generic simulator builds from also requesting x86_64
+        # on Intel-hosted CI runners.
+        "ARCHS[sdk=iphonesimulator*]": arm64
+        "EXCLUDED_ARCHS[sdk=iphonesimulator*]": x86_64
