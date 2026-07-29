@@ -57,6 +57,12 @@ missing_paths() {
     done
 }
 
+print_missing() {
+    while IFS= read -r path; do
+        [[ -n "$path" ]] && printf '  %s\n' "$path"
+    done <<<"$1"
+}
+
 if [[ ! -f "$ROOT/core/Cargo.toml" ]]; then
     echo "error: YourShell source is incomplete (core/Cargo.toml is missing)." >&2
     echo "If this is a submodule, run: git submodule update --init --recursive" >&2
@@ -71,7 +77,7 @@ fi
 
 if [[ "$CHECK_ONLY" -eq 1 ]]; then
     echo "error: YourShell iOS runtime is incomplete:" >&2
-    printf '  %s\n' $missing >&2
+    print_missing "$missing" >&2
     echo "Run: $ROOT/scripts/bootstrap-ios.sh" >&2
     exit 1
 fi
@@ -90,6 +96,7 @@ if ! command -v shasum >/dev/null 2>&1; then
 fi
 
 if command -v git-lfs >/dev/null 2>&1; then
+    git -C "$ROOT" lfs install --local
     git -C "$ROOT" lfs pull --include="vendor/nodejs-mobile/NodeMobile.xcframework/**"
 else
     echo "error: Git LFS is required for NodeMobile (install with: brew install git-lfs)." >&2
@@ -129,7 +136,7 @@ printf '%s\n' "$YOURSHELL_IOS_RUNTIME_VERSION" >"$VERSION_MARKER"
 missing="$(missing_paths)"
 if [[ -n "$missing" ]]; then
     echo "error: runtime archive is incomplete:" >&2
-    printf '  %s\n' $missing >&2
+    print_missing "$missing" >&2
     exit 1
 fi
 
