@@ -44,6 +44,9 @@ jobs:
       - name: Install XcodeGen
         run: brew install xcodegen
 
+      - name: Bootstrap pinned iOS runtime
+        run: ./scripts/bootstrap-ios.sh
+
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
         with:
@@ -51,7 +54,9 @@ jobs:
           key: ios-simulator
 
       - name: Generate project
-        run: xcodegen generate --spec app/project.yml --project app
+        run: |
+          ./scripts/build-ios.sh sim
+          xcodegen generate --spec app/project.yml --project app
 
       - name: Build simulator app
         run: |

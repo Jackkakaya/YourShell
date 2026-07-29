@@ -1,4 +1,5 @@
 import re
+import os
 import subprocess
 import unittest
 from pathlib import Path
@@ -97,6 +98,44 @@ class RepositoryContractTests(unittest.TestCase):
             if size != "-" and int(size) > 100 * 1024 * 1024:
                 oversized.append(path)
         self.assertEqual(oversized, [])
+
+    def test_ios_bootstrap_contract_is_complete(self) -> None:
+        bootstrap = ROOT / "scripts/bootstrap-ios.sh"
+        build = ROOT / "scripts/build-ios.sh"
+        manifest = ROOT / "scripts/ios-runtime.env"
+        for path in (bootstrap, build, manifest):
+            self.assertTrue(path.is_file(), path)
+        self.assertTrue(os.access(bootstrap, os.X_OK))
+        self.assertTrue(os.access(build, os.X_OK))
+
+        values = {}
+        for line in manifest.read_text(encoding="utf-8").splitlines():
+            if line and not line.startswith("#"):
+                key, value = line.split("=", 1)
+                values[key] = value
+        self.assertRegex(values["YOURSHELL_IOS_RUNTIME_VERSION"], r"^\d{4}\.\d{2}\.\d{2}$")
+        self.assertEqual(len(values["YOURSHELL_IOS_RUNTIME_SHA256"]), 64)
+        self.assertTrue(values["YOURSHELL_IOS_RUNTIME_URL"].startswith("https://"))
+        self.assertIn(values["YOURSHELL_IOS_RUNTIME_ARCHIVE"], values["YOURSHELL_IOS_RUNTIME_URL"])
+
+        bootstrap_text = bootstrap.read_text(encoding="utf-8")
+        for required in (
+            "NodeMobile.xcframework",
+            "Python.xcframework",
+            "PythonResources",
+            "NodeResources",
+            "lfs pull",
+            "shasum -a 256",
+        ):
+            self.assertIn(required, bootstrap_text)
+
+    def test_ios_scripts_have_valid_shell_syntax(self) -> None:
+        for script in ("scripts/bootstrap-ios.sh", "scripts/build-ios.sh"):
+            subprocess.run(
+                ["bash", "-n", str(ROOT / script)],
+                cwd=ROOT,
+                check=True,
+            )
 
 
 if __name__ == "__main__":

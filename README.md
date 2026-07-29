@@ -81,21 +81,27 @@ rustup target add aarch64-apple-ios aarch64-apple-ios-sim
 git lfs install
 ```
 
-## Clone
+## Clone and bootstrap
 
-The Brush source is a submodule and NodeMobile uses Git LFS:
+The Brush source is a submodule, NodeMobile uses Git LFS, and the remaining
+iOS runtime is a versioned, checksum-verified release artifact:
 
 ```sh
 git clone --recurse-submodules https://github.com/Jackkakaya/YourShell.git
 cd YourShell
-git lfs pull
+./scripts/bootstrap-ios.sh
 ```
 
-For an existing clone:
+The bootstrap command is idempotent and prepares all Python and Node
+frameworks and resources. It gives an actionable error when Git LFS or another
+required tool is unavailable. For CI or an internal mirror, set
+`YOURSHELL_CACHE_DIR` or `YOURSHELL_IOS_RUNTIME_URL`.
+
+For an existing clone or a parent repository using YourShell as a submodule:
 
 ```sh
 git submodule update --init --recursive
-git lfs pull
+./vendor/YourShell/scripts/bootstrap-ios.sh
 ```
 
 ## Build and test the Rust core
@@ -127,6 +133,7 @@ The full Rust test suite includes:
 ## Build the iOS example app
 
 ```sh
+./scripts/build-ios.sh sim
 xcodegen generate --spec app/project.yml --project app
 xcodebuild \
   -project app/AShellRS.xcodeproj \
@@ -137,8 +144,10 @@ xcodebuild \
   CODE_SIGNING_ALLOWED=NO
 ```
 
-The Xcode build invokes Cargo for `aarch64-apple-ios-sim` and enables the
-Python, Node, and vision integrations.
+For a physical device, use `./scripts/build-ios.sh device`. The command
+bootstraps every binary/resource dependency, installs the Rust target, and
+produces the correct `libashellcore.a`. It is the supported integration entry
+point for parent apps; consumers should not copy runtime files manually.
 
 ## Python runtime test on Simulator
 
