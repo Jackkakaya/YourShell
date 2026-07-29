@@ -42,6 +42,7 @@ mod wget_adapter;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -88,6 +89,13 @@ enum SessionMsg {
     Capture(String, Option<u64>, mpsc::SyncSender<CaptureReply>),
     /// Tab completion: (line, cursor byte offset, reply channel).
     Complete(String, usize, mpsc::SyncSender<CompletionReply>),
+}
+
+/// Shell completion is delivered by the output-pump thread, never directly by
+/// the shell thread. This creates one total order:
+/// command output -> completion -> next prompt/input owner.
+enum OutputEvent {
+    Done(i32, String),
 }
 
 /// Captured output of one command (for `ashell_run_capture`).
@@ -381,6 +389,7 @@ pub extern "C" fn ashell_session_new(
             return std::ptr::null_mut();
         };
         let (cmd_tx, cmd_rx) = mpsc::channel::<SessionMsg>();
+        let (output_event_tx, output_event_rx) = mpsc::channel::<OutputEvent>();
         let stdin_writer = Arc::new(Mutex::new(None));
         let stdin_writer_for_shell = stdin_writer.clone();
         let alive = Arc::new(AtomicBool::new(true));
@@ -394,23 +403,62 @@ pub extern "C" fn ashell_session_new(
             let out_ctx = out_ctx;
             let mut reader = stdout_reader;
             let mut buf = [0u8; 8192];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if reader_alive.load(Ordering::Acquire) {
-                            out_cb(out_ctx.0, buf.as_ptr(), n);
+            // The shell keeps stdout open for the whole session, so a blocking
+            // read cannot also observe completion events. Nonblocking draining
+            // lets this one thread serialize bytes and Done callbacks.
+            let fd = reader.as_raw_fd();
+            // SAFETY: fd belongs to `reader` and remains valid for this thread.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            if flags >= 0 {
+                // SAFETY: same valid fd; preserving all existing status flags.
+                unsafe {
+                    libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                }
+            }
+            let drain = |reader: &mut std::io::PipeReader, buf: &mut [u8; 8192]| -> bool {
+                loop {
+                    match reader.read(buf) {
+                        Ok(0) => return false,
+                        Ok(n) => {
+                            if reader_alive.load(Ordering::Acquire) {
+                                out_cb(out_ctx.0, buf.as_ptr(), n);
+                            }
                         }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return true,
+                        Err(_) => return false,
+                    }
+                }
+            };
+            loop {
+                if !drain(&mut reader, &mut buf) {
+                    break;
+                }
+                match output_event_rx.recv_timeout(std::time::Duration::from_millis(2)) {
+                    Ok(OutputEvent::Done(exit_code, cwd)) => {
+                        // The event is sent only after the command has flushed
+                        // its writers. Drain once more so every preceding byte
+                        // reaches Swift before ownership returns to the prompt.
+                        if !drain(&mut reader, &mut buf) {
+                            break;
+                        }
+                        let cwd = CString::new(cwd).unwrap_or_default();
+                        if reader_alive.load(Ordering::Acquire) {
+                            done_cb(out_ctx.0, exit_code, cwd.as_ptr());
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        if !drain(&mut reader, &mut buf) {
+                            break;
+                        }
+                        break;
                     }
                 }
             }
         });
 
         // Shell thread: owns the Shell instance for this session's lifetime.
-        let shell_ctx = CallbackCtx(ctx);
-        let shell_alive = alive.clone();
         let shell_handle = std::thread::spawn(move || {
-            let shell_ctx = shell_ctx;
             let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -434,9 +482,8 @@ pub extern "C" fn ashell_session_new(
                     Err(e) => {
                         let msg =
                             CString::new(format!("shell init failed: {e}")).unwrap_or_default();
-                        if shell_alive.load(Ordering::Acquire) {
-                            done_cb(shell_ctx.0, 127, msg.as_ptr());
-                        }
+                        let _ = output_event_tx
+                            .send(OutputEvent::Done(127, msg.to_string_lossy().into_owned()));
                         return;
                     }
                 };
@@ -472,12 +519,8 @@ pub extern "C" fn ashell_session_new(
                                     current.take();
                                 }
                             }
-                            let cwd =
-                                CString::new(shell.working_dir().to_string_lossy().into_owned())
-                                    .unwrap_or_default();
-                            if shell_alive.load(Ordering::Acquire) {
-                                done_cb(shell_ctx.0, exit_code, cwd.as_ptr());
-                            }
+                            let cwd = shell.working_dir().to_string_lossy().into_owned();
+                            let _ = output_event_tx.send(OutputEvent::Done(exit_code, cwd));
                         }
                         SessionMsg::Capture(cmd, timeout_ms, reply) => {
                             let out = run_capture(&mut shell, cmd, timeout_ms, &shell_cancel).await;
@@ -788,6 +831,111 @@ pub extern "C" fn ashell_selftest(working_dir: *const c_char) -> *mut c_char {
         let report = selftest::run_selftest(std::path::Path::new(&working_dir));
         CString::new(report).unwrap_or_default().into_raw()
     })
+}
+
+#[cfg(test)]
+mod interactive_session_tests {
+    use super::*;
+
+    #[derive(Debug)]
+    enum Event {
+        Output(Vec<u8>),
+        Done(i32),
+    }
+
+    struct Harness {
+        tx: mpsc::Sender<Event>,
+    }
+
+    extern "C" fn output(ctx: *mut c_void, bytes: *const u8, len: usize) {
+        // SAFETY: the test keeps Harness alive until the session is freed.
+        let harness = unsafe { &*(ctx.cast::<Harness>()) };
+        // SAFETY: output callback contract guarantees `len` readable bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(bytes, len) };
+        let _ = harness.tx.send(Event::Output(bytes.to_vec()));
+    }
+
+    extern "C" fn done(ctx: *mut c_void, exit_code: i32, _cwd: *const c_char) {
+        // SAFETY: the test keeps Harness alive until the session is freed.
+        let harness = unsafe { &*(ctx.cast::<Harness>()) };
+        let _ = harness.tx.send(Event::Done(exit_code));
+    }
+
+    fn exec(session: *mut Session, command: &str) {
+        let command = CString::new(command).unwrap();
+        ashell_exec(session, command.as_ptr());
+    }
+
+    fn write_stdin(session: *mut Session, bytes: &[u8]) {
+        ashell_stdin_write(session, bytes.as_ptr(), bytes.len());
+    }
+
+    #[test]
+    fn completion_follows_all_command_output() {
+        let (tx, rx) = mpsc::channel();
+        let harness = Box::new(Harness { tx });
+        let cwd = CString::new(std::env::temp_dir().to_string_lossy().as_bytes()).unwrap();
+        let session = ashell_session_new(
+            output,
+            done,
+            (&*harness as *const Harness).cast_mut().cast(),
+            cwd.as_ptr(),
+        );
+        assert!(!session.is_null());
+
+        exec(session, "printf sentinel");
+        let mut output_before_done = Vec::new();
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap() {
+                Event::Output(bytes) => output_before_done.extend(bytes),
+                Event::Done(code) => {
+                    assert_eq!(code, 0);
+                    break;
+                }
+            }
+        }
+        assert_eq!(output_before_done, b"sentinel");
+        ashell_session_free(session);
+    }
+
+    #[test]
+    fn unread_stdin_cannot_leak_into_the_next_command() {
+        let (tx, rx) = mpsc::channel();
+        let harness = Box::new(Harness { tx });
+        let cwd = CString::new(std::env::temp_dir().to_string_lossy().as_bytes()).unwrap();
+        let session = ashell_session_new(
+            output,
+            done,
+            (&*harness as *const Harness).cast_mut().cast(),
+            cwd.as_ptr(),
+        );
+        assert!(!session.is_null());
+
+        exec(session, "read first; printf 'first:%s\\n' \"$first\"");
+        write_stdin(session, b"abc\nSHOULD_NOT_LEAK\n");
+        while !matches!(
+            rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
+            Event::Done(0)
+        ) {}
+
+        exec(session, "cat");
+        ashell_stdin_eof(session);
+        let mut second_output = Vec::new();
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap() {
+                Event::Output(bytes) => second_output.extend(bytes),
+                Event::Done(code) => {
+                    assert_eq!(code, 0);
+                    break;
+                }
+            }
+        }
+        assert!(
+            !String::from_utf8_lossy(&second_output).contains("SHOULD_NOT_LEAK"),
+            "leftover stdin crossed the command ownership boundary"
+        );
+        ashell_session_free(session);
+    }
 }
 
 /// ABI version, so the Swift host can verify it matches the linked core.
