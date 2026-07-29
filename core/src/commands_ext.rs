@@ -425,3 +425,92 @@ impl builtins::Command for ZipCommand {
 }
 
 // ---------------------------------------------------------------- jq
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn abs_preserves_absolute_and_resolves_relative_paths() {
+        let cwd = Path::new("/work");
+        assert_eq!(abs(cwd, "/tmp/file"), PathBuf::from("/tmp/file"));
+        assert_eq!(abs(cwd, "file"), PathBuf::from("/work/file"));
+    }
+
+    #[test]
+    fn shell_glob_supports_wildcards_and_escapes_regex_metacharacters() {
+        let wildcard = glob_to_regex("a?.*");
+        assert!(wildcard.is_match("ab.txt"));
+        assert!(!wildcard.is_match("a.txt"));
+
+        let literal = glob_to_regex("a+[b](c){d}|^$\\");
+        assert!(literal.is_match("a+[b](c){d}|^$\\"));
+        assert!(!literal.is_match("aaab"));
+    }
+
+    #[test]
+    fn tree_walk_handles_empty_prefix_depth_limit_and_unreadable_root() {
+        let temp = std::env::temp_dir().join(format!(
+            "yourshell-tree-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(temp.join("dir")).unwrap();
+        std::fs::write(temp.join("file"), b"x").unwrap();
+
+        let opts = TreeOpts {
+            all: true,
+            max: Some(0),
+            dirs_only: false,
+            full_path: true,
+            no_indent: true,
+            pattern: None,
+            ignore: None,
+        };
+        let mut output = Vec::new();
+        let (mut dirs, mut files) = (0, 0);
+        tree_walk(&temp, "", "", &opts, 1, &mut output, &mut dirs, &mut files).unwrap();
+        assert!(output.is_empty());
+
+        let mut output = Vec::new();
+        tree_walk(
+            &temp.join("missing"),
+            "",
+            "",
+            &TreeOpts { max: None, ..opts },
+            1,
+            &mut output,
+            &mut dirs,
+            &mut files,
+        )
+        .unwrap();
+        assert!(output.is_empty());
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn zip_exclusion_is_disabled_when_empty_and_matches_any_pattern() {
+        let base = ZipCommand {
+            recurse: false,
+            update: false,
+            delete: false,
+            store: false,
+            _best: false,
+            junk_paths: false,
+            quiet: false,
+            names_stdin: false,
+            exclude: Vec::new(),
+            archive: "out.zip".into(),
+            paths: Vec::new(),
+        };
+        assert!(!base.excluded("skip.tmp"));
+
+        let matching = ZipCommand {
+            exclude: vec!["*.tmp".into(), "exact".into()],
+            ..base
+        };
+        assert!(matching.excluded("skip.tmp"));
+        assert!(matching.excluded("exact"));
+        assert!(!matching.excluded("keep.txt"));
+    }
+}
