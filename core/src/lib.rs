@@ -43,9 +43,9 @@ use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::io::{Read, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use brush_builtins::BuiltinSet;
@@ -77,7 +77,11 @@ fn ffi_guard<T>(default: T, f: impl FnOnce() -> T) -> T {
 
 /// Messages to the session's shell thread.
 enum SessionMsg {
-    Exec(String),
+    Exec {
+        id: u64,
+        cmd: String,
+        stdin: std::io::PipeReader,
+    },
     /// Run a command and capture its output separately, replying with
     /// (exit, stdout, stderr). Used by non-interactive/agent callers.
     /// (command, optional timeout ms, reply channel).
@@ -104,7 +108,11 @@ pub struct CompletionReply {
 
 pub struct Session {
     cmd_tx: mpsc::Sender<SessionMsg>,
-    stdin_writer: std::io::PipeWriter,
+    /// Writer for the command that currently owns terminal input. Each command
+    /// gets a fresh pipe so unread Python/read bytes can never leak into the
+    /// next shell command. Taking this value produces a real EOF.
+    stdin_writer: Arc<Mutex<Option<(u64, std::io::PipeWriter)>>>,
+    next_exec_id: AtomicU64,
     /// Cleared on free so lingering worker threads suppress their callbacks.
     alive: Arc<AtomicBool>,
     /// Signalled by `ashell_cancel` to interrupt the command currently running
@@ -369,12 +377,12 @@ pub extern "C" fn ashell_session_new(
 
         // Resource exhaustion (fd limit) must not abort the app: return null so
         // Swift can surface the failure.
-        let (Ok((stdout_reader, stdout_writer)), Ok((stdin_reader, stdin_writer))) =
-            (std::io::pipe(), std::io::pipe())
-        else {
+        let Ok((stdout_reader, stdout_writer)) = std::io::pipe() else {
             return std::ptr::null_mut();
         };
         let (cmd_tx, cmd_rx) = mpsc::channel::<SessionMsg>();
+        let stdin_writer = Arc::new(Mutex::new(None));
+        let stdin_writer_for_shell = stdin_writer.clone();
         let alive = Arc::new(AtomicBool::new(true));
         let cancel = Arc::new(tokio::sync::Notify::new());
         let shell_cancel = cancel.clone();
@@ -412,7 +420,9 @@ pub extern "C" fn ashell_session_new(
 
             runtime.block_on(async move {
                 let mut fds: HashMap<brush_core::ShellFd, OpenFile> = HashMap::new();
-                fds.insert(0.into(), OpenFile::from(stdin_reader));
+                if let Ok(nul) = brush_core::openfiles::null() {
+                    fds.insert(0.into(), nul);
+                }
                 let Ok(stdout_writer2) = stdout_writer.try_clone() else {
                     return;
                 };
@@ -433,7 +443,10 @@ pub extern "C" fn ashell_session_new(
 
                 while let Ok(msg) = cmd_rx.recv() {
                     match msg {
-                        SessionMsg::Exec(cmd) => {
+                        SessionMsg::Exec { id, cmd, stdin } => {
+                            let old_stdin = shell
+                                .open_files_mut()
+                                .set_fd(0.into(), OpenFile::from(stdin));
                             let params = shell.default_exec_params();
                             let source_info = brush_core::SourceInfo::from("terminal");
                             let exit_code: i32 = tokio::select! {
@@ -450,6 +463,15 @@ pub extern "C" fn ashell_session_new(
                                 // aborting async awaits (ssh/curl/…). 130 = SIGINT.
                                 () = shell_cancel.notified() => 130,
                             };
+                            drop(params);
+                            if let Some(old) = old_stdin {
+                                shell.open_files_mut().set_fd(0.into(), old);
+                            }
+                            if let Ok(mut current) = stdin_writer_for_shell.lock() {
+                                if current.as_ref().is_some_and(|(active, _)| *active == id) {
+                                    current.take();
+                                }
+                            }
                             let cwd =
                                 CString::new(shell.working_dir().to_string_lossy().into_owned())
                                     .unwrap_or_default();
@@ -488,6 +510,7 @@ pub extern "C" fn ashell_session_new(
         Box::into_raw(Box::new(Session {
             cmd_tx,
             stdin_writer,
+            next_exec_id: AtomicU64::new(1),
             alive,
             cancel,
             reader_handle: Some(reader_handle),
@@ -508,7 +531,24 @@ pub extern "C" fn ashell_exec(session: *mut Session, cmd: *const c_char) {
         let cmd = unsafe { CStr::from_ptr(cmd) }
             .to_string_lossy()
             .into_owned();
-        let _ = session.cmd_tx.send(SessionMsg::Exec(cmd));
+        let Ok((stdin, writer)) = std::io::pipe() else {
+            return;
+        };
+        let id = session.next_exec_id.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut current) = session.stdin_writer.lock() {
+            *current = Some((id, writer));
+        } else {
+            return;
+        }
+        if session
+            .cmd_tx
+            .send(SessionMsg::Exec { id, cmd, stdin })
+            .is_err()
+        {
+            if let Ok(mut current) = session.stdin_writer.lock() {
+                current.take();
+            }
+        }
     });
 }
 
@@ -668,9 +708,29 @@ pub extern "C" fn ashell_stdin_write(session: *mut Session, bytes: *const u8, le
             // caller contracts that it points to `len` valid bytes.
             unsafe { std::slice::from_raw_parts(bytes, len) }
         };
-        let mut w = &session.stdin_writer;
-        let _ = w.write_all(data);
-        let _ = w.flush();
+        if let Ok(mut current) = session.stdin_writer.lock() {
+            if let Some((_, writer)) = current.as_mut() {
+                let _ = writer.write_all(data);
+                let _ = writer.flush();
+            }
+        }
+    });
+}
+
+/// Delivers terminal EOF to the command that currently owns stdin. Unlike an
+/// EOT byte (`0x04`), dropping the command-scoped pipe is observed by
+/// `read()`/Python's `input()` as a real EOF. The next command receives a fresh
+/// pipe, so this cannot poison the session.
+#[unsafe(no_mangle)]
+pub extern "C" fn ashell_stdin_eof(session: *mut Session) {
+    if session.is_null() {
+        return;
+    }
+    ffi_guard((), || {
+        let session = unsafe { &*session };
+        if let Ok(mut current) = session.stdin_writer.lock() {
+            current.take();
+        }
     });
 }
 
