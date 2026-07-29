@@ -42,7 +42,7 @@ fn required_value(args: &[String], index: &mut usize, option: &str) -> Option<St
     }
 }
 
-fn wget_main(ctx: &command_host::CmdCtx<'_>) -> i32 {
+fn wget_main_with(ctx: &command_host::CmdCtx<'_>, run_curl: impl FnOnce(&[String]) -> i32) -> i32 {
     let mut curl = vec![
         "curl".to_string(),
         "--location".to_string(),
@@ -360,14 +360,20 @@ fn wget_main(ctx: &command_host::CmdCtx<'_>) -> i32 {
         curl.insert(3, "--remote-name".to_string());
     }
 
-    let translated = command_host::CmdCtx {
-        name: "curl",
-        argv: &curl,
-        env: ctx.env,
-        cwd: ctx.cwd,
-        stdin_is_interactive: ctx.stdin_is_interactive,
-    };
-    command_host::run_c_argv(&translated, ys_curl_run)
+    run_curl(&curl)
+}
+
+fn wget_main(ctx: &command_host::CmdCtx<'_>) -> i32 {
+    wget_main_with(ctx, |curl| {
+        let translated = command_host::CmdCtx {
+            name: "curl",
+            argv: curl,
+            env: ctx.env,
+            cwd: ctx.cwd,
+            stdin_is_interactive: ctx.stdin_is_interactive,
+        };
+        command_host::run_c_argv(&translated, ys_curl_run)
+    })
 }
 
 fn exec(
@@ -384,5 +390,235 @@ pub fn registration() -> Registration<DefaultShellExtensions> {
         disabled: false,
         special_builtin: false,
         declaration_builtin: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn invoke(args: &[&str]) -> (i32, Vec<String>) {
+        let argv: Vec<String> = std::iter::once("wget")
+            .chain(args.iter().copied())
+            .map(str::to_string)
+            .collect();
+        let ctx = command_host::CmdCtx {
+            name: "wget",
+            argv: &argv,
+            env: &[],
+            cwd: Path::new("."),
+            stdin_is_interactive: false,
+        };
+        let mut translated = Vec::new();
+        let code = wget_main_with(&ctx, |curl| {
+            translated = curl.to_vec();
+            99
+        });
+        (code, translated)
+    }
+
+    #[test]
+    fn immediate_and_error_actions() {
+        assert_eq!(invoke(&["--help"]).0, 0);
+        assert_eq!(invoke(&["--version"]).0, 0);
+        assert_eq!(invoke(&[]).0, 2);
+        assert_eq!(invoke(&["--unknown"]).0, 2);
+        for option in ["-r", "--recursive", "-m", "--mirror"] {
+            assert_eq!(invoke(&[option]).0, 2);
+        }
+    }
+
+    #[test]
+    fn every_value_option_rejects_a_missing_value() {
+        for option in [
+            "-O",
+            "--output-document",
+            "-P",
+            "--directory-prefix",
+            "--header",
+            "-e",
+            "--referer",
+            "-U",
+            "--user-agent",
+            "--connect-timeout",
+            "--max-redirect",
+            "--load-cookies",
+            "--save-cookies",
+            "--user",
+            "--http-user",
+            "--password",
+            "--http-password",
+            "--proxy-user",
+            "--proxy-password",
+            "--method",
+            "--body-data",
+            "--body-file",
+            "--post-file",
+            "-T",
+            "--timeout",
+            "--waitretry",
+            "-t",
+            "--tries",
+            "--post-data",
+        ] {
+            assert_eq!(invoke(&[option]).0, 2, "{option} accepted a missing value");
+        }
+    }
+
+    #[test]
+    fn flag_only_translation_paths_reach_curl() {
+        let (code, translated) = invoke(&[
+            "-q",
+            "-4",
+            "-6",
+            "-nv",
+            "-c",
+            "-nc",
+            "--no-check-certificate",
+            "--no-proxy",
+            "--retry-connrefused",
+            "--ignore-length",
+            "--no-cache",
+            "-S",
+            "--content-disposition",
+            "--compression=auto",
+            "--keep-session-cookies",
+            "file:///definitely/missing/wget-test",
+        ]);
+        assert_eq!(code, 99);
+        for expected in [
+            "--silent",
+            "--ipv4",
+            "--ipv6",
+            "--continue-at",
+            "--no-clobber",
+            "--insecure",
+            "--noproxy",
+            "--retry-connrefused",
+            "--ignore-content-length",
+            "--dump-header",
+            "--remote-header-name",
+            "--compressed",
+        ] {
+            assert!(translated.iter().any(|arg| arg == expected), "{expected}");
+        }
+    }
+
+    #[test]
+    fn separated_value_translation_paths_reach_curl() {
+        let (code, translated) = invoke(&[
+            "-O",
+            "-",
+            "-O",
+            "download.bin",
+            "-P",
+            "downloads",
+            "--header",
+            "X-Test: yes",
+            "-e",
+            "https://referrer.invalid/",
+            "-U",
+            "YourShell-Test",
+            "--connect-timeout",
+            "1",
+            "--max-redirect",
+            "2",
+            "--load-cookies",
+            "cookies-in.txt",
+            "--save-cookies",
+            "cookies-out.txt",
+            "--user",
+            "alice",
+            "--password",
+            "secret",
+            "--proxy-user",
+            "proxy",
+            "--proxy-password",
+            "secret",
+            "--method",
+            "GET",
+            "--body-data",
+            "value",
+            "-T",
+            "1",
+            "--waitretry",
+            "0",
+            "-t",
+            "invalid",
+            "file:///definitely/missing/wget-test",
+        ]);
+        assert_eq!(code, 99);
+        assert!(translated
+            .windows(2)
+            .any(|v| v == ["--user", "alice:secret"]));
+        assert!(translated
+            .windows(2)
+            .any(|v| v == ["--proxy-user", "proxy:secret"]));
+        assert!(!translated.iter().any(|arg| arg == "--remote-name"));
+    }
+
+    #[test]
+    fn equals_value_and_body_translation_paths_reach_curl() {
+        let (code, translated) = invoke(&[
+            "--output-document=-",
+            "--output-document=download.bin",
+            "--directory-prefix=downloads",
+            "--timeout=1",
+            "--connect-timeout=1",
+            "--max-redirect=2",
+            "--header=X-Test: yes",
+            "--referer=https://referrer.invalid/",
+            "--user-agent=YourShell-Test",
+            "--load-cookies=cookies-in.txt",
+            "--save-cookies=cookies-out.txt",
+            "--method=POST",
+            "--body-data=value",
+            "--body-file=body.txt",
+            "--post-file=post.txt",
+            "--user=alice",
+            "--password=secret",
+            "--proxy-user=proxy",
+            "--proxy-password=secret",
+            "--waitretry=0",
+            "file:///definitely/missing/wget-test",
+        ]);
+        assert_eq!(code, 99);
+        assert!(translated.windows(2).any(|v| v == ["--request", "POST"]));
+        assert!(translated
+            .windows(2)
+            .any(|v| v == ["--data-binary", "@post.txt"]));
+    }
+
+    #[test]
+    fn spider_and_post_data_paths_reach_curl() {
+        assert_eq!(
+            invoke(&[
+                "--spider",
+                "--post-data",
+                "value",
+                "file:///definitely/missing/wget-test"
+            ])
+            .0,
+            99
+        );
+        assert_eq!(
+            invoke(&[
+                "--body-file",
+                "missing-body",
+                "file:///definitely/missing/wget-test"
+            ])
+            .0,
+            99
+        );
+        assert_eq!(
+            invoke(&[
+                "--post-file",
+                "missing-post",
+                "file:///definitely/missing/wget-test"
+            ])
+            .0,
+            99
+        );
     }
 }
