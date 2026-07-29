@@ -83,3 +83,56 @@ impl Drop for FdFlagsGuard {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    #[test]
+    fn raw_fd_write_and_error_paths() {
+        let (mut reader, writer) = std::io::pipe().unwrap();
+        write_all_fd(writer.as_raw_fd(), b"complete-write").unwrap();
+        drop(writer);
+        let mut value = String::new();
+        reader.read_to_string(&mut value).unwrap();
+        assert_eq!(value, "complete-write");
+
+        let error = write_all_fd(-1, b"x").unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+        // Best-effort error printing must contain the same invalid-fd path.
+        eprint_fd(-1, "ignored");
+    }
+
+    #[test]
+    fn fd_flags_guard_restores_original_status_flags() {
+        let (reader, writer) = std::io::pipe().unwrap();
+        let fd = reader.as_raw_fd();
+        let original = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        {
+            let _guard = FdFlagsGuard::capture(&[fd, -1]);
+            let changed = original | libc::O_NONBLOCK;
+            assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFL, changed) }, 0);
+            assert_ne!(
+                unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_NONBLOCK,
+                0
+            );
+        }
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFL) }, original);
+        drop(writer);
+        drop(reader);
+    }
+
+    #[test]
+    fn guard_tolerates_fd_closed_before_drop() {
+        let (reader, writer) = std::io::pipe().unwrap();
+        let raw = reader.as_raw_fd();
+        let guard = FdFlagsGuard::capture(&[raw]);
+        let raw = std::os::fd::IntoRawFd::into_raw_fd(reader);
+        // SAFETY: raw was just detached from `reader`; this closes it once.
+        drop(unsafe { std::fs::File::from_raw_fd(raw) });
+        drop(guard);
+        drop(writer);
+    }
+}

@@ -300,6 +300,22 @@ pub static CASES: &[Case] = &[
     case!("which-builtin", "which cd", Has("builtin")),
     case!("which-cmd", "which grep 2>&1 | head -1", Has("grep")),
     case!(
+        "which-missing",
+        "which definitely_missing_command 2>&1; echo rc=$?",
+        Has("not found"),
+        Has("rc=1")
+    ),
+    case!(
+        "which-silent",
+        "which -s cd; echo found=$?; which -s definitely_missing; echo missing=$?",
+        Eq("found=0\nmissing=1")
+    ),
+    case!(
+        "which-all-path",
+        "mkdir -p wp1 wp2; touch wp1/tool wp2/tool; PATH=\"$PWD/wp1:$PWD/wp2\" which -a --skip-functions tool | wc -l",
+        Eq("2")
+    ),
+    case!(
         "interactive-adapter-aliases",
         "type edit vi nano ssh scp sftp mosh open openurl pbcopy pbpaste >/dev/null; echo aliases=$?",
         Eq("aliases=0")
@@ -380,6 +396,26 @@ pub static CASES: &[Case] = &[
         Has("2")
     ),
     case!("tree-basic", "mkdir -p tr/a tr/b; touch tr/a/f.txt; tree tr", Has("a"), Has("f.txt"), Has("directories")),
+    case!(
+        "tree-options",
+        "rm -rf tro; mkdir -p tro/keep/deep tro/drop; touch tro/.hidden tro/keep/a.rs tro/keep/b.txt tro/drop/c.rs; tree -a -f -i -L 2 -P '*.rs' -I drop tro",
+        Has("tro/keep"),
+        Has("tro/keep/a.rs"),
+        Not("b.txt"),
+        Not("drop/c.rs")
+    ),
+    case!(
+        "tree-directories-only",
+        "tree -d tro",
+        Has("keep"),
+        Has("deep"),
+        Not("a.rs")
+    ),
+    case!(
+        "tree-missing-root",
+        "tree definitely-missing-tree-root",
+        Has("0 directories, 0 files")
+    ),
     // --- diff / cmp (uutils/diffutils) -----------------------------------
     // The old 1-flag hand-written diff emitted unified output by DEFAULT, and
     // this test was written to match it. Real diff defaults to normal format
@@ -465,10 +501,25 @@ pub static CASES: &[Case] = &[
     case!("tar-exclude-strip", "mkdir -p te/root; echo yes > te/root/a; echo no > te/root/b; tar -cf te.tar --exclude='*/b' te/root; mkdir tout; tar -xf te.tar -C tout --strip-components 2; cat tout/a; test ! -e tout/b", Eq("yes")),
     case!("tar-repeat-after-error", "tar --definitely-invalid >/dev/null 2>&1 || :; rm -rf tr tr.tar; mkdir tr; echo again > tr/f; tar -cf tr.tar tr; tar -tf tr.tar | grep -c tr/f", Eq("1")),
     case!("zip-unzip-roundtrip", "mkdir -p zt; echo zipped > zt/z.txt; zip -r z.zip zt > /dev/null; rm -rf zt; unzip z.zip > /dev/null; cat zt/z.txt", Eq("zipped")),
+    case!(
+        "zip-verbose-add",
+        "echo verbose > zv.txt; zip zv.zip zv.txt",
+        Has("adding: zv.txt")
+    ),
     case!("unzip-list", "echo hi > u.txt; zip u.zip u.txt > /dev/null; unzip -l u.zip | grep -c u.txt", Has("1")),
     case!("zip-junk-exclude", "rm -rf zj; mkdir -p zj/a zj/b; echo a > zj/a/a.txt; echo b > zj/b/b.tmp; zip -q -r -j -x '*.tmp' zj.zip zj; unzip -p zj.zip a.txt", Eq("a")),
     case!("zip-update", "echo old > zu.txt; zip -q zu.zip zu.txt; echo new > zu.txt; zip -q -u zu.zip zu.txt; unzip -p zu.zip zu.txt", Eq("new")),
+    case!(
+        "zip-update-verbose-carried",
+        "echo one > zuc1; echo two > zuc2; zip -q zuc.zip zuc1 zuc2; echo changed > zuc1; zip -u zuc.zip zuc1; unzip -p zuc.zip zuc2",
+        Eq("  adding: zuc1\ntwo")
+    ),
     case!("zip-delete", "echo keep > zd1; echo drop > zd2; zip -q zd.zip zd1 zd2; zip -q -d zd.zip zd2; unzip -l zd.zip | grep -c zd2", Eq("0")),
+    case!(
+        "zip-delete-verbose",
+        "echo remove > zdv; zip -q zdv.zip zdv; zip -d zdv.zip zdv",
+        Has("deleting: zdv")
+    ),
     case!("zip-store", "echo stored > zs.txt; zip -q -0 zs.zip zs.txt; unzip -p zs.zip zs.txt", Eq("stored")),
     case!("zip-names-stdin", "echo stdin > zi.txt; printf 'zi.txt\n' | zip -q zi.zip -@; unzip -p zi.zip zi.txt", Eq("stdin")),
     case!("sqlite-memory", "sqlite3 :memory: 'create table t(a,b); insert into t values(1,2),(3,4); select sum(a),sum(b) from t'", Eq("4|6")),
