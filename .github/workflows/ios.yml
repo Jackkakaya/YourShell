@@ -1,0 +1,67 @@
+name: iOS build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "app/**"
+      - "core/**"
+      - "vendor/python-ios-lib/**"
+      - "vendor/nodejs-mobile/**"
+      - ".github/workflows/ios.yml"
+  pull_request:
+    paths:
+      - "app/**"
+      - "core/**"
+      - "vendor/python-ios-lib/**"
+      - "vendor/nodejs-mobile/**"
+      - ".github/workflows/ios.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  simulator:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Checkout with runtime assets
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          lfs: true
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios-sim
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+          key: ios-simulator
+
+      - name: Generate project
+        run: xcodegen generate --spec app/project.yml --project app
+
+      - name: Build simulator app
+        run: |
+          xcodebuild \
+            -project app/AShellRS.xcodeproj \
+            -scheme AShellRS \
+            -configuration Debug \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            -disablePackageRepositoryCache \
+            -scmProvider system \
+            build \
+            CODE_SIGNING_ALLOWED=NO

@@ -1,11 +1,11 @@
 //! (nextvi C build disabled — its process-global state made repeated `vi`
-//! invocations crash in our long-lived process. `vi` uses the stable Rust
-//! modal editor instead. Kept for a future thread-localized integration.)
+//!   invocations crash in our long-lived process. `vi` uses the stable Rust
+//!   modal editor instead. Kept for a future thread-localized integration.)
 //!
 //! one-true-awk (Kernighan's awk) IS compiled in, like SQLite/libgit2: the
 //! vendored C is built into a static lib via `cc` and driven in-process by
 //! `awk_adapter.rs`. The grammar/proctab were pre-generated on the host (bison
-//! + maketab) and checked into vendor/awk, so no yacc/bison is needed here and
+//! and maketab) and checked into vendor/awk, so no yacc/bison is needed here and
 //! iOS cross-compiles cleanly.
 
 use std::path::Path;
