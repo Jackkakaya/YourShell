@@ -1,0 +1,57 @@
+Metadata-Version: 2.4
+Name: lxml
+Version: 6.1.1
+Summary: Powerful and Pythonic XML processing library combining libxml2/libxslt with the ElementTree API.
+Home-page: https://lxml.de/
+Author: lxml dev team
+Author-email: lxml@lxml.de
+Maintainer: lxml dev team
+Maintainer-email: lxml@lxml.de
+License: BSD-3-Clause
+Project-URL: Source, https://github.com/lxml/lxml
+Project-URL: Bug Tracker, https://bugs.launchpad.net/lxml
+Classifier: Development Status :: 5 - Production/Stable
+Classifier: Intended Audience :: Developers
+Classifier: Intended Audience :: Information Technology
+Classifier: Programming Language :: Cython
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.8
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Programming Language :: Python :: 3.12
+Classifier: Programming Language :: Python :: 3.13
+Classifier: Programming Language :: Python :: 3.14
+Classifier: Programming Language :: C
+Classifier: Operating System :: OS Independent
+Classifier: Topic :: Text Processing :: Markup :: HTML
+Classifier: Topic :: Text Processing :: Markup :: XML
+Classifier: Topic :: Software Development :: Libraries :: Python Modules
+Requires-Python: >=3.8
+License-File: LICENSE.txt
+License-File: LICENSES.txt
+Provides-Extra: source
+Provides-Extra: cssselect
+Requires-Dist: cssselect>=0.7; extra == "cssselect"
+Provides-Extra: html5
+Requires-Dist: html5lib; extra == "html5"
+Provides-Extra: htmlsoup
+Requires-Dist: BeautifulSoup4; extra == "htmlsoup"
+Provides-Extra: html-clean
+Requires-Dist: lxml_html_clean; extra == "html-clean"
+Dynamic: author
+Dynamic: author-email
+Dynamic: classifier
+Dynamic: description
+Dynamic: home-page
+Dynamic: license
+Dynamic: license-file
+Dynamic: maintainer
+Dynamic: maintainer-email
+Dynamic: project-url
+Dynamic: provides-extra
+Dynamic: requires-python
+Dynamic: summary
+Requires-Dist: flet-libxslt (==1.1.45)
+Requires-Dist: flet-libxml2 (==2.15.3)
+

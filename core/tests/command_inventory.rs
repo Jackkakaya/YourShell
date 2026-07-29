@@ -14,13 +14,15 @@ async fn run(shell: &mut brush_core::Shell, script: &str) -> (i32, String) {
     shell.open_files_mut().set_fd(1.into(), output.clone());
     shell.open_files_mut().set_fd(2.into(), output);
     let params = shell.default_exec_params();
-    let result = shell
-        .run_string(
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        shell.run_string(
             script.to_string(),
             &brush_core::SourceInfo::from("command-inventory"),
             &params,
-        )
-        .await;
+        ),
+    )
+    .await;
     shell
         .open_files_mut()
         .set_fd(1.into(), brush_core::openfiles::null().unwrap());
@@ -30,7 +32,9 @@ async fn run(shell: &mut brush_core::Shell, script: &str) -> (i32, String) {
     let mut bytes = Vec::new();
     reader.read_to_end(&mut bytes).unwrap();
     (
-        result.map_or(127, |r| i32::from(u8::from(r.exit_code))),
+        result.map_or(-1, |result| {
+            result.map_or(127, |r| i32::from(u8::from(r.exit_code)))
+        }),
         String::from_utf8_lossy(&bytes).into_owned(),
     )
 }
@@ -65,13 +69,34 @@ fn main() {
             // and help path. This catches argv[0] dispatch mistakes and stale
             // registry entries without performing a destructive operation.
             if command.source == CommandSource::UutilsCoreutils {
-                let (code, output) =
-                    run(&mut shell, &format!("{} --help >/dev/null", command.name)).await;
+                let (code, output) = run(&mut shell, &format!("{} --help", command.name)).await;
                 assert_eq!(
                     code, 0,
                     "{} rejected its upstream --help path: {output}",
                     command.name
                 );
+                assert!(
+                    !output.trim().is_empty(),
+                    "{} accepted --help but emitted no help text",
+                    command.name
+                );
+            } else if command.source != CommandSource::BrushBuiltin {
+                println!("checking help contract: {}", command.name);
+                // Adapters, runtimes and hosts do not all use the same help
+                // exit code (OpenSSH deliberately returns non-zero), but a
+                // help request must never be silently swallowed. Try the GNU
+                // spelling first, then the common short spelling.
+                let (_, long_output) =
+                    run(&mut shell, &format!("{} --help </dev/null", command.name)).await;
+                if long_output.trim().is_empty() {
+                    let (_, short_output) =
+                        run(&mut shell, &format!("{} -h </dev/null", command.name)).await;
+                    assert!(
+                        !short_output.trim().is_empty(),
+                        "{} emitted no text for either --help or -h",
+                        command.name
+                    );
+                }
             }
         }
         println!(

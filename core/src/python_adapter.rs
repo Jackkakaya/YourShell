@@ -99,6 +99,29 @@ fn inject_pip_target(argv: &mut Vec<String>) {
     if !has_iso {
         argv.push("--no-build-isolation".into());
     }
+
+    // Mobile links commonly pause during Wi-Fi/cellular handoff. pip's short
+    // desktop-oriented read timeout makes a healthy but slow link look like a
+    // package incompatibility. Supply conservative defaults while preserving
+    // every explicit user choice.
+    let has_timeout = argv
+        .iter()
+        .any(|a| a == "--timeout" || a.starts_with("--timeout="));
+    if !has_timeout {
+        argv.extend(["--timeout".into(), "60".into()]);
+    }
+    let has_retries = argv
+        .iter()
+        .any(|a| a == "--retries" || a.starts_with("--retries="));
+    if !has_retries {
+        argv.extend(["--retries".into(), "5".into()]);
+    }
+    let has_resume_retries = argv
+        .iter()
+        .any(|a| a == "--resume-retries" || a.starts_with("--resume-retries="));
+    if !has_resume_retries {
+        argv.extend(["--resume-retries".into(), "5".into()]);
+    }
 }
 
 fn content(

@@ -15,6 +15,7 @@ let package = Package(
         .library(name: "SciPy", targets: ["SciPy", "NumPy"]),
         .library(name: "Pandas", targets: ["Pandas", "NumPy", "Dateutil"]),
         .library(name: "Pillow", targets: ["Pillow"]),
+        .library(name: "Lxml", targets: ["Lxml"]),
         .library(
             name: "Matplotlib",
             targets: ["Matplotlib", "Plotly", "Dateutil", "FontTools"]
@@ -56,6 +57,16 @@ let package = Package(
             resources: [
                 .copy("PIL"),
                 .copy("pillow-11.0.0.dist-info"),
+            ]
+        ),
+        .target(
+            name: "Lxml",
+            path: "Sources/Lxml",
+            resources: [
+                .copy("lxml"),
+                .copy("lxml-6.1.1.dist-info"),
+                .copy("flet_libxml2-2.15.3.dist-info"),
+                .copy("flet_libxslt-1.1.45.dist-info"),
             ]
         ),
         .target(

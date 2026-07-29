@@ -229,7 +229,7 @@ fn wget_main_with(ctx: &command_host::CmdCtx<'_>, run_curl: impl FnOnce(&[String
                 };
                 curl.extend(["--data".to_string(), value]);
             }
-            "--help" => {
+            "-h" | "--help" => {
                 println!(
                     "Usage: wget [OPTION]... URL...\n\
                      HTTP/TLS transfers use embedded curl 8.1.2.\n\
@@ -420,6 +420,7 @@ mod tests {
 
     #[test]
     fn immediate_and_error_actions() {
+        assert_eq!(invoke(&["-h"]).0, 0);
         assert_eq!(invoke(&["--help"]).0, 0);
         assert_eq!(invoke(&["--version"]).0, 0);
         assert_eq!(invoke(&[]).0, 2);

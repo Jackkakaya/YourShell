@@ -53,6 +53,8 @@ if [[ ! -d "$APP" ]]; then
     exit 2
 fi
 
+"$ROOT/app/Scripts/verify-ios-app.sh" "$APP" iphonesimulator
+
 xcrun simctl terminate "$UDID" "$BUNDLE_ID" 2>/dev/null || true
 xcrun simctl install "$UDID" "$APP"
 

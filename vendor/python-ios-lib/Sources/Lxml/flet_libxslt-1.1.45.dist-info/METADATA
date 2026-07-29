@@ -1,0 +1,7 @@
+Metadata-Version: 1.2
+Name: flet-libxslt
+Version: 1.1.45
+Summary: 
+Download-URL: 
+Requires-Dist: flet-libxml2 (==2.15.3)
+

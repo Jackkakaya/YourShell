@@ -488,6 +488,8 @@ pub static CASES: &[Case] = &[
     case!("curl-output", "curl -s -o curl-copy.txt \"file://$PWD/curl-local.txt\"; cat curl-copy.txt", Eq("upstream-curl")),
     case!("curl-repeat", "curl -s \"file://$PWD/curl-local.txt\"; echo; curl -s \"file://$PWD/curl-local.txt\"", Eq("upstream-curl\nupstream-curl")),
     case!("wget-version", "wget --version", Has("curl 8.1.2")),
+    case!("wget-help-short", "wget -h", Has("Usage: wget"), Exit(0)),
+    case!("wget-help-long", "wget --help", Has("Usage: wget"), Exit(0)),
     case!("wget-default-output", "mkdir wget-src; printf upstream-wget > wget-src/payload.txt; wget -q \"file://$PWD/wget-src/payload.txt\"; cat payload.txt", Eq("upstream-wget")),
     case!("wget-stdout", "wget -q -O - \"file://$PWD/wget-src/payload.txt\"", Eq("upstream-wget")),
     case!("wget-directory-prefix", "wget -q -P downloads \"file://$PWD/wget-src/payload.txt\"; cat downloads/payload.txt", Eq("upstream-wget")),
@@ -788,25 +790,46 @@ async fn run_selftest_async(workdir: &std::path::Path) -> String {
 
     let mut report = String::new();
     let mut passed = 0usize;
+    let skip_network = std::env::var_os("YS_SELFTEST_SKIP_NETWORK").is_some();
 
-    run_case_group(&mut shell, CASES, &mut passed, &mut report, &flush).await;
+    let mut total = run_case_group(
+        &mut shell,
+        CASES,
+        skip_network,
+        &mut passed,
+        &mut report,
+        &flush,
+    )
+    .await;
 
     // Only the in-process builtin counts — on dev hosts a system python3
     // found via PATH would otherwise hijack these cases.
-    let mut total = CASES.len();
-
     let (_c, py_probe_out) = run_case(&mut shell, "type python3 2>/dev/null").await;
     if py_probe_out.contains("builtin") {
-        run_case_group(&mut shell, PY_CASES, &mut passed, &mut report, &flush).await;
-        total += PY_CASES.len();
+        total += run_case_group(
+            &mut shell,
+            PY_CASES,
+            skip_network,
+            &mut passed,
+            &mut report,
+            &flush,
+        )
+        .await;
     } else {
         report.push_str("NOTE python3 not built in; python cases skipped\n");
     }
 
     let (_c, node_probe_out) = run_case(&mut shell, "type node 2>/dev/null").await;
     if node_probe_out.contains("builtin") {
-        run_case_group(&mut shell, NODE_CASES, &mut passed, &mut report, &flush).await;
-        total += NODE_CASES.len();
+        total += run_case_group(
+            &mut shell,
+            NODE_CASES,
+            skip_network,
+            &mut passed,
+            &mut report,
+            &flush,
+        )
+        .await;
     } else {
         report.push_str("NOTE node not built in; node cases skipped\n");
     }
@@ -821,11 +844,19 @@ async fn run_selftest_async(workdir: &std::path::Path) -> String {
 async fn run_case_group(
     shell: &mut brush_core::Shell,
     cases: &[Case],
+    skip_network: bool,
     passed: &mut usize,
     report: &mut String,
     flush: &impl Fn(&str),
-) {
+) -> usize {
+    let mut executed = 0;
     for case in cases {
+        if skip_network && is_network_case(case.name) {
+            report.push_str(&format!("NOTE {} skipped by offline battery\n", case.name));
+            flush(report);
+            continue;
+        }
+        executed += 1;
         let (exit_code, output) = run_case(shell, case.script).await;
         let trimmed = output.trim_end();
         let mut failures: Vec<String> = Vec::new();
@@ -861,6 +892,24 @@ async fn run_case_group(
         }
         flush(report);
     }
+    executed
+}
+
+fn is_network_case(name: &str) -> bool {
+    matches!(
+        name,
+        "py-pip-install"
+            | "py-pip-rich"
+            | "py-pip-fpdf2-pillow"
+            | "py-pdf-generate"
+            | "py-pdf-readback"
+            | "py-requests-https"
+            | "py-hot-search"
+            | "py-data-analysis"
+            | "py-pptx-real"
+            | "npm-install-require"
+            | "npm-install-tree"
+    )
 }
 
 async fn run_case(shell: &mut brush_core::Shell, script: &str) -> (i32, String) {

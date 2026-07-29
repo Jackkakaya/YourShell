@@ -212,6 +212,12 @@ class PythonIOSLibRuntimeTests(unittest.TestCase):
                     f"{distribution}: module has no source path",
                 )
 
+    def test_10_lxml_signed_native_extension(self) -> None:
+        from lxml import etree
+
+        root = etree.fromstring(b"<root><value>42</value></root>")
+        self.assertEqual(root.findtext("value"), "42")
+
 
 def main() -> int:
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(

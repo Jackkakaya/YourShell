@@ -65,3 +65,8 @@ jobs:
             -scmProvider system \
             build \
             CODE_SIGNING_ALLOWED=NO
+
+      - name: Verify packaged runtimes
+        run: |
+          app="$RUNNER_TEMP/DerivedData/Build/Products/Debug-iphonesimulator/AShellRS.app"
+          app/Scripts/verify-ios-app.sh "$app" iphonesimulator

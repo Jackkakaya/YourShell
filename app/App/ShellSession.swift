@@ -40,6 +40,12 @@ final class ShellSession: ObservableObject {
         // Resources/PythonResources/python.
         if let res = Bundle.main.resourcePath {
             setenv("YOURSHELL_PYTHON_HOME", res + "/PythonResources/python", 1)
+            let caBundle = res + "/PythonResources/cacert.pem"
+            if FileManager.default.fileExists(atPath: caBundle) {
+                setenv("SSL_CERT_FILE", caBundle, 1)
+                setenv("REQUESTS_CA_BUNDLE", caBundle, 1)
+                setenv("CURL_CA_BUNDLE", caBundle, 1)
+            }
         }
         // Writable standard user-site for pip. Keeping PYTHONUSERBASE and the
         // path injected by the Python host aligned lets bare `pip install`
@@ -52,6 +58,14 @@ final class ShellSession: ObservableObject {
             atPath: pySite, withIntermediateDirectories: true)
         setenv("PYTHONUSERBASE", pyUserBase, 1)
         setenv("YOURSHELL_PY_SITE", pySite, 1)
+        let pipCache = library.appendingPathComponent("pip-cache").path
+        try? FileManager.default.createDirectory(
+            atPath: pipCache, withIntermediateDirectories: true)
+        setenv("PIP_CACHE_DIR", pipCache, 1)
+        let matplotlibConfig = library.appendingPathComponent("matplotlib").path
+        try? FileManager.default.createDirectory(
+            atPath: matplotlibConfig, withIntermediateDirectories: true)
+        setenv("MPLCONFIGDIR", matplotlibConfig, 1)
         // Releases before the standard user-site migration installed here.
         // Keep it readable so existing packages satisfy pip dependencies.
         setenv("YOURSHELL_PY_LEGACY_SITE",
@@ -189,6 +203,20 @@ final class ShellSession: ObservableObject {
         setenv("npm_config_fund", "false", 1)
         setenv("npm_config_audit", "false", 1)
         setenv("npm_config_update_notifier", "false", 1)
+        // Tolerate slow mobile links and transient Wi-Fi/cellular handoffs.
+        // npm still lets command flags or exported config override these.
+        if getenv("npm_config_fetch_retries") == nil {
+            setenv("npm_config_fetch_retries", "5", 1)
+        }
+        if getenv("npm_config_fetch_retry_mintimeout") == nil {
+            setenv("npm_config_fetch_retry_mintimeout", "1000", 1)
+        }
+        if getenv("npm_config_fetch_retry_maxtimeout") == nil {
+            setenv("npm_config_fetch_retry_maxtimeout", "60000", 1)
+        }
+        if getenv("npm_config_fetch_timeout") == nil {
+            setenv("npm_config_fetch_timeout", "300000", 1)
+        }
         // npm install is network-latency bound (dependency-tree resolution =
         // one registry round-trip per package; ~86% of install time). The
         // default registry.npmjs.org is far/slow here; a mirror cuts installs
