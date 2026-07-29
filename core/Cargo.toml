@@ -112,3 +112,7 @@ harness = false
 [[test]]
 name = "command_inventory"
 harness = false
+
+[[test]]
+name = "ssh_local"
+harness = false
