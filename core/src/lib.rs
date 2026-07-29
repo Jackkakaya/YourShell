@@ -130,6 +130,83 @@ pub struct Session {
     shell_handle: Option<JoinHandle<()>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommandSource {
+    BrushBuiltin,
+    UutilsCoreutils,
+    Adapter,
+    Runtime,
+    Host,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandInfo {
+    pub name: String,
+    pub source: CommandSource,
+}
+
+/// Authoritative inventory used by coverage tests and documentation. Keeping
+/// this derived from the same upstream registries as `build_shell` makes a new
+/// Brush/uutils command fail the test-matrix gate until it has a contract test.
+pub fn command_inventory() -> Vec<CommandInfo> {
+    let mut commands = Vec::new();
+    let mut brush =
+        brush_builtins::default_builtins::<DefaultShellExtensions>(BuiltinSet::BashMode);
+    for unsupported in ["disown", "logout", "exec", "suspend"] {
+        brush.remove(unsupported);
+    }
+    commands.extend(brush.keys().map(|name| CommandInfo {
+        name: name.clone(),
+        source: CommandSource::BrushBuiltin,
+    }));
+    commands.extend(
+        uutils_adapter::command_names()
+            .into_iter()
+            .map(|name| CommandInfo {
+                name,
+                source: CommandSource::UutilsCoreutils,
+            }),
+    );
+    for name in [
+        "grep", "egrep", "fgrep", "stat", "rg", "clear", "which", "find", "xargs", "tree", "diff",
+        "cmp", "gzip", "gunzip", "sed", "curl", "wget", "tar", "zip", "unzip", "sqlite3", "jq",
+        "git", "awk", "ssh", "scp", "sftp", "mosh", "edit", "vi", "nano",
+    ] {
+        commands.push(CommandInfo {
+            name: name.to_string(),
+            source: CommandSource::Adapter,
+        });
+    }
+    for name in ["pbcopy", "pbpaste", "open", "openurl"] {
+        commands.push(CommandInfo {
+            name: name.to_string(),
+            source: CommandSource::Host,
+        });
+    }
+    #[cfg(feature = "python")]
+    for name in ["python3", "python", "pip", "pip3"] {
+        commands.push(CommandInfo {
+            name: name.to_string(),
+            source: CommandSource::Runtime,
+        });
+    }
+    #[cfg(feature = "vision")]
+    commands.push(CommandInfo {
+        name: "ocr".to_string(),
+        source: CommandSource::Host,
+    });
+    #[cfg(feature = "node")]
+    for name in ["node", "npm", "npx"] {
+        commands.push(CommandInfo {
+            name: name.to_string(),
+            source: CommandSource::Runtime,
+        });
+    }
+    commands.sort_by(|a, b| a.name.cmp(&b.name));
+    commands.dedup_by(|a, b| a.name == b.name);
+    commands
+}
+
 /// Builds a Shell configured identically for FFI sessions and the selftest
 /// battery: bash-mode default builtins, the full uutils coreutils set (via
 /// the fd-redirecting adapter), and library-backed commands.

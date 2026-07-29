@@ -86,6 +86,7 @@ pub static CASES: &[Case] = &[
     // assignments (bash: di=5+2 -> 7, brush -> 0); verified against the brush
     // CLI itself, so we only assert plain integer declaration here.
     case!("declare-int", "declare -i di=12; echo $di", Eq("12")),
+    case!("typeset", "typeset TS=typed; echo $TS", Eq("typed")),
     case!("eval", "eval 'echo evaled'", Eq("evaled")),
     case!("source", "echo 'SRCV=99' > src.sh; source src.sh; echo $SRCV", Eq("99")),
     case!("dot-source", "echo 'DOTV=55' > dot.sh; . ./dot.sh; echo $DOTV", Eq("55")),
@@ -298,6 +299,11 @@ pub static CASES: &[Case] = &[
     // ---- ext commands (crate-backed) ----
     case!("which-builtin", "which cd", Has("builtin")),
     case!("which-cmd", "which grep 2>&1 | head -1", Has("grep")),
+    case!(
+        "interactive-adapter-aliases",
+        "type edit vi nano ssh scp sftp mosh open openurl pbcopy pbpaste >/dev/null; echo aliases=$?",
+        Eq("aliases=0")
+    ),
     case!("stat-format", "printf x > st.txt; stat -c '%n %s' st.txt", Eq("st.txt 1")),
     // --- find / xargs (uutils/findutils, real GNU syntax) ----------------
     // NOTE: these used to be written as `find ft --name '*.txt'` — a
@@ -515,6 +521,12 @@ pub static CASES: &[Case] = &[
     case!("factor", "factor 12", Has("2 2 3")),
     case!("sha256sum", "printf hi | sha256sum", Has("8f434346648f6b96")),
     case!("base64-cmd", "printf hi | base64", Eq("aGk=")),
+    case!("basenc-base16", "printf hi | basenc --base16", Eq("6869")),
+    case!("b2sum", "printf hi | b2sum | cut -c1-8", Eq("bfbcbe7a")),
+    case!("cksum", "printf hi | cksum | cut -d' ' -f2", Eq("2")),
+    case!("sha224sum", "printf hi | sha224sum | cut -c1-8", Eq("1a15bca3")),
+    case!("sha384sum", "printf hi | sha384sum | cut -c1-8", Eq("0791006d")),
+    case!("sha512sum", "printf hi | sha512sum | cut -c1-8", Eq("150a14ed")),
     case!("nl", "printf 'x\\ny\\n' | nl", Has("1"), Has("x")),
     case!("paste", "printf 'a\\nb\\n' > p1.txt; printf '1\\n2\\n' > p2.txt; paste -d: p1.txt p2.txt", Eq("a:1\nb:2")),
     case!("tee", "echo teed | tee tee.txt; cat tee.txt", Eq("teed\nteed")),
@@ -526,11 +538,22 @@ pub static CASES: &[Case] = &[
     case!("truncate", "truncate -s 5 trc.txt; wc -c trc.txt", Has("5")),
     case!("mktemp-cmd", "t=$(mktemp tmp.XXXXXX); [ -f \"$t\" ] && echo mktemp-ok; rm -f \"$t\"", Eq("mktemp-ok")),
     case!("du", "du -s . > /dev/null; echo du-rc=$?", Eq("du-rc=0")),
+    case!("df", "df .", Has("/")),
+    case!("dir", "dir poem.txt", Has("poem.txt")),
+    case!("vdir", "vdir poem.txt", Has("poem.txt")),
+    case!("dircolors", "dircolors -b", Has("LS_COLORS")),
+    case!("env", "env UUTEST=works", Has("UUTEST=works")),
     case!("whoami-nproc-hostname", "whoami > /dev/null && nproc > /dev/null && hostname > /dev/null; echo id-rc=$?", Eq("id-rc=0")),
     case!("sleep-cmd", "sleep 0; echo slept=$?", Eq("slept=0")),
     case!("od", "printf 'A' | od -An -c", Has("A")),
     case!("fold", "echo abcdef | fold -w 3", Eq("abc\ndef")),
+    case!("fmt", "printf 'one two three four\\n' | fmt -w 8", Eq("one two\nthree\nfour")),
+    case!("pr", "printf 'line\\n' | pr -t", Eq("line")),
+    case!("ptx", "printf 'alpha beta\\n' | ptx -f", Has("alpha")),
     case!("split-cmd", "printf '1\\n2\\n3\\n4\\n' > sp.txt; split -l 2 sp.txt spx_; cat spx_aa", Eq("1\n2")),
+    case!("csplit", "printf 'a\\nMARK\\nb\\n' > cs.txt; csplit -s cs.txt /MARK/; cat xx01", Eq("MARK\nb")),
+    case!("sum", "printf hi | sum | wc -w", Eq("2")),
+    case!("shred", "printf secret > shred.txt; shred -n 1 -z shred.txt; wc -c shred.txt", Has("6")),
     case!("tsort", "printf 'a b\\nb c\\n' | tsort", Eq("a\nb\nc")),
     case!("expand-roundtrip", "printf '\\tx\\n' | expand | unexpand | wc -l", Eq("1")),
     // ---- grep (ripgrep engine) extended ----
@@ -1075,7 +1098,7 @@ const FLAG_REFERENCE: &[(&str, &[&str])] = &[
             "-q",
             "-c",
             "-P",
-            "-n",
+            "-nc",
             "-4",
             "-6",
             "-U",
@@ -1173,4 +1196,49 @@ async fn run_flag_coverage_async(workdir: &std::path::Path) -> String {
         }
     }
     report
+}
+
+#[cfg(test)]
+mod command_matrix_tests {
+    use super::*;
+
+    fn contains_token(text: &str, token: &str) -> bool {
+        text.match_indices(token).any(|(start, _)| {
+            let before = text[..start].chars().next_back();
+            let end = start + token.len();
+            let after = text[end..].chars().next();
+            let boundary = |c: Option<char>| {
+                c.is_none_or(|c| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-')))
+            };
+            boundary(before) && boundary(after)
+        })
+    }
+
+    #[test]
+    fn every_registered_command_is_named_by_a_functional_case() {
+        let mut all_cases: Vec<&Case> = CASES.iter().collect();
+        all_cases.extend(PY_CASES);
+        all_cases.extend(NODE_CASES);
+        let missing: Vec<String> = crate::command_inventory()
+            .into_iter()
+            .filter(|command| {
+                !all_cases.iter().any(|case| {
+                    contains_token(case.script, &command.name)
+                        || contains_token(case.name, &command.name)
+                })
+            })
+            .map(|command| command.name)
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "registered commands without a functional test case: {}",
+            missing.join(", ")
+        );
+    }
+
+    #[test]
+    fn command_inventory_is_unique_and_sorted() {
+        let inventory = crate::command_inventory();
+        assert!(inventory.windows(2).all(|pair| pair[0].name < pair[1].name));
+    }
 }

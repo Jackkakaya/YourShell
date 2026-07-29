@@ -104,3 +104,11 @@ harness = false
 [[test]]
 name = "git_compat"
 harness = false
+
+[[test]]
+name = "ios_host"
+harness = false
+
+[[test]]
+name = "command_inventory"
+harness = false
