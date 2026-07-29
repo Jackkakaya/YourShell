@@ -836,6 +836,30 @@ mod tests {
     }
 
     #[test]
+    fn scp_identity_and_parse_errors_are_reported() {
+        let o = parse_scp(&[
+            "scp".into(),
+            "-i".into(),
+            "/keys/id".into(),
+            "local".into(),
+            "host:/remote".into(),
+        ])
+        .unwrap();
+        assert_eq!(o.identity.as_deref(), Some(Path::new("/keys/id")));
+
+        for argv in [
+            vec!["scp".into()],
+            vec!["scp".into(), "-P".into()],
+            vec!["scp".into(), "-P".into(), "bad".into()],
+            vec!["scp".into(), "-i".into()],
+            vec!["scp".into(), "-z".into(), "a".into(), "host:b".into()],
+            vec!["scp".into(), "a".into(), "b".into(), "c".into()],
+        ] {
+            assert!(parse_scp(&argv).is_err(), "{argv:?}");
+        }
+    }
+
+    #[test]
     fn join_remote_paths() {
         assert_eq!(join_remote("/home/me", "f"), "/home/me/f");
         assert_eq!(join_remote("/home/me", "/etc/x"), "/etc/x");

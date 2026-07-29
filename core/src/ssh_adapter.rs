@@ -667,4 +667,42 @@ mod tests {
         let env = env_of(&[("HOME", "/h")]);
         assert!(parse(&["ssh", "-p", "notaport", "h"], &env).is_err());
     }
+
+    #[test]
+    fn option_errors_defaults_and_environment_are_explicit() {
+        let empty = env_of(&[]);
+        let defaults = parse(&["ssh", "host"], &empty).unwrap();
+        assert_eq!(defaults.user, "root");
+        assert_eq!(defaults.home, PathBuf::from("/"));
+        assert_eq!((defaults.cols, defaults.rows), (80, 24));
+        assert_eq!(defaults.term, "xterm-256color");
+
+        let env = env_of(&[
+            ("USER", "me"),
+            ("HOME", "/home/me"),
+            ("TERM", "vt100"),
+            ("SSH_PASSWORD", "secret"),
+            ("COLUMNS", "bad"),
+            ("LINES", "bad"),
+        ]);
+        let configured = parse(&["ssh", "host"], &env).unwrap();
+        assert_eq!(configured.term, "vt100");
+        assert_eq!(configured.password_env.as_deref(), Some("secret"));
+        assert_eq!((configured.cols, configured.rows), (80, 24));
+
+        assert!(parse(&["ssh", "-i"], &empty).err().unwrap().contains("-i"));
+        assert!(parse(&["ssh", "-x"], &empty)
+            .err()
+            .unwrap()
+            .contains("unsupported"));
+    }
+
+    #[test]
+    fn remote_term_allowlist_rejects_exotic_and_accepts_common_values() {
+        for safe in ["xterm", "screen-256color", "tmux", "linux", "dumb"] {
+            assert_eq!(safe_remote_term(Some(safe)), safe);
+        }
+        assert_eq!(safe_remote_term(Some("xterm-kitty")), "xterm-256color");
+        assert_eq!(safe_remote_term(None), "xterm-256color");
+    }
 }
