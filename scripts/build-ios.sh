@@ -25,7 +25,7 @@ DEPLOYMENT_TARGET="${YOURSHELL_IOS_DEPLOYMENT_TARGET:-17.0}"
 FEATURES="${YOURSHELL_CARGO_FEATURES:-python,node}"
 export IPHONEOS_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET"
 
-stamp="$ROOT/core/target/$TARGET/.yourshell-deployment-target"
+stamp="$ROOT/.build-stamps/$TARGET-deployment-target"
 if [[ ! -f "$stamp" ]] || [[ "$(<"$stamp")" != "$DEPLOYMENT_TARGET" ]]; then
     echo "Refreshing cached $TARGET objects for iOS $DEPLOYMENT_TARGET..."
     cargo clean \
