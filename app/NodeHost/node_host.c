@@ -12,7 +12,6 @@
 // immediately. Later commands talk to the instance over TCP.
 //
 
-#include <NodeMobile/NodeMobile.h>
 #include <dlfcn.h>
 #include <limits.h>
 #include <mach-o/dyld.h>
@@ -22,7 +21,8 @@
 #include <string.h>
 
 static char *ys_main_js_path = NULL;
-static __typeof__(&node_start) ys_node_start = NULL;
+typedef int (*ys_node_start_fn)(int argc, char *argv[]);
+static ys_node_start_fn ys_node_start = NULL;
 static void *ys_node_runtime = NULL;
 static pthread_mutex_t ys_node_mutex = PTHREAD_MUTEX_INITIALIZER;
 
