@@ -465,6 +465,13 @@ pub extern "C" fn ashell_session_new(
         let Ok((stdout_reader, stdout_writer)) = std::io::pipe() else {
             return std::ptr::null_mut();
         };
+        // Wake the output pump when a completion event is queued. Polling this
+        // pipe alongside stdout avoids the old 2 ms recv_timeout loop (500
+        // idle wakeups/second/session) while preserving output-before-done
+        // callback ordering.
+        let Ok((event_reader, event_writer)) = std::io::pipe() else {
+            return std::ptr::null_mut();
+        };
         let (cmd_tx, cmd_rx) = mpsc::channel::<SessionMsg>();
         let (output_event_tx, output_event_rx) = mpsc::channel::<OutputEvent>();
         let stdin_writer = Arc::new(Mutex::new(None));
@@ -479,6 +486,7 @@ pub extern "C" fn ashell_session_new(
         let reader_handle = std::thread::spawn(move || {
             let out_ctx = out_ctx;
             let mut reader = stdout_reader;
+            let mut event_reader = event_reader;
             let mut buf = [0u8; 8192];
             // The shell keeps stdout open for the whole session, so a blocking
             // read cannot also observe completion events. Nonblocking draining
@@ -490,6 +498,13 @@ pub extern "C" fn ashell_session_new(
                 // SAFETY: same valid fd; preserving all existing status flags.
                 unsafe {
                     libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                }
+            }
+            let event_fd = event_reader.as_raw_fd();
+            let event_flags = unsafe { libc::fcntl(event_fd, libc::F_GETFL) };
+            if event_flags >= 0 {
+                unsafe {
+                    libc::fcntl(event_fd, libc::F_SETFL, event_flags | libc::O_NONBLOCK);
                 }
             }
             let drain = |reader: &mut std::io::PipeReader, buf: &mut [u8; 8192]| -> bool {
@@ -507,11 +522,38 @@ pub extern "C" fn ashell_session_new(
                 }
             };
             loop {
-                if !drain(&mut reader, &mut buf) {
+                let mut fds = [
+                    libc::pollfd {
+                        fd,
+                        events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: event_fd,
+                        events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+                        revents: 0,
+                    },
+                ];
+                // SAFETY: both pollfd entries refer to pipe readers owned by
+                // this thread and remain valid for the entire call.
+                let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, -1) };
+                if ready < 0 {
+                    continue;
+                }
+                if fds[0].revents != 0 && !drain(&mut reader, &mut buf) {
                     break;
                 }
-                match output_event_rx.recv_timeout(std::time::Duration::from_millis(2)) {
-                    Ok(OutputEvent::Done(exit_code, cwd)) => {
+                if fds[1].revents != 0 {
+                    let mut wake_buf = [0u8; 64];
+                    loop {
+                        match event_reader.read(&mut wake_buf) {
+                            Ok(0) => break,
+                            Ok(_) => continue,
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(_) => break,
+                        }
+                    }
+                    while let Ok(OutputEvent::Done(exit_code, cwd)) = output_event_rx.try_recv() {
                         // The event is sent only after the command has flushed
                         // its writers. Drain once more so every preceding byte
                         // reaches Swift before ownership returns to the prompt.
@@ -523,8 +565,10 @@ pub extern "C" fn ashell_session_new(
                             done_cb(out_ctx.0, exit_code, cwd.as_ptr());
                         }
                     }
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    if matches!(
+                        output_event_rx.try_recv(),
+                        Err(mpsc::TryRecvError::Disconnected)
+                    ) {
                         if !drain(&mut reader, &mut buf) {
                             break;
                         }
@@ -536,6 +580,7 @@ pub extern "C" fn ashell_session_new(
 
         // Shell thread: owns the Shell instance for this session's lifetime.
         let shell_handle = std::thread::spawn(move || {
+            let mut event_writer = event_writer;
             let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -559,8 +604,12 @@ pub extern "C" fn ashell_session_new(
                     Err(e) => {
                         let msg =
                             CString::new(format!("shell init failed: {e}")).unwrap_or_default();
-                        let _ = output_event_tx
-                            .send(OutputEvent::Done(127, msg.to_string_lossy().into_owned()));
+                        if output_event_tx
+                            .send(OutputEvent::Done(127, msg.to_string_lossy().into_owned()))
+                            .is_ok()
+                        {
+                            let _ = event_writer.write_all(&[1]);
+                        }
                         return;
                     }
                 };
@@ -597,7 +646,12 @@ pub extern "C" fn ashell_session_new(
                                 }
                             }
                             let cwd = shell.working_dir().to_string_lossy().into_owned();
-                            let _ = output_event_tx.send(OutputEvent::Done(exit_code, cwd));
+                            if output_event_tx
+                                .send(OutputEvent::Done(exit_code, cwd))
+                                .is_ok()
+                            {
+                                let _ = event_writer.write_all(&[1]);
+                            }
                         }
                         SessionMsg::Capture(cmd, timeout_ms, reply) => {
                             let out = run_capture(&mut shell, cmd, timeout_ms, &shell_cancel).await;
