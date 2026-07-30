@@ -32,7 +32,7 @@ ashell_capture_result *ashell_run_capture(void *session, const char *cmd,
 void ashell_cancel(void *session);
 void ashell_capture_free(ashell_capture_result *result);
 
-void ys_node_start_resident(const char *main_js_path);
+int ys_node_start_resident(const char *main_js_path);
 
 typedef int32_t (*ashell_ios_copy_cb)(const uint8_t *bytes, size_t len);
 typedef void (*ashell_ios_paste_output_cb)(void *ctx, const uint8_t *bytes, size_t len);

@@ -13,11 +13,102 @@
 //
 
 #include <Python/Python.h>
+#include <dlfcn.h>
+#include <limits.h>
+#include <mach-o/dyld.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 static int ys_py_initialized = 0;
 static pthread_mutex_t ys_py_mutex = PTHREAD_MUTEX_INITIALIZER;
+static void *ys_py_runtime = NULL;
+
+// Python.framework stays embedded and signed, but is intentionally not linked
+// into the app. Resolve the small embedding API surface on the first python/pip
+// command so ordinary shell/agent sessions do not map CPython at launch.
+#define YS_PY_API(X) \
+    X(PyConfig_Clear) \
+    X(PyConfig_InitIsolatedConfig) \
+    X(PyConfig_Read) \
+    X(PyConfig_SetString) \
+    X(PyEval_SaveThread) \
+    X(PyGILState_Ensure) \
+    X(PyGILState_Release) \
+    X(PyList_New) \
+    X(PyList_SetItem) \
+    X(PyLong_AsLong) \
+    X(PyMem_RawFree) \
+    X(PyPreConfig_InitPythonConfig) \
+    X(PyStatus_Exception) \
+    X(PySys_GetObject) \
+    X(PySys_SetObject) \
+    X(PyUnicode_DecodeFSDefault) \
+    X(Py_DecRef) \
+    X(Py_DecodeLocale) \
+    X(Py_InitializeFromConfig) \
+    X(Py_PreInitialize) \
+    X(PyRun_SimpleStringFlags)
+
+#define YS_DECLARE(symbol) static __typeof__(&symbol) ys_##symbol = NULL;
+YS_PY_API(YS_DECLARE)
+#undef YS_DECLARE
+
+static void *ys_open_embedded_framework(const char *framework) {
+    char executable[PATH_MAX];
+    uint32_t size = sizeof(executable);
+    if (_NSGetExecutablePath(executable, &size) != 0) {
+        fprintf(stderr, "python: executable path exceeds PATH_MAX\n");
+        return NULL;
+    }
+    char *slash = strrchr(executable, '/');
+    if (slash == NULL) {
+        fprintf(stderr, "python: invalid executable path\n");
+        return NULL;
+    }
+    *slash = '\0';
+
+    char path[PATH_MAX];
+    int length = snprintf(path, sizeof(path), "%s/Frameworks/%s.framework/%s",
+                          executable, framework, framework);
+    if (length < 0 || (size_t)length >= sizeof(path)) {
+        fprintf(stderr, "python: framework path exceeds PATH_MAX\n");
+        return NULL;
+    }
+    void *handle = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
+    if (handle == NULL) {
+        fprintf(stderr, "python: cannot load %s: %s\n", path, dlerror());
+    }
+    return handle;
+}
+
+static int ys_python_load_runtime(void) {
+    if (ys_py_runtime != NULL) {
+        return 0;
+    }
+    void *handle = ys_open_embedded_framework("Python");
+    if (handle == NULL) {
+        return -1;
+    }
+
+#define YS_RESOLVE(symbol) do { \
+    *(void **)(&ys_##symbol) = dlsym(handle, #symbol); \
+    if (ys_##symbol == NULL) { \
+        fprintf(stderr, "python: Python.framework lacks %s: %s\n", \
+                #symbol, dlerror()); \
+        dlclose(handle); \
+        return -1; \
+    } \
+} while (0);
+    YS_PY_API(YS_RESOLVE)
+#undef YS_RESOLVE
+
+    // Keep the RTLD_GLOBAL handle for the process lifetime. Native extension
+    // modules loaded later by CPython resolve their Py* imports through it.
+    ys_py_runtime = handle;
+    return 0;
+}
 
 // Command driver: parses the python CLI subset we support and dispatches,
 // capturing the exit code into sys._ys_exit_code.
@@ -146,6 +237,9 @@ static int ys_python_ensure_init(void) {
     if (ys_py_initialized) {
         return 0;
     }
+    if (ys_python_load_runtime() != 0) {
+        return -1;
+    }
 
     PyStatus status;
     PyPreConfig preconfig;
@@ -154,14 +248,14 @@ static int ys_python_ensure_init(void) {
     // User-site must be enabled at pre-initialization time too. Combining an
     // isolated preconfig with a non-isolated PyConfig leaves
     // sys.flags.no_user_site set, making pip --user reject a writable sandbox.
-    PyPreConfig_InitPythonConfig(&preconfig);
+    ys_PyPreConfig_InitPythonConfig(&preconfig);
     preconfig.utf8_mode = 1;
-    status = Py_PreInitialize(&preconfig);
-    if (PyStatus_Exception(status)) {
+    status = ys_Py_PreInitialize(&preconfig);
+    if (ys_PyStatus_Exception(status)) {
         return -1;
     }
 
-    PyConfig_InitIsolatedConfig(&config);
+    ys_PyConfig_InitIsolatedConfig(&config);
     // Isolated config forces -I (= -s -E), which hard-disables user-site
     // (sys.flags.no_user_site=1) regardless of user_site_directory. Turn isolated
     // off and re-enable env so `pip install --user` works: --user resolves against
@@ -179,26 +273,26 @@ static int ys_python_ensure_init(void) {
 
     const char *home = getenv("YOURSHELL_PYTHON_HOME");
     if (home != NULL) {
-        wchar_t *whome = Py_DecodeLocale(home, NULL);
+        wchar_t *whome = ys_Py_DecodeLocale(home, NULL);
         if (whome != NULL) {
-            PyConfig_SetString(&config, &config.home, whome);
-            PyMem_RawFree(whome);
+            ys_PyConfig_SetString(&config, &config.home, whome);
+            ys_PyMem_RawFree(whome);
         }
     }
 
-    status = PyConfig_Read(&config);
-    if (PyStatus_Exception(status)) {
-        PyConfig_Clear(&config);
+    status = ys_PyConfig_Read(&config);
+    if (ys_PyStatus_Exception(status)) {
+        ys_PyConfig_Clear(&config);
         return -1;
     }
-    status = Py_InitializeFromConfig(&config);
-    PyConfig_Clear(&config);
-    if (PyStatus_Exception(status)) {
+    status = ys_Py_InitializeFromConfig(&config);
+    ys_PyConfig_Clear(&config);
+    if (ys_PyStatus_Exception(status)) {
         return -1;
     }
 
     // Release the GIL and let PyGILState manage per-thread states from here.
-    PyEval_SaveThread();
+    ys_PyEval_SaveThread();
     ys_py_initialized = 1;
     return 0;
 }
@@ -220,26 +314,26 @@ int ys_python_run(int argc, const char **argv) {
     // while module state (sys.modules) deliberately persists — major C
     // extensions (lxml, numpy) refuse to load into more than one interpreter
     // per process. Same model as a-Shell / Jupyter kernels.
-    PyGILState_STATE gil = PyGILState_Ensure();
+    PyGILState_STATE gil = ys_PyGILState_Ensure();
 
     int exit_code = 125;
-    PyObject *py_argv = PyList_New(argc);
+    PyObject *py_argv = ys_PyList_New(argc);
     if (py_argv != NULL) {
         for (int i = 0; i < argc; i++) {
-            PyList_SetItem(py_argv, i, PyUnicode_DecodeFSDefault(argv[i]));
+            ys_PyList_SetItem(py_argv, i, ys_PyUnicode_DecodeFSDefault(argv[i]));
         }
-        PySys_SetObject("argv", py_argv);
-        Py_DECREF(py_argv);
+        ys_PySys_SetObject("argv", py_argv);
+        ys_Py_DecRef(py_argv);
     }
 
-    int rc = PyRun_SimpleString(YS_DRIVER);
+    int rc = ys_PyRun_SimpleStringFlags(YS_DRIVER, NULL);
     exit_code = (rc == 0) ? 0 : 1;
-    PyObject *code_obj = PySys_GetObject("_ys_exit_code"); // borrowed
+    PyObject *code_obj = ys_PySys_GetObject("_ys_exit_code"); // borrowed
     if (code_obj != NULL && PyLong_Check(code_obj)) {
-        exit_code = (int)PyLong_AsLong(code_obj);
+        exit_code = (int)ys_PyLong_AsLong(code_obj);
     }
 
-    PyGILState_Release(gil);
+    ys_PyGILState_Release(gil);
 
     pthread_mutex_unlock(&ys_py_mutex);
     return exit_code;

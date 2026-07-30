@@ -51,9 +51,11 @@ targets:
       - framework: ../vendor/python-ios/Python.xcframework
         embed: true
         codeSign: true
+        link: false
       - framework: ../vendor/nodejs-mobile/NodeMobile.xcframework
         embed: true
         codeSign: true
+        link: false
       - package: SwiftTerm
       - package: PythonIOSLib
         product: NumPy

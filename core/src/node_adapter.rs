@@ -1,13 +1,13 @@
 //! Bridges Node.js (nodejs-mobile) into brush as the `node`/`npm`/`npx`
 //! builtins.
 //!
-//! node_start() can only run once per process, so the app launches one
-//! resident Node instance at startup (node_host.c + main.js dispatcher). This
-//! adapter never starts Node; each command connects to the resident instance
-//! over loopback TCP, sends a JSON request (argv/cwd/env/stdin), and streams
-//! the framed stdout/stderr back to the session's fds. Because Node runs in
-//! its own instance, this needs neither the process-state lock nor fd dup2 —
-//! output is written directly to the session's OpenFile.
+//! node_start() can only run once per process, so the first Node-family command
+//! dynamically loads NodeMobile and launches one resident instance
+//! (`node_host.c` + main.js dispatcher). Each command connects over loopback
+//! TCP, sends a JSON request (argv/cwd/env/stdin), and streams the framed
+//! stdout/stderr back to the session's fds. Because Node runs in its own
+//! instance, this needs neither the process-state lock nor fd dup2 — output is
+//! written directly to the session's OpenFile.
 //!
 //! The request carries a shared secret (`YS_NODE_TOKEN`): iOS does not isolate
 //! loopback between apps, so an unauthenticated dispatcher would let any other
@@ -37,23 +37,26 @@ fn npx_cli() -> Option<PathBuf> {
 
 unsafe extern "C" {
     /// Provided by node_host.c: starts the resident Node instance (idempotent).
-    fn ys_node_start_resident(main_js_path: *const std::ffi::c_char);
+    fn ys_node_start_resident(main_js_path: *const std::ffi::c_char) -> std::ffi::c_int;
 }
 
 /// Ensures the resident Node instance is starting. Idempotent on the C side,
 /// so calling it on every node command is fine — only the first one launches.
-fn ensure_node_started() {
+fn ensure_node_started() -> bool {
     if let Some(main_js) = std::env::var_os("YS_NODE_MAIN_JS") {
         if let Ok(c) = std::ffi::CString::new(main_js.to_string_lossy().into_owned()) {
-            unsafe { ys_node_start_resident(c.as_ptr()) };
+            return unsafe { ys_node_start_resident(c.as_ptr()) } == 0;
         }
     }
+    false
 }
 
 /// Reads the resident instance's port (written by main.js). Retries while Node
 /// starts up (the first command triggers a lazy launch that takes ~1-2s).
 fn resident_port() -> Option<u16> {
-    ensure_node_started();
+    if !ensure_node_started() {
+        return None;
+    }
     let file = std::env::var_os("YS_NODE_PORT_FILE")?;
     for _ in 0..100 {
         if let Ok(s) = std::fs::read_to_string(&file) {

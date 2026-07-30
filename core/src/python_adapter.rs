@@ -6,8 +6,9 @@
 //! through a small Python driver. This module only forwards argv and the pieces
 //! of session state a resident interpreter cannot pick up on its own.
 //!
-//! Compiled only with the `python` cargo feature: the symbols resolve when the
-//! app links Python.xcframework; host test binaries build without it.
+//! Compiled only with the `python` cargo feature. The app embeds but does not
+//! launch-link Python.xcframework; `python_host.c` resolves the C API with
+//! `dlopen`/`dlsym` on the first Python-family command.
 
 use std::ffi::{c_char, c_int, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};

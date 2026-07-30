@@ -93,6 +93,23 @@ for framework in Python NodeMobile; do
     fi
 done
 
+# The runtimes must be packaged but absent from the app's launch-time load
+# commands. Debug builds put app code in <Executable>.debug.dylib, so inspect
+# both that image and the small launcher when present.
+APP_EXECUTABLE=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' \
+    "$APP/Info.plist" 2>/dev/null || true)
+for image in "$APP/$APP_EXECUTABLE" "$APP/${APP_EXECUTABLE}.debug.dylib"; do
+    [[ -f "$image" ]] || continue
+    while IFS= read -r dependency; do
+        case "$dependency" in
+            *"/Python.framework/Python"|*"/NodeMobile.framework/NodeMobile")
+                fail "runtime is launch-linked from ${image#$APP/}: $dependency"
+                ;;
+        esac
+    done < <(otool -L "$image" 2>/dev/null | tail -n +2 \
+        | sed 's/^[[:space:]]*//; s/ (.*$//')
+done
+
 if [[ "$PLATFORM" == "iphoneos" ]] \
     && ! codesign --verify --deep --strict "$APP" >/dev/null 2>&1; then
     fail "final app bundle signature is invalid"

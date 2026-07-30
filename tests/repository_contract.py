@@ -149,6 +149,12 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertIn("scripts/build-ios.sh", project)
         self.assertIn("Scripts/prune-ios-runtime.sh", project)
         self.assertIn("YOURSHELL_IOS_DEPLOYMENT_TARGET", project)
+        for runtime in ("Python.xcframework", "NodeMobile.xcframework"):
+            dependency = project.index(runtime)
+            declaration = project[dependency:dependency + 140]
+            self.assertIn("embed: true", declaration)
+            self.assertIn("codeSign: true", declaration)
+            self.assertIn("link: false", declaration)
 
 
 if __name__ == "__main__":
