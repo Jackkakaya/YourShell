@@ -8,6 +8,7 @@ source "$ROOT/scripts/ios-runtime.env"
 
 CACHE_DIR="${YOURSHELL_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/yourshell}"
 ARCHIVE="$CACHE_DIR/$YOURSHELL_IOS_RUNTIME_ARCHIVE"
+PREBUNDLE_ARCHIVE="$CACHE_DIR/$YOURSHELL_IOS_PREBUNDLE_ARCHIVE"
 CHECK_ONLY=0
 
 usage() {
@@ -36,6 +37,10 @@ required_paths=(
     "app/PythonResources/python/lib/python3.14"
     "app/NodeResources/node/main.js"
     "app/NodeResources/node/npm/bin/npm-cli.js"
+    "ios-prebundle/sim/PIL/Image.py"
+    "ios-prebundle/sim/numpy/__init__.py"
+    "ios-prebundle/device/PIL/Image.py"
+    "ios-prebundle/device/numpy/__init__.py"
 )
 VERSION_MARKER="$ROOT/app/PythonResources/.yourshell-runtime-version"
 
@@ -105,32 +110,54 @@ fi
 
 mkdir -p "$CACHE_DIR"
 verify_archive() {
-    [[ -f "$ARCHIVE" ]] &&
-        [[ "$(shasum -a 256 "$ARCHIVE" | awk '{print $1}')" == "$YOURSHELL_IOS_RUNTIME_SHA256" ]]
+    local archive="$1"
+    local expected_sha="$2"
+    [[ -f "$archive" ]] &&
+        [[ "$(shasum -a 256 "$archive" | awk '{print $1}')" == "$expected_sha" ]]
 }
 
-if ! verify_archive; then
-    rm -f "$ARCHIVE"
-    tmp_archive="$ARCHIVE.download.$$"
-    trap 'rm -f "$tmp_archive"' EXIT
-    echo "Downloading YourShell iOS runtime $YOURSHELL_IOS_RUNTIME_VERSION..."
+download_archive() {
+    local archive="$1"
+    local expected_sha="$2"
+    local url="$3"
+    local label="$4"
+    if verify_archive "$archive" "$expected_sha"; then
+        return
+    fi
+    rm -f "$archive"
+    local tmp_archive="$archive.download.$$"
+    trap "rm -f '$tmp_archive'" EXIT
+    echo "Downloading YourShell $label $YOURSHELL_IOS_RUNTIME_VERSION..."
     curl --fail --location --retry 5 --retry-all-errors \
         --connect-timeout 20 \
         --output "$tmp_archive" \
-        "${YOURSHELL_IOS_RUNTIME_URL}"
+        "$url"
+    local actual_sha
     actual_sha="$(shasum -a 256 "$tmp_archive" | awk '{print $1}')"
-    if [[ "$actual_sha" != "$YOURSHELL_IOS_RUNTIME_SHA256" ]]; then
-        echo "error: runtime checksum mismatch." >&2
-        echo "expected: $YOURSHELL_IOS_RUNTIME_SHA256" >&2
+    if [[ "$actual_sha" != "$expected_sha" ]]; then
+        echo "error: $label checksum mismatch." >&2
+        echo "expected: $expected_sha" >&2
         echo "actual:   $actual_sha" >&2
         exit 1
     fi
-    mv "$tmp_archive" "$ARCHIVE"
+    mv "$tmp_archive" "$archive"
     trap - EXIT
-fi
+}
+
+download_archive \
+    "$ARCHIVE" \
+    "$YOURSHELL_IOS_RUNTIME_SHA256" \
+    "$YOURSHELL_IOS_RUNTIME_URL" \
+    "iOS runtime"
+download_archive \
+    "$PREBUNDLE_ARCHIVE" \
+    "$YOURSHELL_IOS_PREBUNDLE_SHA256" \
+    "$YOURSHELL_IOS_PREBUNDLE_URL" \
+    "iOS Python prebundle"
 
 echo "Installing YourShell iOS runtime..."
 tar -xzf "$ARCHIVE" -C "$ROOT"
+tar -xzf "$PREBUNDLE_ARCHIVE" -C "$ROOT"
 printf '%s\n' "$YOURSHELL_IOS_RUNTIME_VERSION" >"$VERSION_MARKER"
 
 missing="$(missing_paths)"
