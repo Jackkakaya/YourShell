@@ -62,7 +62,7 @@ function b64(buf) {
   return Buffer.from(buf).toString('base64');
 }
 
-function runRequest(req, sock) {
+function runRequest(req, sock, setInputHandler) {
   // Per-command captured streams -> framed back to the client.
   const send = (obj) => {
     try {
@@ -103,6 +103,7 @@ function runRequest(req, sock) {
   let exitCode = 0;
   let exited = false;
   let isEvalMode = false;
+  let isInteractive = false;
   const origExit = process.exit;
   // Record the exit code but do NOT throw: npm and other CLIs call
   // process.exit() from async contexts, and throwing across node's internal
@@ -138,8 +139,46 @@ function runRequest(req, sock) {
       || args[0] === '-p' || args[0] === '--print'
       || args[0] === '-v' || args[0] === '--version';
     if (args.length === 0) {
-      send({ e: b64('node: interactive REPL not supported over dispatcher\n') });
-      exitCode = 1;
+      isInteractive = true;
+      const anchor = path.join(cwd, '[repl].js');
+      const localRequire = Module.createRequire(anchor);
+      const context = vm.createContext({
+        require: localRequire,
+        process,
+        Buffer,
+        console,
+        __dirname: cwd,
+        __filename: anchor,
+        global: null,
+      });
+      context.global = context;
+      let input = '';
+      const prompt = () => writeOut('> ');
+      setInputHandler((chunk) => {
+        input += chunk;
+        let nl;
+        while ((nl = input.indexOf('\n')) >= 0) {
+          const line = input.slice(0, nl).replace(/\r$/, '');
+          input = input.slice(nl + 1);
+          if (line.trim() === '.exit') {
+            exited = true;
+            finish();
+            return;
+          }
+          if (line.trim()) {
+            try {
+              const value = vm.runInContext(line, context, { filename: anchor });
+              if (value !== undefined) {
+                writeOut(require('util').inspect(value) + '\n');
+              }
+            } catch (err) {
+              writeErr((err && err.stack ? err.stack : String(err)) + '\n');
+            }
+          }
+          prompt();
+        }
+      });
+      prompt();
     } else if (args[0] === '-e' || args[0] === '--eval') {
       const code = args[1] || '';
       process.argv = ['node', '-e', ...args.slice(2)];
@@ -200,7 +239,7 @@ function runRequest(req, sock) {
   timer = setInterval(() => {
     const idle = Date.now() - lastWriteAt;
     const elapsed = Date.now() - startedAt;
-    if ((exited && idle >= 80) || idle >= 20000 || elapsed >= 600000) {
+    if ((exited && idle >= 80) || (!isInteractive && idle >= 20000) || elapsed >= 600000) {
       finish();
     }
   }, 50);
@@ -209,15 +248,22 @@ function runRequest(req, sock) {
 const server = net.createServer((sock) => {
   let buf = '';
   let handled = false;
+  let inputHandler = null;
   sock.on('data', (d) => {
-    if (handled) return;
     buf += d.toString('utf8');
-    const nl = buf.indexOf('\n');
-    if (nl >= 0) {
-      handled = true;
+    let nl;
+    while ((nl = buf.indexOf('\n')) >= 0) {
       const line = buf.slice(0, nl);
+      buf = buf.slice(nl + 1);
       try {
-        const req = JSON.parse(line);
+        const frame = JSON.parse(line);
+        if (handled) {
+          if (inputHandler && typeof frame.i === 'string') {
+            inputHandler(Buffer.from(frame.i, 'base64').toString('utf8'));
+          }
+          continue;
+        }
+        const req = frame;
         // Unauthenticated peer (another app on the device, or our own core
         // running without the token): drop it silently. No error frame — an
         // unauthenticated caller learns nothing, not even that it parsed.
@@ -225,7 +271,8 @@ const server = net.createServer((sock) => {
           sock.destroy();
           return;
         }
-        runRequest(req, sock);
+        handled = true;
+        runRequest(req, sock, (handler) => { inputHandler = handler; });
       } catch (e) {
         sock.write(JSON.stringify({ e: b64('dispatch error: ' + e + '\n') }) + '\n');
         sock.write(JSON.stringify({ exit: 1 }) + '\n');

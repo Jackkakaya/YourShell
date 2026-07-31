@@ -17,7 +17,12 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::PathBuf;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::Duration;
 
 use base64::Engine;
@@ -143,10 +148,14 @@ fn exec_node(
                 .ok()
                 .and_then(|b| b.try_clone_to_owned().ok())
         });
+        let interactive_repl = name == "node" && argv.len() == 1 && stdin_is_interactive;
         let mut stdin_data = Vec::new();
         if !stdin_is_interactive {
-            if let Some(fd) = cmd_stdin {
-                let _ = std::fs::File::from(fd).read_to_end(&mut stdin_data);
+            if let Some(fd) = cmd_stdin.as_ref() {
+                let fd = fd.try_clone().ok();
+                if let Some(fd) = fd {
+                    let _ = std::fs::File::from(fd).read_to_end(&mut stdin_data);
+                }
             }
         }
 
@@ -154,10 +163,12 @@ fn exec_node(
 
         let mut out = context.stdout();
         let mut err = context.stderr();
-        let code =
-            tokio::task::spawn_blocking(move || run_via_resident(&request, &mut out, &mut err))
-                .await
-                .unwrap_or(126);
+        let repl_stdin = interactive_repl.then_some(cmd_stdin).flatten();
+        let code = tokio::task::spawn_blocking(move || {
+            run_via_resident(&request, repl_stdin, &mut out, &mut err)
+        })
+        .await
+        .unwrap_or(126);
 
         #[expect(clippy::cast_sign_loss)]
         Ok(ExecutionResult::new((code & 0xff) as u8))
@@ -196,7 +207,12 @@ fn build_request(argv: &[String], cwd: &str, env: &[(String, String)], stdin: &[
     )
 }
 
-fn run_via_resident(request: &str, out: &mut impl Write, err: &mut impl Write) -> i32 {
+fn run_via_resident(
+    request: &str,
+    interactive_stdin: Option<OwnedFd>,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> i32 {
     let Some(port) = resident_port() else {
         let _ = writeln!(err, "node: resident instance not available");
         return 125;
@@ -227,6 +243,43 @@ fn run_via_resident(request: &str, out: &mut impl Write, err: &mut impl Write) -
     }
     let _ = writer.flush();
 
+    // A normal command sends all stdin in its initial request. A bare `node`
+    // is different: keep forwarding the session keyboard pipe as framed input
+    // until the REPL exits. poll(2) gives the helper a bounded shutdown time,
+    // avoiding a permanently blocked/leaked reader thread after `.exit`.
+    let input_done = Arc::new(AtomicBool::new(false));
+    let input_thread = interactive_stdin.and_then(|fd| {
+        let mut input_writer = writer.try_clone().ok()?;
+        let done = Arc::clone(&input_done);
+        Some(std::thread::spawn(move || {
+            let mut input = std::fs::File::from(fd);
+            let mut buf = [0_u8; 4096];
+            while !done.load(Ordering::Acquire) {
+                let mut pollfd = libc::pollfd {
+                    fd: input.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: pollfd points to one live stack value for this call.
+                let ready = unsafe { libc::poll(&mut pollfd, 1, 100) };
+                if ready <= 0 || pollfd.revents & libc::POLLIN == 0 {
+                    continue;
+                }
+                let Ok(count) = input.read(&mut buf) else {
+                    break;
+                };
+                if count == 0 {
+                    break;
+                }
+                let encoded = base64::engine::general_purpose::STANDARD.encode(&buf[..count]);
+                if writeln!(input_writer, "{{\"i\":\"{encoded}\"}}").is_err() {
+                    break;
+                }
+                let _ = input_writer.flush();
+            }
+        }))
+    });
+
     let b64 = base64::engine::general_purpose::STANDARD;
     let reader = BufReader::new(stream);
     let mut exit_code = 0;
@@ -247,6 +300,10 @@ fn run_via_resident(request: &str, out: &mut impl Write, err: &mut impl Write) -
         } else if let Some(code) = frame_int(&line, "\"exit\":") {
             exit_code = code;
         }
+    }
+    input_done.store(true, Ordering::Release);
+    if let Some(thread) = input_thread {
+        let _ = thread.join();
     }
     let _ = out.flush();
     let _ = err.flush();
