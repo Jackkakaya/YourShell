@@ -22,6 +22,16 @@ const path = require('path');
 const vm = require('vm');
 const Module = require('module');
 const crypto = require('crypto');
+const { Console } = require('console');
+
+// The dispatcher writes framed command output, not an interactive TTY. Force
+// deterministic plain text even when nodejs-mobile inherits a colored Xcode
+// console environment.
+global.console = new Console({
+  stdout: process.stdout,
+  stderr: process.stderr,
+  colorMode: false,
+});
 
 const PORT_FILE = process.env.YS_NODE_PORT_FILE;
 

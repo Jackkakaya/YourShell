@@ -22,7 +22,7 @@ if ! command -v rustup >/dev/null 2>&1 || ! command -v cargo >/dev/null 2>&1; th
 fi
 
 DEPLOYMENT_TARGET="${YOURSHELL_IOS_DEPLOYMENT_TARGET:-17.0}"
-FEATURES="${YOURSHELL_CARGO_FEATURES:-python,node}"
+FEATURES="${YOURSHELL_CARGO_FEATURES:-python,node,vision}"
 export IPHONEOS_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET"
 
 stamp="$ROOT/.build-stamps/$TARGET-deployment-target"

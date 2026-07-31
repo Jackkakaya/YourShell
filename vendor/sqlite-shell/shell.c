@@ -30278,7 +30278,7 @@ static void main_init(ShellState *data) {
   data->showHeader = 0;
   data->shellFlgs = SHFLG_Lookaside;
   sqlite3_config(SQLITE_CONFIG_LOG, shellLog, data);
-#if !defined(SQLITE_SHELL_FIDDLE)
+#if !defined(SQLITE_SHELL_FIDDLE) && !defined(YOURSHELL_EMBEDDED)
   verify_uninitialized();
 #endif
   sqlite3_config(SQLITE_CONFIG_URI, 1);

@@ -286,6 +286,7 @@ fn build_sqlite_shell() {
     shell
         .include(sqlite_dir)
         .file(sqlite_dir.join("shell.c"))
+        .define("YOURSHELL_EMBEDDED", "1")
         .define("main", "ys_sqlite3_main")
         .define("exit", "ys_sqlite3_exit")
         .define("atexit", "ys_sqlite3_atexit")
