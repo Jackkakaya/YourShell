@@ -156,7 +156,10 @@ download_archive \
     "iOS Python prebundle"
 
 echo "Installing YourShell iOS runtime..."
-tar -xzf "$ARCHIVE" -C "$ROOT"
+# The runtime archive contains a historical copy of the Node dispatcher for
+# standalone consumers. The Git checkout is authoritative for source files;
+# never overwrite it with an older release artifact during bootstrap.
+tar --exclude="app/NodeResources/node/main.js" -xzf "$ARCHIVE" -C "$ROOT"
 tar -xzf "$PREBUNDLE_ARCHIVE" -C "$ROOT"
 printf '%s\n' "$YOURSHELL_IOS_RUNTIME_VERSION" >"$VERSION_MARKER"
 
