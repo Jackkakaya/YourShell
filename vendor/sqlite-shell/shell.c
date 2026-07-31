@@ -29895,7 +29895,9 @@ void ys_sqlite3_reset_process_state(void){
     sqlite3_close_v2(globalDb);
     globalDb = 0;
   }
+#if !defined(YOURSHELL_EMBEDDED)
   sqlite3_shutdown();
+#endif
   enableTimer = 0;
   bail_on_error = 0;
   stdin_is_interactive = 1;
@@ -30447,7 +30449,9 @@ int SQLITE_CDECL wmain(int argc, wchar_t **wargv){
     argvToFree[i] = argv[i];
     sqlite3_free(z);
   }
+#if !defined(YOURSHELL_EMBEDDED)
   sqlite3_shutdown();
+#endif
 #endif
 
   assert( argc>=1 && argv && argv[0] );

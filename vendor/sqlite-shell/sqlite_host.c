@@ -10,7 +10,9 @@
  *
  * SQLite commands are serialized by command_host's process-state lock. A
  * process-global jump target is therefore sufficient and avoids pretending
- * this wrapper is independently thread-safe.
+ * this wrapper is independently thread-safe. The embedded shell must never
+ * call sqlite3_shutdown(): YourAI's backend uses the same process-wide SQLite
+ * library concurrently, and shutting it down invalidates the host's caches.
  */
 static jmp_buf ys_sqlite_exit_target;
 static int ys_sqlite_exit_code;
