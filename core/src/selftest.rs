@@ -716,7 +716,7 @@ pub static PY_CASES: &[Case] = &[
     case!("py-pip-install", "python3 -m pip install --quiet --no-input --upgrade --only-binary :all: --target \"$YOURSHELL_PY_SITE\" six > /dev/null 2>&1; python3 -c 'import six; print(six.__name__, six.__version__ != \"\")'", Has("six True")),
     // ---- python real-world scenarios (network + binary wheels) ----
     case!("py-pip-rich", "python3 -m pip install -q --no-input --only-binary :all: --target \"$YOURSHELL_PY_SITE\" rich > /dev/null 2>&1; python3 -c 'from rich.console import Console; Console(force_terminal=False).print(\"rich\", 6*7)'", Has("rich 42")),
-    case!("py-pip-fpdf2-pillow", "python3 -m pip install -q --no-input --only-binary :all: --target \"$YOURSHELL_PY_SITE\" fpdf2 pypdf requests > /dev/null 2>&1; python3 -c 'import fpdf, pypdf, requests, PIL; print(\"heavy-deps-ok\")'", Eq("heavy-deps-ok")),
+    case!("py-pip-fpdf2-pillow", "python3 -m pip install -q --no-input --only-binary :all: fpdf2 pypdf requests > /dev/null 2>&1; python3 -c 'import fpdf, pypdf, requests, PIL; print(\"heavy-deps-ok\")'", Has("heavy-deps-ok")),
     case!("py-pil-image", "python3 -c 'from PIL import Image; img = Image.new(\"RGB\", (80, 40), \"blue\"); img.save(\"blue.png\"); print(\"png\", img.size[0], img.size[1])'", Has("png 80 40")),
     case!("py-pdf-generate", "printf 'from fpdf import FPDF\\npdf = FPDF()\\npdf.add_page()\\npdf.set_font(\"Helvetica\", size=20)\\npdf.cell(text=\"YourShell PDF\")\\npdf.image(\"blue.png\", x=10, y=30, w=40)\\npdf.output(\"gen.pdf\")\\nprint(\"pdf-generated\")\\n' > genpdf.py; python3 genpdf.py; head -c 5 gen.pdf; echo", Has("pdf-generated"), Has("%PDF-")),
     case!("py-pdf-readback", "python3 -c 'from pypdf import PdfReader; r = PdfReader(\"gen.pdf\"); print(\"pages\", len(r.pages))'", Eq("pages 1")),
@@ -727,8 +727,10 @@ pub static PY_CASES: &[Case] = &[
     // python-pptx blocked upstream: lxml has no iOS wheel yet. A minimal
     // valid .pptx is assembled with stdlib zipfile+xml instead, proving the
     // OOXML container pipeline works end to end.
-    // python-pptx works via the Flet iOS wheel index (lxml + libxml2).
-    case!("py-pptx-real", "python3 -m pip install -q --no-input --only-binary :all: --index-url https://pypi.flet.dev --extra-index-url https://pypi.org/simple --target \"$YOURSHELL_PY_SITE\" python-pptx > /dev/null 2>&1; cat > genppt.py <<'PYSRC'\nfrom pptx import Presentation\nprs = Presentation()\nslide = prs.slides.add_slide(prs.slide_layouts[0])\nslide.shapes.title.text = 'YourShell'\nprs.save('real.pptx')\nprint('pptx-saved')\nPYSRC\npython3 genppt.py; python3 -c 'from pptx import Presentation; print(\"title:\", Presentation(\"real.pptx\").slides[0].shapes.title.text)'", Has("pptx-saved"), Has("title: YourShell")),
+    // python-pptx and its native lxml dependency are prebundled and signed.
+    // Downloading a native wheel at runtime cannot work on a physical iOS
+    // device because App Store code signing forbids loading unsigned .so files.
+    case!("py-pptx-real", "cat > genppt.py <<'PYSRC'\nfrom pptx import Presentation\nprs = Presentation()\nslide = prs.slides.add_slide(prs.slide_layouts[0])\nslide.shapes.title.text = 'YourShell'\nprs.save('real.pptx')\nprint('pptx-saved')\nPYSRC\npython3 genppt.py; python3 -c 'from pptx import Presentation; print(\"title:\", Presentation(\"real.pptx\").slides[0].shapes.title.text)'", Has("pptx-saved"), Has("title: YourShell")),
     // Full circle: PIL renders text, the native Vision-backed ocr command
     // reads it back.
     case!("ocr-vision-roundtrip", "cat > genocr.py <<'PYSRC'\nfrom PIL import Image, ImageDraw, ImageFont\nimg = Image.new('RGB', (900, 200), 'white')\nd = ImageDraw.Draw(img)\nfont = ImageFont.load_default(size=96)\nd.text((40, 40), 'HELLO YOURSHELL', fill='black', font=font)\nimg.save('ocr_input.png')\nprint('image-ok')\nPYSRC\npython3 genocr.py; ocr ocr_input.png", Has("image-ok"), Has("HELLO"), Has("YOURSHELL")),
