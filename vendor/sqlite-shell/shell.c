@@ -30259,10 +30259,12 @@ static void usage(int showDetail){
 ** error message if it is initialized.
 */
 static void verify_uninitialized(void){
+#if !defined(YOURSHELL_EMBEDDED)
   if( sqlite3_config(-1)==SQLITE_MISUSE ){
     sputz(stdout, "WARNING: attempt to configure SQLite after"
           " initialization.\n");
   }
+#endif
 }
 
 /*
